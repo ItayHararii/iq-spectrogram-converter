@@ -16,7 +16,20 @@ def process_file(path, output_dir, rbw):
 
     I, Q = (x[:, 0], x[:, 1])
     iq = I + 1j * Q
-    # # x = ...  # your 1D signal
+
+    num_samples = len(iq)
+    duration_s = num_samples / fs
+    bandwidth_hz = fs  # Nyquist bandwidth for complex IQ
+    file_size_kb = os.path.getsize(path) / 1024
+
+    print(f"--- {Path(path).name} ---")
+    print(f"  Sample rate    : {fs:,} Hz")
+    print(f"  Samples        : {num_samples:,}")
+    print(f"  Duration       : {duration_s:.3f} s")
+    print(f"  Bandwidth      : {bandwidth_hz / 1e6:.3f} MHz")
+    print(f"  RBW            : {rbw / 1e3:.3f} kHz")
+    print(f"  File size      : {file_size_kb:.1f} kB")
+
     RBW = rbw
     bin_width = RBW / 2
     n_fft = int(2 ** np.ceil(np.log2(fs / RBW * 2)))
@@ -53,7 +66,7 @@ def process_file(path, output_dir, rbw):
     out_name = Path(path).stem + ".png"
     plt.savefig(os.path.join(output_dir, out_name), dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"Saved {out_name}")
+    print(f"  Saved          : {out_name}")
 
 
 if __name__ == "__main__":
