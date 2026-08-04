@@ -2,12 +2,19 @@ import io
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from iq_data import process_file
+from iq_data import estimate_conversion_seconds, process_file
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:  # pragma: no cover
+    Image = None
+    ImageTk = None
 
 
 def app_dir() -> Path:
@@ -16,20 +23,29 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def resource_dir() -> Path:
+    """Bundled resources (PyInstaller extracts to _MEIPASS)."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent
+
+
 APP_DIR = app_dir()
 DEFAULT_OUTPUT = APP_DIR / "IQ Results"
 DEFAULT_INPUT_DIR = APP_DIR / "IQ Collection"
+LOGO_PATH = resource_dir() / "assets" / "sensorz_logo.png"
 
+# Sensorz-aligned palette
 COLORS = {
     "bg": "#eef1f4",
     "surface": "#ffffff",
-    "header": "#1a2332",
+    "header": "#000000",
     "header_text": "#f4f7fb",
     "muted": "#5c6b7a",
     "text": "#1a2332",
-    "accent": "#0d9488",
-    "accent_hover": "#0f766e",
-    "accent_text": "#ffffff",
+    "accent": "#00c2d4",
+    "accent_hover": "#009eb0",
+    "accent_text": "#041018",
     "border": "#d0d7de",
     "log_bg": "#0f1720",
     "log_fg": "#c8d4e0",
@@ -59,21 +75,41 @@ def enable_dpi_awareness():
             pass
 
 
+def format_duration(seconds):
+    seconds = max(0, int(round(seconds)))
+    minutes, secs = divmod(seconds, 60)
+    if minutes >= 60:
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
 class IQConverterGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("IQ Spectrogram Converter")
-        self.geometry("760x640")
-        self.minsize(700, 580)
+        self.title("IQ Spectrogram Converter — Sensorz")
+        self.geometry("780x680")
+        self.minsize(720, 620)
         self.configure(bg=COLORS["bg"])
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar(value=str(DEFAULT_OUTPUT))
         self.rbw_var = tk.StringVar(value="15000")
         self.status_var = tk.StringVar(value="Select a stereo IQ WAV file to begin.")
+        self.time_var = tk.StringVar(value="")
+        self.progress_var = tk.DoubleVar(value=0.0)
+
+        self._logo_photo = None
+        self._converting = False
+        self._progress_fraction = 0.0
+        self._progress_stage = ""
+        self._convert_started_at = 0.0
+        self._estimated_total_s = 0.0
+        self._timer_job = None
 
         self._configure_styles()
         self._build_ui()
+        self.rbw_var.trace_add("write", lambda *_: self._update_estimate_preview())
         self._center_window()
 
     def _configure_styles(self):
@@ -96,7 +132,7 @@ class IQConverterGUI(tk.Tk):
         style.configure(
             "HeaderSub.TLabel",
             background=COLORS["header"],
-            foreground="#94a3b8",
+            foreground="#8aa0b8",
             font=("Segoe UI", 10),
         )
         style.configure(
@@ -116,6 +152,12 @@ class IQConverterGUI(tk.Tk):
             background=COLORS["bg"],
             foreground=COLORS["text"],
             font=("Segoe UI", 9),
+        )
+        style.configure(
+            "Time.TLabel",
+            background=COLORS["bg"],
+            foreground=COLORS["muted"],
+            font=("Segoe UI Semibold", 9),
         )
         style.configure(
             "App.TEntry",
@@ -142,7 +184,7 @@ class IQConverterGUI(tk.Tk):
         )
         style.map(
             "Primary.TButton",
-            background=[("active", COLORS["accent_hover"]), ("disabled", "#99b8b4")],
+            background=[("active", COLORS["accent_hover"]), ("disabled", "#7eb8c0")],
             foreground=[("disabled", "#e8f0ef")],
         )
         style.configure("Secondary.TButton", font=("Segoe UI", 9), padding=(12, 6))
@@ -153,7 +195,7 @@ class IQConverterGUI(tk.Tk):
             bordercolor=COLORS["border"],
             lightcolor=COLORS["accent"],
             darkcolor=COLORS["accent"],
-            thickness=8,
+            thickness=12,
         )
         style.configure(
             "Card.TLabelframe",
@@ -170,17 +212,46 @@ class IQConverterGUI(tk.Tk):
             font=("Segoe UI Semibold", 10),
         )
 
+    def _load_logo(self, max_height=46):
+        if not LOGO_PATH.is_file():
+            return None
+        try:
+            if Image is not None and ImageTk is not None:
+                img = Image.open(LOGO_PATH)
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGBA")
+                ratio = max_height / img.height
+                size = (max(1, int(img.width * ratio)), max_height)
+                img = img.resize(size, Image.Resampling.LANCZOS)
+                self._logo_photo = ImageTk.PhotoImage(img)
+                return self._logo_photo
+            self._logo_photo = tk.PhotoImage(file=str(LOGO_PATH))
+            # Downscale with subsample if very tall
+            while self._logo_photo.height() > max_height * 2:
+                self._logo_photo = self._logo_photo.subsample(2, 2)
+            return self._logo_photo
+        except Exception:
+            return None
+
     def _build_ui(self):
-        header = ttk.Frame(self, style="Header.TFrame", padding=(24, 18))
+        header = ttk.Frame(self, style="Header.TFrame", padding=(20, 14))
         header.pack(fill="x")
-        ttk.Label(header, text="IQ Spectrogram Converter", style="HeaderTitle.TLabel").pack(
-            anchor="w"
+        header.columnconfigure(1, weight=1)
+
+        logo = self._load_logo()
+        if logo is not None:
+            tk.Label(header, image=logo, bg=COLORS["header"], bd=0, highlightthickness=0).grid(
+                row=0, column=0, rowspan=2, sticky="w", padx=(0, 18)
+            )
+
+        ttk.Label(header, text="IQ Spectrogram Converter", style="HeaderTitle.TLabel").grid(
+            row=0, column=1, sticky="sw"
         )
         ttk.Label(
             header,
             text="Turn stereo IQ WAV recordings into spectrogram images",
             style="HeaderSub.TLabel",
-        ).pack(anchor="w", pady=(4, 0))
+        ).grid(row=1, column=1, sticky="nw", pady=(4, 0))
 
         body = ttk.Frame(self, style="App.TFrame", padding=(20, 16, 20, 12))
         body.pack(fill="both", expand=True)
@@ -253,14 +324,23 @@ class IQConverterGUI(tk.Tk):
             command=self.open_output_folder,
         ).pack(side="left", padx=(10, 0))
 
-        self.progress = ttk.Progressbar(
-            body, mode="indeterminate", style="App.Horizontal.TProgressbar"
+        progress_header = ttk.Frame(body, style="App.TFrame")
+        progress_header.pack(fill="x", pady=(4, 4))
+        ttk.Label(progress_header, textvariable=self.status_var, style="Status.TLabel").pack(
+            side="left", anchor="w"
         )
-        self.progress.pack(fill="x", pady=(0, 8))
+        ttk.Label(progress_header, textvariable=self.time_var, style="Time.TLabel").pack(
+            side="right", anchor="e"
+        )
 
-        ttk.Label(body, textvariable=self.status_var, style="Status.TLabel", wraplength=700).pack(
-            anchor="w", pady=(0, 8)
+        self.progress = ttk.Progressbar(
+            body,
+            mode="determinate",
+            maximum=100,
+            variable=self.progress_var,
+            style="App.Horizontal.TProgressbar",
         )
+        self.progress.pack(fill="x", pady=(0, 10))
 
         log_frame = ttk.LabelFrame(body, text="  Activity  ", style="Card.TLabelframe", padding=10)
         log_frame.pack(fill="both", expand=True)
@@ -311,6 +391,7 @@ class IQConverterGUI(tk.Tk):
             self.input_var.set(selected)
             self.status_var.set(f"Selected: {Path(selected).name}")
             self._append_log(f"Input: {selected}")
+            self._update_estimate_preview()
 
     def choose_output(self):
         initial = self.output_var.get().strip() or str(DEFAULT_OUTPUT)
@@ -318,6 +399,22 @@ class IQConverterGUI(tk.Tk):
         if selected:
             self.output_var.set(selected)
             self._append_log(f"Output folder: {selected}")
+
+    def _update_estimate_preview(self):
+        if self._converting:
+            return
+        path = Path(self.input_var.get().strip())
+        if not path.is_file():
+            self.time_var.set("")
+            return
+        try:
+            rbw = float(self.rbw_var.get())
+            if rbw <= 0:
+                raise ValueError
+            est = estimate_conversion_seconds(str(path), rbw)
+            self.time_var.set(f"Est. ~{format_duration(est)}")
+        except Exception:
+            self.time_var.set("")
 
     def start_conversion(self):
         input_path = Path(self.input_var.get().strip())
@@ -341,12 +438,27 @@ class IQConverterGUI(tk.Tk):
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        try:
+            estimated = estimate_conversion_seconds(str(input_path), rbw)
+        except Exception:
+            estimated = 30.0
+
+        self._converting = True
+        self._progress_fraction = 0.0
+        self._progress_stage = "Starting…"
+        self._convert_started_at = time.monotonic()
+        self._estimated_total_s = estimated
+        self.progress_var.set(0)
         self.convert_button.config(state="disabled")
-        self.progress.start(12)
-        self.status_var.set("Converting… large IQ files can take a while.")
+        self.status_var.set("Converting…")
+        self.time_var.set(
+            f"Elapsed 0:00 · Est. {format_duration(estimated)} remaining"
+        )
         self._append_log("-" * 48)
         self._append_log(f"Starting conversion: {input_path.name}")
         self._append_log(f"RBW = {rbw:g} Hz → {output_dir}")
+        self._append_log(f"Estimated time: ~{format_duration(estimated)}")
+        self._schedule_timer()
 
         thread = threading.Thread(
             target=self._convert_worker,
@@ -355,11 +467,58 @@ class IQConverterGUI(tk.Tk):
         )
         thread.start()
 
+    def _schedule_timer(self):
+        if self._timer_job is not None:
+            self.after_cancel(self._timer_job)
+        self._tick_timer()
+
+    def _tick_timer(self):
+        if not self._converting:
+            self._timer_job = None
+            return
+
+        elapsed = time.monotonic() - self._convert_started_at
+        fraction = self._progress_fraction
+
+        # Blend stage progress with time-based progress so the bar keeps moving
+        if self._estimated_total_s > 0:
+            time_fraction = min(0.95, elapsed / self._estimated_total_s)
+        else:
+            time_fraction = 0.0
+        display_fraction = max(fraction, time_fraction * 0.85)
+        if fraction >= 1.0:
+            display_fraction = 1.0
+
+        self.progress_var.set(display_fraction * 100)
+
+        if fraction >= 0.08:
+            projected_total = elapsed / max(fraction, 0.08)
+            remaining = max(0.0, projected_total - elapsed)
+        else:
+            remaining = max(0.0, self._estimated_total_s - elapsed)
+
+        stage = self._progress_stage or "Working…"
+        self.status_var.set(stage)
+        self.time_var.set(
+            f"Elapsed {format_duration(elapsed)} · Est. {format_duration(remaining)} remaining"
+        )
+
+        self._timer_job = self.after(200, self._tick_timer)
+
+    def _on_progress(self, fraction, message):
+        self._progress_fraction = fraction
+        self._progress_stage = message
+
     def _convert_worker(self, input_path, output_dir, rbw):
         buffer = io.StringIO()
         try:
             with redirect_stdout(buffer), redirect_stderr(buffer):
-                process_file(str(input_path), str(output_dir), rbw)
+                process_file(
+                    str(input_path),
+                    str(output_dir),
+                    rbw,
+                    progress_callback=lambda f, m: self.after(0, self._on_progress, f, m),
+                )
 
             details = buffer.getvalue().strip()
             if details:
@@ -383,11 +542,21 @@ class IQConverterGUI(tk.Tk):
                 message = f"{details}\n{message}"
             self.after(0, self._conversion_failed, message)
 
+    def _stop_timer(self):
+        self._converting = False
+        if self._timer_job is not None:
+            self.after_cancel(self._timer_job)
+            self._timer_job = None
+
     def _conversion_succeeded(self, png_path):
-        self.progress.stop()
+        elapsed = time.monotonic() - self._convert_started_at
+        self._stop_timer()
+        self.progress_var.set(100)
         self.convert_button.config(state="normal")
         self.status_var.set(f"Done — opened {png_path.name}")
+        self.time_var.set(f"Finished in {format_duration(elapsed)}")
         self._append_log(f"Saved: {png_path}")
+        self._append_log(f"Actual time: {format_duration(elapsed)}")
 
         try:
             os.startfile(png_path)
@@ -398,9 +567,11 @@ class IQConverterGUI(tk.Tk):
             )
 
     def _conversion_failed(self, details):
-        self.progress.stop()
+        self._stop_timer()
+        self.progress_var.set(0)
         self.convert_button.config(state="normal")
         self.status_var.set("Conversion failed.")
+        self.time_var.set("")
         self._append_log(f"ERROR: {details}")
         messagebox.showerror("Conversion failed", details)
 

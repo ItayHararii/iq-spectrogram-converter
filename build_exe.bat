@@ -42,7 +42,9 @@ echo Building executable...
     --windowed ^
     --onefile ^
     --name "IQ_Spectrogram_Converter" ^
+    --add-data "assets;assets" ^
     --hidden-import=iq_data ^
+    --hidden-import=PIL ^
     --hidden-import=numpy ^
     --hidden-import=matplotlib ^
     --hidden-import=seaborn ^

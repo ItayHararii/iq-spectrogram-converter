@@ -11,7 +11,12 @@ from scipy.signal import stft
 import soundfile as sf
 
 
-def process_file(path, output_dir, rbw):
+def process_file(path, output_dir, rbw, progress_callback=None):
+    def report(fraction, message):
+        if progress_callback is not None:
+            progress_callback(max(0.0, min(1.0, fraction)), message)
+
+    report(0.02, "Reading WAV…")
     x, fs = sf.read(path)
 
     I, Q = (x[:, 0], x[:, 1])
@@ -31,8 +36,8 @@ def process_file(path, output_dir, rbw):
     print(f"  File size      : {file_size_kb:.1f} kB")
 
     RBW = rbw
-    bin_width = RBW / 2
     n_fft = int(2 ** np.ceil(np.log2(fs / RBW * 2)))
+    report(0.12, "Computing STFT…")
     # boundary=None, padded=False: same framing as scipy.signal.spectrogram(..., mode="psd", scaling="spectrum")
     f, t, Zxx = stft(
         iq,
@@ -45,11 +50,14 @@ def process_file(path, output_dir, rbw):
         boundary=None,
         padded=False,
     )
-    # # Power matches spectrogram PSD: |Zxx|**2 with scaling="spectrum"
+
+    report(0.48, "Computing power spectrum…")
+    # Power matches spectrogram PSD: |Zxx|**2 with scaling="spectrum"
     power = np.abs(Zxx) ** 2
     power_db = 10 * np.log10(power)
     power = 10 ** (power_db / 10)
 
+    report(0.62, "Smoothing…")
     window_size = 5
     kernel = np.ones(window_size) / window_size
     power_smooth = np.apply_along_axis(
@@ -61,12 +69,33 @@ def process_file(path, output_dir, rbw):
 
     power_db = np.fft.fftshift(power_db)
 
+    report(0.75, "Rendering spectrogram…")
     plt.figure(figsize=(10, 10))
     sns.heatmap(power_db.T, cmap="jet")
     out_name = Path(path).stem + ".png"
+    report(0.90, "Saving PNG…")
     plt.savefig(os.path.join(output_dir, out_name), dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved          : {out_name}")
+    report(1.0, "Done")
+
+
+def estimate_conversion_seconds(path, rbw):
+    """Rough wall-clock estimate from WAV size / RBW (used for initial ETA)."""
+    info = sf.info(path)
+    fs = float(info.samplerate)
+    n_samples = int(info.frames)
+    file_mb = os.path.getsize(path) / (1024 * 1024)
+    n_fft = int(2 ** np.ceil(np.log2(max(fs / max(rbw, 1.0) * 2, 2.0))))
+    hop = max(n_fft // 2, 1)
+    n_frames = max(1, 1 + (n_samples - n_fft) // hop) if n_samples >= n_fft else 1
+
+    # Empirically weighted costs: STFT + smoothing + seaborn heatmap
+    stft_sec = (n_samples * np.log2(max(n_fft, 2))) / 4.5e7
+    smooth_sec = (n_fft * n_frames) / 3.5e7
+    plot_sec = (n_fft * n_frames) / 1.2e7
+    io_sec = 0.8 + 0.15 * file_mb
+    return max(2.0, float(stft_sec + smooth_sec + plot_sec + io_sec))
 
 
 if __name__ == "__main__":
