@@ -1,0 +1,22 @@
+[project]
+name = "crfs-iq-recorder"
+version = "1.0.0"
+description = "Local desktop client for CRFS RFeye EMP remote IQ recording"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PySide6>=6.6",
+  "requests>=2.31",
+  "paramiko>=3.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+crfs-iq-recorder = "crfs_iq_recorder.__main__:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
