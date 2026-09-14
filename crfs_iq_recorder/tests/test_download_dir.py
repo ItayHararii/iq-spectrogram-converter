@@ -44,10 +44,10 @@ def test_default_download_dir_is_local_profile_recordings():
 
 
 def test_cloud_download_dir_is_rejected():
-    cloud = r"C:\Users\itay.h\OneDrive - Sensorz\Documents\CRFS IQ Recorder\Recordings"
+    cloud = r"C:\Users\example\OneDrive\Documents\CRFS IQ Recorder\Recordings"
     assert is_cloud_path(cloud)
     assert resolved_download_dir(cloud) == default_download_dir()
-    state = ConnectionState.from_settings({"host": "10.1.0.11", "download_dir": cloud})
+    state = ConnectionState.from_settings({"host": "192.0.2.10", "download_dir": cloud})
     assert state.download_dir == ""
     assert not is_cloud_path(state.persistable()["download_dir"])
 
@@ -81,10 +81,10 @@ def test_settings_remember_download_dir(tmp_path, monkeypatch):
     settings = tmp_path / ".crfs_iq_recorder_settings.json"
     monkeypatch.setattr(paths, "settings_path", lambda: settings)
     chosen = tmp_path / "My IQ"
-    state = ConnectionState(host="10.1.0.11", download_dir=str(chosen))
+    state = ConnectionState(host="192.0.2.10", download_dir=str(chosen))
     save_settings(state.persistable())
     loaded = ConnectionState.from_settings(load_settings())
-    assert loaded.host == "10.1.0.11"
+    assert loaded.host == "192.0.2.10"
     assert loaded.download_dir == str(chosen)
     assert "http_password" not in load_settings()
     assert "sftp_password" not in load_settings()
@@ -98,7 +98,7 @@ def test_settings_remember_band_time_unit_and_format(tmp_path, monkeypatch):
     settings = tmp_path / ".crfs_iq_recorder_settings.json"
     monkeypatch.setattr(paths, "settings_path", lambda: settings)
     state = ConnectionState(
-        host="10.1.0.13",
+        host="192.0.2.13",
         freq_unit="GHz",
         freq_mode="start_end",
         start_hz=790_000_000,
@@ -131,7 +131,7 @@ def test_unverified_format_is_not_restored():
 
 
 def test_legacy_settings_without_download_dir_use_default():
-    state = ConnectionState.from_settings({"host": "192.168.1.12"})
+    state = ConnectionState.from_settings({"host": "192.0.2.12"})
     assert state.download_dir == ""
     assert resolved_download_dir(state.download_dir) == default_download_dir()
     assert Path(state.persistable()["download_dir"]) == default_download_dir()

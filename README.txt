@@ -1,7 +1,7 @@
 SENSORZ IQ Spectrogram Converter
 ================================
 
-Converts a stereo IQ WAV (I left, Q right) to a PNG: spectrum on top
+Turns a stereo IQ WAV (I left, Q right) into a PNG. Spectrum on top
 (dBFS/bin, average + peak-hold) and spectrogram underneath.
 
 
@@ -18,13 +18,13 @@ Optional EXE (no Python on the target PC):
   Double-click build_exe.bat
   Then run dist\IQ_Spectrogram_Converter.exe
 
-The EXE is not stored in Git. Attach it to a versioned GitHub Release
-when you distribute it.
+The EXE is not stored in Git. Attach it to a GitHub Release when you
+share it.
 
 
 USE
 ---
-- Choose a stereo IQ WAV, or drop a file/folder on the window
+- Choose a stereo IQ WAV, or drop a file or folder on the window
 - Confirm the output folder (default: IQ Results)
 - Set RBW in Hz, or use 5 / 15 / 30 / 50 kHz
 - Click Convert

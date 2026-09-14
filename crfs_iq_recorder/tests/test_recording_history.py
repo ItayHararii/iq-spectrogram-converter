@@ -53,7 +53,7 @@ def test_expand_group_entries_includes_all_split_parts():
 def test_recording_history_roundtrip_omits_secrets(tmp_path):
     path = tmp_path / "recordings.json"
     record = new_recording(
-        host="192.168.1.12",
+        host="192.0.2.12",
         start_hz=790_000_000,
         end_hz=810_000_000,
         center_hz=800_000_000,
@@ -78,7 +78,7 @@ def test_recording_history_roundtrip_omits_secrets(tmp_path):
 def test_match_iq_file_to_saved_parameters():
     started = datetime(2026, 9, 10, 18, 30, 0)
     record = new_recording(
-        host="192.168.1.12",
+        host="192.0.2.12",
         start_hz=790_000_000,
         end_hz=810_000_000,
         center_hz=800_000_000,
@@ -100,7 +100,7 @@ def test_match_iq_file_to_saved_parameters():
         1000,
         datetime(2026, 9, 10, 12, 0, 0),
     )
-    matched = match_recordings_to_entries([entry, other], [record], host="192.168.1.12")
+    matched = match_recordings_to_entries([entry, other], [record], host="192.0.2.12")
     assert matched[entry.path] == record
     assert other.path not in matched
     start, end, center, bw, duration = format_columns(record)
@@ -114,7 +114,7 @@ def test_match_iq_file_to_saved_parameters():
 def test_each_recording_matches_at_most_one_file_group():
     started = datetime(2026, 9, 10, 18, 30, 0)
     record = new_recording(
-        host="192.168.1.12",
+        host="192.0.2.12",
         start_hz=790_000_000,
         end_hz=810_000_000,
         center_hz=800_000_000,
@@ -124,7 +124,7 @@ def test_each_recording_matches_at_most_one_file_group():
     )
     first = RemoteEntry("iq_20260910_183000_0001.wav", "/a/iq_20260910_183000_0001.wav", False, 1, started)
     second = RemoteEntry("iq_20260910_183001_0001.wav", "/a/iq_20260910_183001_0001.wav", False, 1, started)
-    matched = match_recordings_to_entries([first, second], [record], host="192.168.1.12")
+    matched = match_recordings_to_entries([first, second], [record], host="192.0.2.12")
     assert len(matched) == 1
     assert first.path in matched
 
@@ -132,7 +132,7 @@ def test_each_recording_matches_at_most_one_file_group():
 def test_split_iq_parts_share_the_same_recording():
     started = datetime(2026, 9, 10, 19, 16, 20)
     record = new_recording(
-        host="192.168.1.12",
+        host="192.0.2.12",
         start_hz=5_000_000_000,
         end_hz=5_100_000_000,
         center_hz=5_050_000_000,
@@ -163,7 +163,7 @@ def test_split_iq_parts_share_the_same_recording():
             datetime(2026, 9, 10, 19, 16, 54),
         ),
     ]
-    matched = match_recordings_to_entries(parts, [record], host="192.168.1.12")
+    matched = match_recordings_to_entries(parts, [record], host="192.0.2.12")
     assert set(matched) == {part.path for part in parts}
     assert all(matched[part.path] == record for part in parts)
     assert format_columns(record)[4] == "4"
@@ -172,7 +172,7 @@ def test_split_iq_parts_share_the_same_recording():
 def test_later_split_part_matches_without_first_file():
     started = datetime(2026, 9, 10, 19, 16, 20)
     record = new_recording(
-        host="192.168.1.12",
+        host="192.0.2.12",
         start_hz=5_000_000_000,
         end_hz=5_100_000_000,
         center_hz=5_050_000_000,
@@ -187,14 +187,14 @@ def test_later_split_part_matches_without_first_file():
         326_836_928,
         datetime(2026, 9, 10, 19, 30, 0),
     )
-    matched = match_recordings_to_entries([later], [record], host="192.168.1.12")
+    matched = match_recordings_to_entries([later], [record], host="192.0.2.12")
     assert matched[later.path] == record
 
 
 def test_match_utc_filename_using_local_mtime():
     started = datetime(2026, 9, 10, 18, 42, 37)
     record = new_recording(
-        host="192.168.1.12",
+        host="192.0.2.12",
         start_hz=793_750_000,
         end_hz=806_250_000,
         center_hz=800_000_000,
@@ -209,14 +209,14 @@ def test_match_utc_filename_using_local_mtime():
         8_380_992,
         datetime(2026, 9, 10, 18, 42, 43),
     )
-    matched = match_recordings_to_entries([entry], [record], host="192.168.1.12")
+    matched = match_recordings_to_entries([entry], [record], host="192.0.2.12")
     assert matched[entry.path] == record
 
 
 def test_match_utc_filename_without_mtime():
     started = datetime(2026, 9, 10, 18, 42, 37)
     record = new_recording(
-        host="192.168.1.12",
+        host="192.0.2.12",
         start_hz=793_750_000,
         end_hz=806_250_000,
         center_hz=800_000_000,
@@ -231,14 +231,14 @@ def test_match_utc_filename_without_mtime():
         8_380_992,
         None,
     )
-    matched = match_recordings_to_entries([entry], [record], host="192.168.1.12")
+    matched = match_recordings_to_entries([entry], [record], host="192.0.2.12")
     assert matched[entry.path] == record
 
 
 def test_metadata_survives_sensor_ip_change(tmp_path):
     started = datetime(2026, 9, 10, 18, 30, 0)
     record = new_recording(
-        host="192.168.1.12",
+        host="192.0.2.12",
         start_hz=790_000_000,
         end_hz=810_000_000,
         center_hz=800_000_000,
@@ -256,7 +256,7 @@ def test_metadata_survives_sensor_ip_change(tmp_path):
         1000,
         datetime(2026, 9, 10, 18, 45, 0),
     )
-    matched = match_recordings_to_entries([entry], loaded, host="10.1.0.11")
+    matched = match_recordings_to_entries([entry], loaded, host="192.0.2.10")
     assert matched[entry.path].id == record.id
     assert matched[entry.path].duration_s == 4
     assert matched[entry.path].center_hz == 800_000_000
@@ -265,7 +265,7 @@ def test_metadata_survives_sensor_ip_change(tmp_path):
 def test_does_not_assign_metadata_to_unrelated_newest_file():
     started = datetime(2026, 9, 10, 12, 0, 0)
     record = new_recording(
-        host="192.168.1.12",
+        host="192.0.2.12",
         start_hz=790_000_000,
         end_hz=810_000_000,
         center_hz=800_000_000,
@@ -280,7 +280,7 @@ def test_does_not_assign_metadata_to_unrelated_newest_file():
         999,
         datetime(2026, 9, 10, 22, 0, 0),
     )
-    matched = match_recordings_to_entries([newest], [record], host="192.168.1.12")
+    matched = match_recordings_to_entries([newest], [record], host="192.0.2.12")
     assert newest.path not in matched
 
 
@@ -289,7 +289,7 @@ def test_persist_stem_then_match_later_parts(tmp_path):
 
     started = datetime(2026, 9, 10, 18, 30, 0)
     record = new_recording(
-        host="192.168.1.12",
+        host="192.0.2.12",
         start_hz=790_000_000,
         end_hz=810_000_000,
         center_hz=800_000_000,
@@ -306,7 +306,7 @@ def test_persist_stem_then_match_later_parts(tmp_path):
         1,
         started,
     )
-    matched = match_recordings_to_entries([first], [record], host="10.0.0.1")
+    matched = match_recordings_to_entries([first], [record], host="192.0.2.1")
     persist_matched_stems(matched, path)
     loaded = load_recordings(path)
     assert loaded[0].iq_stem == "iq_20260910_183000"
@@ -317,14 +317,14 @@ def test_persist_stem_then_match_later_parts(tmp_path):
         1,
         datetime(2026, 9, 10, 19, 0, 0),
     )
-    matched_later = match_recordings_to_entries([later], loaded, host="10.1.0.11")
+    matched_later = match_recordings_to_entries([later], loaded, host="192.0.2.10")
     assert matched_later[later.path].id == record.id
 
 
 def test_match_time_only_filename_with_folder_date():
     started = datetime(2026, 9, 10, 22, 43, 30)
     record = new_recording(
-        host="10.1.0.11",
+        host="192.0.2.10",
         start_hz=790_000_000,
         end_hz=810_000_000,
         center_hz=800_000_000,
@@ -339,5 +339,5 @@ def test_match_time_only_filename_with_folder_date():
         251_413_044,
         None,
     )
-    matched = match_recordings_to_entries([entry], [record], host="192.168.1.12")
+    matched = match_recordings_to_entries([entry], [record], host="192.0.2.12")
     assert matched[entry.path] == record

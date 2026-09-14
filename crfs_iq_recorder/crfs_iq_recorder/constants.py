@@ -8,7 +8,7 @@ APP_NAME = "CRFS IQ Recorder"
 APP_ID = "Sensorz.CRFSIQRecorder"
 
 DEFAULT_USERNAME = "admin"
-DEFAULT_PASSWORD = "pass"
+DEFAULT_PASSWORD = ""
 DEFAULT_TIMEOUT_S = 30.0
 DEFAULT_PORT = 80
 EMP_PATH = "/emp/"
@@ -31,9 +31,9 @@ DEFAULT_END_HZ = 806_250_000
 
 DEFAULT_RECORDED_TIME_S = 0.1
 DEFAULT_SFTP_PORT = 22
-# CRFS SSH from Sensors Inventory — not the HTTP Basic Auth account.
+# SFTP uses a different account from HTTP Basic Auth. Passwords start empty.
 DEFAULT_SFTP_USERNAME = "root"
-DEFAULT_SFTP_PASSWORD = "rf3y3"
+DEFAULT_SFTP_PASSWORD = ""
 SFTP_REMDATA_ROOT = "/mnt/1/remdata/"
 
 EMPIRICAL_REF_SIZE_MB = "61.051"
@@ -112,7 +112,7 @@ RECORDING_FORMATS: tuple[RecordingFormatInfo, ...] = (
         emp_verified=False,
         short_label="BIN (unverified)",
         tooltip=(
-            "Requested identifier — not present in the documented EMP enum "
+            "Requested identifier - not present in the documented EMP enum "
             "(WAVE, XDAT, NCP, HDF5) or public CRFS format lists. "
             "The sensor may reject this value. This is not a file-extension conversion."
         ),
@@ -122,7 +122,7 @@ RECORDING_FORMATS: tuple[RecordingFormatInfo, ...] = (
         emp_verified=False,
         short_label="JSON (unverified IQ format)",
         tooltip=(
-            "Requested identifier — not a verified EMP IQ sample format. "
+            "Requested identifier - not a verified EMP IQ sample format. "
             "CRFS uses JSON for REST APIs and configuration files. "
             "Preset export and request preview JSON are separate from this field. "
             "Do not treat a .json extension as format conversion."
@@ -156,12 +156,12 @@ UNVERIFIED_TIMING_TOOLTIPS = {
 MODEL_INFO_TEXT = (
     "Published CRFS receiver ranges differ by model and are shown for reference only. "
     "This application does not clamp or rewrite your request to fit a model.\n\n"
-    "Node 40-8: 9 kHz–8 GHz, 40 MHz IBW, ~20 MHz sustained local I/Q.\n"
-    "Node 100-8: 9 kHz–8 GHz, 100 MHz IBW, ~25 MHz sustained local I/Q.\n"
-    "Node 100-18 / LW: 9 kHz–18 GHz, 100 MHz IBW, ~25 MHz sustained local I/Q.\n"
-    "Node Plus 100-18: 9 kHz–18 GHz, 100 MHz IBW, 100 MHz sustained local I/Q.\n"
-    "Node 100-40: 9 kHz–40 GHz, 100 MHz IBW, ~25 MHz sustained local I/Q.\n\n"
+    "Node 40-8: 9 kHz-8 GHz, 40 MHz IBW, ~20 MHz sustained local I/Q.\n"
+    "Node 100-8: 9 kHz-8 GHz, 100 MHz IBW, ~25 MHz sustained local I/Q.\n"
+    "Node 100-18 / LW: 9 kHz-18 GHz, 100 MHz IBW, ~25 MHz sustained local I/Q.\n"
+    "Node Plus 100-18: 9 kHz-18 GHz, 100 MHz IBW, 100 MHz sustained local I/Q.\n"
+    "Node 100-40: 9 kHz-40 GHz, 100 MHz IBW, ~25 MHz sustained local I/Q.\n\n"
     "Node 100-x can record 100 MHz I/Q for a few seconds (not sustained gapless). "
     "Tuning resolution on the Node 100-18 datasheet is 1 Hz. "
-    "Firmware and options vary — confirm on the specific sensor."
+    "Firmware and options vary. Confirm on the specific sensor."
 )

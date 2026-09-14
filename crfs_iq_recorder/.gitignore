@@ -30,6 +30,9 @@ dist/
 *.exe
 *.spec.bak
 
+# Internal before/after shots (can include local IPs or usernames)
+docs/ui_refresh/
+
 # OS
 Thumbs.db
 Desktop.ini

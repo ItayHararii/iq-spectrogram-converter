@@ -122,7 +122,7 @@ class ConnectionState:
         used_http_login_for_sftp = bool(data.get("sftp_same_as_http")) or saved_user in ("", DEFAULT_USERNAME)
         state.sftp_same_as_http = False
         if used_http_login_for_sftp:
-            # Older builds reused HTTP admin/pass. CRFS SSH is a different account.
+            # Older builds reused the HTTP username for SFTP. SSH is a different account.
             state.sftp_username = DEFAULT_SFTP_USERNAME
         else:
             state.sftp_username = saved_user

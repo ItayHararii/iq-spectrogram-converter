@@ -40,7 +40,7 @@ def test_parse_versions_device_type_and_node_software():
 
 def test_build_prefers_versions_firmware_and_node_serial():
     info = build_sensor_info(
-        host="192.168.1.12",
+        host="192.0.2.12",
         node_payload=NODE,
         versions_payload=VERSIONS,
         status="Connected",
@@ -53,7 +53,7 @@ def test_build_prefers_versions_firmware_and_node_serial():
 
 def test_software_manager_fallback_when_node_json_missing():
     info = build_sensor_info(
-        host="192.168.1.12",
+        host="192.0.2.12",
         manager_payload={"label": "rfeye100400", "node_software_version": "2.25-325"},
         status="Connected",
     )

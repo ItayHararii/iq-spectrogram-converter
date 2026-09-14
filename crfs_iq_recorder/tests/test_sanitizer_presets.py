@@ -42,9 +42,9 @@ def test_connection_state_persistable_omits_passwords():
 
 
 def test_saved_demo_flag_is_ignored_unless_constructor_requests_it():
-    state = ConnectionState.from_settings({"host": "10.1.0.11", "demo": True})
+    state = ConnectionState.from_settings({"host": "192.0.2.10", "demo": True})
     assert state.demo is False
-    forced = ConnectionState.from_settings({"host": "10.1.0.11", "demo": True}, demo=True)
+    forced = ConnectionState.from_settings({"host": "192.0.2.10", "demo": True}, demo=True)
     assert forced.demo is True
     assert "demo" not in forced.persistable()
 
@@ -52,7 +52,7 @@ def test_saved_demo_flag_is_ignored_unless_constructor_requests_it():
 def test_legacy_http_sftp_settings_switch_to_crfs_ssh_account():
     state = ConnectionState.from_settings(
         {
-            "host": "192.168.1.12",
+            "host": "192.0.2.12",
             "username": "admin",
             "sftp_username": "admin",
             "sftp_same_as_http": True,

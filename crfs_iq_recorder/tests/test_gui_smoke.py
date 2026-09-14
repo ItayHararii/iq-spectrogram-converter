@@ -441,14 +441,14 @@ def test_stale_sensor_info_does_not_overwrite(qapp):
 
     window = MainWindow(demo=True)
     try:
-        window._conn.host = "10.1.0.11"
+        window._conn.host = "192.0.2.10"
         window._info_token = 3
         window._apply_sensor_info(
             SensorInfo(
-                host="10.1.0.11",
+                host="192.0.2.10",
                 model="R40-8",
                 firmware="2.25-325",
-                serial="rfeye300540",
+                serial="rfeyeTEST",
                 status="Connected",
                 connected=True,
             )
@@ -456,9 +456,9 @@ def test_stale_sensor_info_does_not_overwrite(qapp):
         window._show_sensor_info_result(
             (
                 2,
-                "192.168.1.12",
+                "192.0.2.12",
                 SensorInfo(
-                    host="192.168.1.12",
+                    host="192.0.2.12",
                     model="StaleModel",
                     firmware="old",
                     serial="stale",
@@ -468,10 +468,10 @@ def test_stale_sensor_info_does_not_overwrite(qapp):
             )
         )
         assert window.model_value.text() != "StaleModel"
-        assert window.serial_value.text() == "rfeye300540"
+        assert window.serial_value.text() == "rfeyeTEST"
         window._show_sensor_info(
             SensorInfo(
-                host="192.168.1.12",
+                host="192.0.2.12",
                 model="WrongHost",
                 firmware="x",
                 serial="y",

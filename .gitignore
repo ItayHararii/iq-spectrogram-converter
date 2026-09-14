@@ -44,3 +44,6 @@ Desktop.ini
 # Extra example renders (one screenshot is tracked for the README)
 assets/examples/*
 !assets/examples/example_spectrum_spectrogram_081608.png
+
+# Internal before/after shots (can include local IPs or usernames)
+crfs_iq_recorder/docs/ui_refresh/

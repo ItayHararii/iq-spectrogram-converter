@@ -1,4 +1,4 @@
-"""Capture Confluence screenshots from the live CRFS IQ Recorder widgets."""
+"""Capture Confluence screenshots from demo widgets. No live sensor, IP, or password."""
 
 from __future__ import annotations
 
@@ -19,10 +19,12 @@ from PySide6.QtWidgets import QApplication
 
 from crfs_iq_recorder.connection_state import ConnectionState
 from crfs_iq_recorder.gui import MainWindow, configure_appearance
-from crfs_iq_recorder.paths import default_download_dir
 from crfs_iq_recorder.recording_history import add_recording, new_recording
 from crfs_iq_recorder.sensor_info import SensorInfo
 from crfs_iq_recorder.sftp_window import SftpWindow
+
+EXAMPLE_HOST = "example"
+EXAMPLE_DOWNLOAD = r"C:\CRFS IQ Recorder\Recordings"
 
 
 def _wait(app: QApplication, pred, timeout: float = 8.0) -> bool:
@@ -45,15 +47,17 @@ def _save(widget, path: Path) -> None:
 
 def main() -> int:
     out = Path(__file__).resolve().parent
-    recordings = Path(tempfile.gettempdir()) / "crfs_iq_recorder_shot_recordings.json"
+    tmp = Path(tempfile.mkdtemp(prefix="crfs-docs-shot-"))
     os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
+    from crfs_iq_recorder import paths as app_paths
     from crfs_iq_recorder import recording_history
 
-    recording_history.recordings_path = lambda: recordings  # type: ignore[method-assign]
+    app_paths.settings_path = lambda: tmp / "settings.json"  # type: ignore[method-assign]
+    recording_history.recordings_path = lambda: tmp / "recordings.json"  # type: ignore[method-assign]
     add_recording(
         new_recording(
-            host="10.1.0.11",
+            host=EXAMPLE_HOST,
             start_hz=793_750_000,
             end_hz=806_250_000,
             center_hz=800_000_000,
@@ -69,15 +73,15 @@ def main() -> int:
     configure_appearance(app)
 
     window = MainWindow(demo=True)
-    window._conn.host = "10.1.0.11"
-    window._conn.download_dir = str(default_download_dir())
-    window.conn_label.setText("10.1.0.11")
+    window._conn.host = EXAMPLE_HOST
+    window._conn.download_dir = EXAMPLE_DOWNLOAD
+    window.conn_label.setText(EXAMPLE_HOST)
     window._apply_sensor_info(
         SensorInfo(
-            host="10.1.0.11",
+            host=EXAMPLE_HOST,
             model="R40-8",
             firmware="2.25-325",
-            serial="rfeye300540",
+            serial="rfeyeDEMO",
             status="Connected",
             connected=True,
         )
@@ -95,24 +99,12 @@ def main() -> int:
     time.sleep(0.4)
     app.processEvents()
     _save(window, out / "01-main-window.png")
-    refresh = ROOT / "docs" / "ui_refresh"
-    _save(window, refresh / "after-main.png")
-
-    from crfs_iq_recorder.connection_dialog import ConnectionDialog
-
-    settings = ConnectionDialog(window._conn, window)
-    settings.show()
-    app.processEvents()
-    time.sleep(0.2)
-    app.processEvents()
-    _save(settings, refresh / "after-settings.png")
-    settings.close()
 
     sftp = SftpWindow(
         ConnectionState(
             demo=True,
-            host="10.1.0.11",
-            download_dir=str(default_download_dir()),
+            host=EXAMPLE_HOST,
+            download_dir=EXAMPLE_DOWNLOAD,
         )
     )
     sftp.resize(1240, 720)
@@ -127,19 +119,18 @@ def main() -> int:
         sftp.table.selectRow(target)
         sftp.table.setCurrentCell(target, 1)
         sftp._on_selection_changed()
-    _wait(app, lambda: not sftp.preview_image.pixmap() is None and not sftp.preview_image.pixmap().isNull(), 10)
+    _wait(
+        app,
+        lambda: sftp.preview_image.pixmap() is not None and not sftp.preview_image.pixmap().isNull(),
+        10,
+    )
     app.processEvents()
     _save(sftp, out / "02-sensor-files.png")
     _save(sftp.preview_image, out / "03-waterfall-preview.png")
-    _save(sftp, refresh / "after-sftp.png")
 
     sftp.close()
     window.close()
     app.processEvents()
-    try:
-        recordings.unlink(missing_ok=True)
-    except OSError:
-        pass
     return 0
 
 
