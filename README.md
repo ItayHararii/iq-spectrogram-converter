@@ -9,6 +9,8 @@ The PNG has two stacked plots that share a frequency axis centered at 0 Hz:
 
 Large files are read in float32 chunks so the full capture does not have to sit in RAM.
 
+The **CRFS IQ Recorder** (start recordings on a sensor and download WAVE files) is in [`crfs_iq_recorder/`](crfs_iq_recorder/).
+
 ![Example spectrum and spectrogram](assets/examples/example_spectrum_spectrogram_081608.png)
 
 ## Features

@@ -1,0 +1,36 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local settings, history, secrets
+.crfs_iq_recorder_settings.json
+.crfs_iq_recorder_recordings.json
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# Recordings and logs
+*.wav
+*.log
+
+# Build outputs
+build/
+dist/
+*.exe
+*.spec.bak
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

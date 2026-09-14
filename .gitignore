@@ -36,9 +36,6 @@ build/
 *.exe
 *.lnk
 
-# Unrelated local work
-crfs_iq_recorder/
-
 # OS
 Thumbs.db
 Desktop.ini
