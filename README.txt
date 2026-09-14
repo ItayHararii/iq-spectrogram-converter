@@ -1,24 +1,47 @@
 IQ Spectrogram Converter
-=======================
+========================
 
-EASIEST WAY
+Converts a stereo IQ WAV (I left, Q right) to a PNG: spectrum on top
+(dBFS/bin, average + peak-hold) and spectrogram underneath.
+
+
+RUN THE GUI
 -----------
 Double-click:  Start IQ Converter.bat
 
-First run installs dependencies automatically.
-After that it just opens the GUI.
+Needs Python 3 on PATH. First run creates a venv and installs
+requirements.txt. Later runs just open the app.
+
+After that, Run_IQ_GUI.bat starts the GUI without checking packages.
+
+Optional EXE (no Python on the target PC):
+  Double-click build_exe.bat
+  Then run dist\IQ_Spectrogram_Converter.exe
 
 
-OPTIONAL: STANDALONE EXE
-------------------------
-Double-click:  build_exe.bat
-Then run:      dist\IQ_Spectrogram_Converter.exe
-
-
-GUI
+USE
 ---
-- Choose a stereo IQ WAV (I left / Q right), or drop a file/folder onto the window
-- Convert one file, or use Convert folder for every WAV in a directory
-- Choose output folder (default: IQ Results)
-- Set RBW or pick a preset
-- PNG is labeled (time, frequency, dB); optionally opens when done
+- Choose a stereo IQ WAV, or drop a file/folder on the window
+- Confirm the output folder (default: IQ Results)
+- Set RBW in Hz, or use 5 / 15 / 30 / 50 kHz
+- Click Convert
+
+Also: Convert folder (WAVs in that folder only), dark/light theme,
+drag-and-drop, Open image / Open output folder, Open when done.
+Display options: colormap, frequency smooth (off by default), auto dB.
+
+Large files are read in float32 chunks. Input must be stereo IQ.
+
+
+COMMAND LINE
+------------
+venv\Scripts\python.exe iq_data.py --input file.wav --output "IQ Results" --rbw 15000
+venv\Scripts\python.exe iq_data.py --folder wav_folder --output "IQ Results" --rbw 15000
+
+Optional: --cmap, --freq-smooth, --db-min, --db-max
+
+
+REQUIREMENTS
+------------
+Python 3, plus: numpy, matplotlib, seaborn, scipy, soundfile, Pillow,
+tkinterdnd2 (see requirements.txt).
