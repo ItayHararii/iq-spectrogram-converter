@@ -42,16 +42,21 @@ echo Building executable...
     --windowed ^
     --onefile ^
     --name "IQ_Spectrogram_Converter" ^
+    --icon "assets\sensorz_icon.ico" ^
     --add-data "assets;assets" ^
     --hidden-import=iq_data ^
+    --hidden-import=iq_theme ^
     --hidden-import=PIL ^
+    --hidden-import=PIL.ImageTk ^
     --hidden-import=numpy ^
     --hidden-import=matplotlib ^
     --hidden-import=seaborn ^
     --hidden-import=scipy ^
     --hidden-import=soundfile ^
+    --hidden-import=tkinterdnd2 ^
     --collect-all matplotlib ^
     --collect-all seaborn ^
+    --collect-all tkinterdnd2 ^
     iq_gui.py
 
 if errorlevel 1 goto :error

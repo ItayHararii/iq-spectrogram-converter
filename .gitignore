@@ -1,0 +1,17 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyc
+IQ Collection/
+IQ Results/
+IQ Results.zip
+dist/
+build/
+*.exe
+*.wav
+.iq_gui_settings.json
+.iq_eta_calibration.json
+crfs_iq_recorder/
+*.lnk
+assets/examples/
