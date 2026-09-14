@@ -4,11 +4,20 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 datas = [('assets', 'assets')]
-_recorder_icon = Path('crfs_iq_recorder/assets/sensorz_icon.ico')
-_local_icon = Path('assets/sensorz_icon.ico')
-_exe_icon = _recorder_icon if _recorder_icon.is_file() else _local_icon
+_exe_icon = Path('assets/sensorz_icon.ico')
 binaries = []
-hiddenimports = ['iq_data', 'iq_theme', 'PIL', 'PIL.ImageTk', 'numpy', 'matplotlib', 'seaborn', 'scipy', 'soundfile', 'tkinterdnd2']
+hiddenimports = [
+    'iq_data',
+    'iq_theme',
+    'PIL',
+    'PIL.ImageTk',
+    'numpy',
+    'matplotlib',
+    'seaborn',
+    'scipy',
+    'soundfile',
+    'tkinterdnd2',
+]
 tmp_ret = collect_all('matplotlib')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('seaborn')

@@ -73,15 +73,9 @@ SETTINGS_NAME = ".iq_gui_settings.json"
 
 
 def _brand_icon_path(name: str) -> Path:
-    """CRFS IQ Recorder app mark, then local assets (frozen builds use bundled assets)."""
+    """Local Sensorz assets (frozen builds use the bundled assets folder)."""
     here = Path(__file__).resolve().parent
-    roots = []
-    if getattr(sys, "frozen", False):
-        roots.append(resource_dir() / "assets")
-    else:
-        roots.append(here / "crfs_iq_recorder" / "assets")
-        roots.append(here / "assets")
-        roots.append(resource_dir() / "assets")
+    roots = [resource_dir() / "assets", here / "assets"]
     for folder in roots:
         path = folder / name
         if path.is_file():

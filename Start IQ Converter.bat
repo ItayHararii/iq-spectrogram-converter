@@ -56,8 +56,8 @@ if errorlevel 1 (
 if not exist "IQ Results" mkdir "IQ Results"
 if not exist "IQ Collection" mkdir "IQ Collection"
 
-if not exist "crfs_iq_recorder\assets\sensorz_icon.ico" if not exist "assets\sensorz_icon.ico" (
-    echo WARNING: sensorz_icon.ico missing — taskbar may show the Python icon.
+if not exist "assets\sensorz_icon.ico" (
+    echo WARNING: assets\sensorz_icon.ico missing — taskbar may show the Python icon.
 )
 
 echo Refreshing launcher shortcut...
