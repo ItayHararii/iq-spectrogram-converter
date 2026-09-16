@@ -23,6 +23,10 @@ secrets.json
 # Recordings and logs
 *.wav
 *.log
+*.xlsm
+*.xlsx
+*.crfs-backup-*
+.crfs_iq_recorder_excel_log.json
 
 # Build outputs
 build/

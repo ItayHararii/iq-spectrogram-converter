@@ -112,12 +112,20 @@ def main() -> int:
     sftp.raise_()
     app.processEvents()
     time.sleep(0.3)
-    _wait(app, lambda: sftp.table.rowCount() >= 2)
+    _wait(app, lambda: sftp.table.topLevelItemCount() >= 2)
     files = [entry for entry in sftp._entries if not entry.is_dir]
-    target = next((i for i, e in enumerate(sftp._entries) if "0001" in e.name), 0)
-    if files:
-        sftp.table.selectRow(target)
-        sftp.table.setCurrentCell(target, 1)
+    group = next(
+        (
+            sftp.table.topLevelItem(i)
+            for i in range(sftp.table.topLevelItemCount())
+            if sftp.table.topLevelItem(i) and sftp.table.topLevelItem(i).childCount()
+        ),
+        sftp.table.topLevelItem(0),
+    )
+    if group is not None:
+        sftp.table.clearSelection()
+        group.setSelected(True)
+        sftp.table.setCurrentItem(group)
         sftp._on_selection_changed()
     _wait(
         app,

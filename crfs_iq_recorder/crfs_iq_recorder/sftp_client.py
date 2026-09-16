@@ -67,6 +67,9 @@ class SftpBrowser:
     def read_prefix(self, remote_path: str, local_path: Path, max_bytes: int) -> int:
         raise NotImplementedError
 
+    def remove_file(self, remote_path: str) -> None:
+        raise NotImplementedError
+
 
 def _raise_if_cancelled(cancel: threading.Event | None) -> None:
     if cancel is not None and cancel.is_set():
@@ -163,6 +166,16 @@ class ParamikoSftpBrowser(SftpBrowser):
         except OSError as exc:
             cleanup_part(tmp)
             raise SftpError(f"Download failed: {exc}") from exc
+
+    def remove_file(self, remote_path: str) -> None:
+        try:
+            self._sftp.remove(remote_path)
+        except FileNotFoundError as exc:
+            raise SftpError(f"File not found: {remote_path}") from exc
+        except OSError as exc:
+            raise SftpError(f"Could not delete {remote_path}: {exc}") from exc
+        except Exception as exc:
+            raise SftpError(f"Could not delete {remote_path}: {exc}") from exc
 
 
 def connect_sftp(
@@ -298,6 +311,83 @@ class DemoSftpBrowser(SftpBrowser):
                 ]
             )
 
+    def add_file(
+        self,
+        name: str,
+        directory: str,
+        *,
+        payload: bytes | None = None,
+        size: int | None = None,
+        modified: datetime | None = None,
+    ) -> RemoteEntry:
+        folder = _demo_dir_key(directory)
+        if folder not in self._dirs:
+            parent = folder.rsplit("/", 2)[0] + "/" if folder.count("/") > 2 else "/mnt/1/remdata/"
+            date_name = folder.strip("/").rsplit("/", 1)[-1]
+            remote_dir = folder.rstrip("/")
+            if parent in self._dirs and not any(item.path.rstrip("/") == remote_dir for item in self._dirs[parent]):
+                self._dirs[parent].append(
+                    RemoteEntry(date_name, remote_dir, True, 0, modified or datetime.now())
+                )
+            self._dirs[folder] = []
+        data = payload if payload is not None else stereo_iq_tone_wav_bytes()
+        path = join_remote(directory, name)
+        nbytes = int(size if size is not None else len(data))
+        if size is not None and size != len(data):
+            data = (data + b"\x00" * max(0, size - len(data)))[:size] if size else data
+            data = data[:nbytes] if nbytes <= len(data) else data + bytes(nbytes - len(data))
+        self._files[path] = data[:nbytes] if nbytes <= len(data) else data + bytes(nbytes - len(data))
+        entry = RemoteEntry(name, path, False, nbytes, modified or datetime.now())
+        current = [item for item in self._dirs[folder] if item.path != path]
+        current.append(entry)
+        self._dirs[folder] = sort_remote_entries(current)
+        return entry
+
+    def set_file_size(self, remote_path: str, size: int, *, modified: datetime | None = None) -> None:
+        payload = self._files.get(remote_path, stereo_iq_tone_wav_bytes())
+        nbytes = max(0, int(size))
+        self._files[remote_path] = payload[:nbytes] if nbytes <= len(payload) else payload + bytes(nbytes - len(payload))
+        when = modified or datetime.now()
+        for folder, entries in list(self._dirs.items()):
+            updated: list[RemoteEntry] = []
+            changed = False
+            for item in entries:
+                if item.path == remote_path:
+                    updated.append(RemoteEntry(item.name, item.path, False, nbytes, when))
+                    changed = True
+                else:
+                    updated.append(item)
+            if changed:
+                self._dirs[folder] = sort_remote_entries(updated)
+
+    def publish_capture(
+        self,
+        stem: str,
+        *,
+        parts: int = 1,
+        directory: str | None = None,
+        when: datetime | None = None,
+        size: int | None = None,
+    ) -> list[RemoteEntry]:
+        folder = directory or today_remdata_directory()
+        stamp = when or datetime.now()
+        wav = stereo_iq_tone_wav_bytes()
+        nbytes = int(size if size is not None else len(wav))
+        out: list[RemoteEntry] = []
+        count = max(1, int(parts))
+        for index in range(1, count + 1):
+            name = f"{stem}_{index:04d}.wav"
+            out.append(
+                self.add_file(
+                    name,
+                    folder,
+                    payload=wav,
+                    size=nbytes,
+                    modified=stamp + timedelta(seconds=index - 1),
+                )
+            )
+        return out
+
     def directory_exists(self, path: str) -> bool:
         key = _demo_dir_key(path)
         return key in self._dirs
@@ -340,3 +430,11 @@ class DemoSftpBrowser(SftpBrowser):
         except DownloadError as exc:
             cleanup_part(tmp)
             raise SftpError(str(exc)) from exc
+
+    def remove_file(self, remote_path: str) -> None:
+        path = (remote_path or "").replace("\\", "/")
+        if path not in self._files:
+            raise SftpError(f"File not found: {path}")
+        del self._files[path]
+        for folder, entries in list(self._dirs.items()):
+            self._dirs[folder] = [item for item in entries if item.path != path]

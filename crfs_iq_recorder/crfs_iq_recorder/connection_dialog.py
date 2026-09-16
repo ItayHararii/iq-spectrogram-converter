@@ -114,7 +114,7 @@ class ConnectionDialog(QDialog):
         local.addRow("Download folder", dl_row)
         form_l.addLayout(local)
 
-        hint = QLabel("Passwords are not saved.")
+        hint = QLabel("Usernames and passwords are remembered on this computer.")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         form_l.addWidget(hint)

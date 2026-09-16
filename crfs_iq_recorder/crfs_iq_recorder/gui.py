@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,10 @@ from PySide6.QtGui import QGuiApplication, QIcon, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -28,6 +32,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QStatusBar,
     QVBoxLayout,
@@ -36,6 +41,8 @@ from PySide6.QtWidgets import (
 
 from . import APP_NAME, __version__
 from .api_client import EmpClient, HttpOutcome
+from .class_match import suggest_class
+from .collection_catalog import preferred_event, load_workbook_catalog
 from .connection_dialog import ConnectionDialog
 from .connection_state import ConnectionState
 from .constants import (
@@ -46,6 +53,16 @@ from .constants import (
     VERIFIED_RECORDING_FORMATS,
 )
 from .demo import DemoTransport
+from .demo_sftp import shared_demo_browser
+from .excel_log import ExcelLogStore, flush_excel_queue, pending_from_row
+from .excel_writer import ExcelRow
+from .file_watch import (
+    FileWatchState,
+    capture_is_settled,
+    folders_for_recording,
+    list_watch_entries,
+    update_file_watch,
+)
 from .frequency import (
     FrequencyError,
     FrequencyPlan,
@@ -54,8 +71,18 @@ from .frequency import (
     from_start_end,
     parse_to_integer_hz,
 )
-from .paths import ensure_download_dir, load_settings, save_settings, user_config_dir
-from .recording_history import add_recording, new_recording, remove_recording
+from .paths import ensure_download_dir, load_settings, save_settings, user_config_dir, resolved_download_dir
+from .recording_history import (
+    add_recording,
+    iq_group_key,
+    load_recordings,
+    match_recordings_to_entries,
+    new_recording,
+    persist_matched_stems,
+    recording_group_key,
+    remote_directory,
+    remove_recording,
+)
 from .recording_status import (
     CONFIRMED,
     FINALIZING,
@@ -64,12 +91,14 @@ from .recording_status import (
     RECORDING,
     SUBMITTING,
     UNKNOWN,
+    WAITING,
 )
 from .request_builder import RequestBuildError, build_payload_for_recording_time, unique_task_id
 from .sanitizer import redact_text
 from .sensor_info import SensorInfo, blank_info, checking_info
+from .sensor_label import workbook_sensor_name
 from .size_estimate import SizeEstimateError, empirical_size_mb, format_estimate
-from .sftp_window import SftpWindow
+from .sftp_window import SftpWindow, _open_browser
 from .theme import (
     DARK_MODE,
     LIGHT_MODE,
@@ -162,9 +191,36 @@ class MainWindow(QMainWindow):
         self._open_record_id: str | None = None
         self._log_collapsed = False
         self._log_sizes = [680, 300]
+        self._catalog = None
+        self._excel_store = ExcelLogStore()
+        self._class_user_set = False
+        self._series_active = False
+        self._series_remaining: int | None = None
+        self._stop_after_current = False
+        self._watching = False
+        self._waiting = False
+        self._wait_deadline = 0.0
+        self._recordings_completed = 0
+        self._files_found = 0
+        self._watch_state = FileWatchState()
+        self._elapsed_at: datetime | None = None
+        self._watch_browser = None
+        self._demo_parts = 1
+        self._settle_s = 8.0
+        self._stable_needed = 2
         self._record_timer = QTimer(self)
         self._record_timer.setSingleShot(True)
         self._record_timer.timeout.connect(self._on_recording_time_elapsed)
+        self._watch_timer = QTimer(self)
+        self._watch_timer.setInterval(2000)
+        self._watch_timer.timeout.connect(self._poll_collection_files)
+        self._excel_timer = QTimer(self)
+        self._excel_timer.setInterval(15000)
+        self._excel_timer.timeout.connect(self._flush_excel)
+        self._excel_timer.start()
+        self._wait_timer = QTimer(self)
+        self._wait_timer.setInterval(200)
+        self._wait_timer.timeout.connect(self._tick_wait)
         self._conn = ConnectionState.from_settings(load_settings(), demo=demo)
         self._plan = self._conn.frequency_plan()
 
@@ -198,6 +254,10 @@ class MainWindow(QMainWindow):
         self._apply_mode_fields()
         self._refresh_size()
         self._sync_connection_label()
+        if self._conn.excel_workbook:
+            self._load_workbook(self._conn.excel_workbook, quiet=True)
+        self._flush_excel()
+        self._update_collection_status()
         if current_mode() != self._conn.ui_theme:
             app = QApplication.instance()
             if app is not None:
@@ -399,11 +459,19 @@ class MainWindow(QMainWindow):
         self.msg.setWordWrap(True)
         layout.addWidget(self.msg)
 
+        layout.addWidget(self._collection_section())
+
         self.start_btn = QPushButton("Start Recording")
         self.start_btn.setObjectName("primary")
         self.start_btn.setDefault(True)
         self.start_btn.clicked.connect(self._on_start)
         layout.addWidget(self.start_btn)
+
+        self.stop_btn = QPushButton("Stop after current recording")
+        self.stop_btn.setObjectName("ghost")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._on_stop_after_current)
+        layout.addWidget(self.stop_btn)
 
         self.phase_label = QLabel(PHASE_LABELS[IDLE])
         self.phase_label.setObjectName("muted")
@@ -424,6 +492,115 @@ class MainWindow(QMainWindow):
         scroll.setWidget(card)
         outer.addWidget(scroll)
         return holder
+
+    def _collection_section(self) -> QWidget:
+        box = QFrame()
+        box.setObjectName("inputWrap")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        self.excel_check = QCheckBox("Log recordings to Excel")
+        self.excel_check.setChecked(bool(self._conn.excel_enabled))
+        self.excel_check.toggled.connect(self._on_excel_toggled)
+        layout.addWidget(self.excel_check)
+
+        book_row = QHBoxLayout()
+        book_row.setSpacing(8)
+        book_label = QLabel("Workbook")
+        book_label.setObjectName("muted")
+        self.workbook_edit = QLineEdit()
+        self.workbook_edit.setReadOnly(True)
+        self.workbook_edit.setPlaceholderText("Choose a .xlsm collection workbook")
+        if self._conn.excel_workbook:
+            self.workbook_edit.setText(self._conn.excel_workbook)
+        browse = QPushButton("Browse")
+        browse.setObjectName("ghost")
+        browse.clicked.connect(self._browse_workbook)
+        book_row.addWidget(book_label)
+        book_row.addWidget(self.workbook_edit, 1)
+        book_row.addWidget(browse)
+        layout.addLayout(book_row)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
+        self.event_combo = QComboBox()
+        self.event_combo.setEditable(True)
+        self.event_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        apply_combo_popup_palette(self.event_combo, dark=False)
+        self.class_combo = QComboBox()
+        self.class_combo.setEditable(True)
+        self.class_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        apply_combo_popup_palette(self.class_combo, dark=False)
+        self.class_combo.currentTextChanged.connect(self._on_class_edited)
+        self.sheet_combo = QComboBox()
+        self.sheet_combo.setEditable(True)
+        self.sheet_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        apply_combo_popup_palette(self.sheet_combo, dark=False)
+        grid.addWidget(QLabel("Collection event"), 0, 0)
+        grid.addWidget(self.event_combo, 0, 1)
+        grid.addWidget(QLabel("Target class"), 1, 0)
+        grid.addWidget(self.class_combo, 1, 1)
+        grid.addWidget(QLabel("Worksheet"), 2, 0)
+        grid.addWidget(self.sheet_combo, 2, 1)
+        layout.addLayout(grid)
+
+        repeat_row = QHBoxLayout()
+        repeat_row.setSpacing(12)
+        repeat_caption = QLabel("Repeat recording")
+        repeat_caption.setObjectName("muted")
+        self.repeat_off = QRadioButton("Off")
+        self.repeat_n = QRadioButton("Count")
+        self.repeat_until = QRadioButton("Until stopped")
+        self.repeat_off.setChecked(self._conn.repeat_mode == "off" or not self._conn.repeat_mode)
+        self.repeat_n.setChecked(self._conn.repeat_mode == "count")
+        self.repeat_until.setChecked(self._conn.repeat_mode == "until")
+        group = QButtonGroup(self)
+        group.addButton(self.repeat_off)
+        group.addButton(self.repeat_n)
+        group.addButton(self.repeat_until)
+        self.repeat_spin = QSpinBox()
+        self.repeat_spin.setRange(1, 999)
+        self.repeat_spin.setValue(int(self._conn.repeat_count or 2))
+        self.repeat_spin.setEnabled(self.repeat_n.isChecked())
+        self.repeat_n.toggled.connect(lambda on: self.repeat_spin.setEnabled(on))
+        repeat_row.addWidget(repeat_caption)
+        repeat_row.addWidget(self.repeat_off)
+        repeat_row.addWidget(self.repeat_n)
+        repeat_row.addWidget(self.repeat_spin)
+        repeat_row.addWidget(self.repeat_until)
+        repeat_row.addStretch(1)
+        layout.addLayout(repeat_row)
+
+        wait_row = QHBoxLayout()
+        wait_row.setSpacing(8)
+        wait_caption = QLabel("Wait between recordings")
+        wait_caption.setObjectName("muted")
+        self.wait_spin = QDoubleSpinBox()
+        self.wait_spin.setRange(0, 10_000)
+        self.wait_spin.setDecimals(2)
+        self.wait_spin.setSingleStep(1)
+        self.wait_unit = QComboBox()
+        self.wait_unit.addItems(["Seconds", "Minutes"])
+        apply_combo_popup_palette(self.wait_unit, dark=False)
+        unit = "Minutes" if self._conn.repeat_wait_unit == "minutes" else "Seconds"
+        self.wait_unit.setCurrentText(unit)
+        wait_s = max(float(self._conn.repeat_wait_s), 0.0)
+        self.wait_spin.setValue(wait_s / 60.0 if unit == "Minutes" else wait_s)
+        wait_row.addWidget(wait_caption)
+        wait_row.addWidget(self.wait_spin)
+        wait_row.addWidget(self.wait_unit)
+        wait_row.addStretch(1)
+        layout.addLayout(wait_row)
+
+        self.collection_status = QLabel("Recordings completed: 0  ·  Files found: 0  ·  Excel: Idle")
+        self.collection_status.setObjectName("muted")
+        self.collection_status.setWordWrap(True)
+        layout.addWidget(self.collection_status)
+        return box
 
     def _log_panel(self) -> QWidget:
         self.log_panel = QFrame()
@@ -492,6 +669,8 @@ class MainWindow(QMainWindow):
             apply_theme(app, next_mode)
         polish_combo(self.unit_combo)
         polish_combo(self.format_combo)
+        for combo in (self.event_combo, self.class_combo, self.sheet_combo, self.wait_unit):
+            polish_combo(combo)
         self._sync_theme_button()
         self._capture_session_into_conn()
         save_settings(self._conn.persistable())
@@ -503,6 +682,10 @@ class MainWindow(QMainWindow):
         self._capture_session_into_conn()
         save_settings(self._conn.persistable())
         self._record_timer.stop()
+        self._watch_timer.stop()
+        self._wait_timer.stop()
+        self._excel_timer.stop()
+        self._close_watch_browser()
         if self._record_client is not None:
             self._record_client.close()
         for thread, _worker in list(self._jobs):
@@ -559,6 +742,189 @@ class MainWindow(QMainWindow):
         except ValidationError:
             pass
         self._conn.recording_format = self._recording_format()
+        if hasattr(self, "excel_check"):
+            self._conn.excel_enabled = self.excel_check.isChecked()
+            self._conn.excel_workbook = self.workbook_edit.text().strip()
+            self._conn.collection_event = self.event_combo.currentText().strip()
+            if self.repeat_until.isChecked():
+                self._conn.repeat_mode = "until"
+            elif self.repeat_n.isChecked():
+                self._conn.repeat_mode = "count"
+            else:
+                self._conn.repeat_mode = "off"
+            self._conn.repeat_count = int(self.repeat_spin.value())
+            self._conn.repeat_wait_unit = "minutes" if self.wait_unit.currentText() == "Minutes" else "seconds"
+            self._conn.repeat_wait_s = self._repeat_wait_s()
+
+    def _repeat_mode(self) -> str:
+        if hasattr(self, "repeat_until") and self.repeat_until.isChecked():
+            return "until"
+        if hasattr(self, "repeat_n") and self.repeat_n.isChecked():
+            return "count"
+        return "off"
+
+    def _uses_collection_watch(self) -> bool:
+        excel = hasattr(self, "excel_check") and self.excel_check.isChecked()
+        return excel or self._repeat_mode() != "off"
+
+    def _on_excel_toggled(self, checked: bool) -> None:
+        if checked and self.workbook_edit.text().strip():
+            self._load_workbook(self.workbook_edit.text().strip(), quiet=True)
+        self._update_collection_status()
+
+    def _browse_workbook(self) -> None:
+        start = self.workbook_edit.text().strip() or str(Path.home())
+        path, _ok = QFileDialog.getOpenFileName(
+            self,
+            "Collection workbook",
+            start,
+            "Excel macro workbook (*.xlsm)",
+        )
+        if not path:
+            return
+        if self._load_workbook(path):
+            self.excel_check.setChecked(True)
+
+    def _load_workbook(self, path: str, *, quiet: bool = False) -> bool:
+        file = Path(path)
+        if not file.is_file():
+            if not quiet:
+                QMessageBox.warning(self, "Workbook", "That workbook file was not found.")
+            return False
+        try:
+            catalog = load_workbook_catalog(file)
+        except Exception as exc:
+            if not quiet:
+                QMessageBox.warning(self, "Workbook", f"Could not read the workbook: {exc}")
+            return False
+        self._catalog = catalog
+        self.workbook_edit.setText(str(file))
+        self._conn.excel_workbook = str(file)
+        self.event_combo.blockSignals(True)
+        self.sheet_combo.blockSignals(True)
+        self.class_combo.blockSignals(True)
+        self.event_combo.clear()
+        self.event_combo.addItems(list(catalog.events))
+        event = self._conn.collection_event or preferred_event(catalog.events)
+        if event:
+            self.event_combo.setCurrentText(event)
+        self.sheet_combo.clear()
+        self.sheet_combo.addItems(list(catalog.worksheets))
+        classes: list[str] = []
+        seen: set[str] = set()
+        for item in catalog.mappings:
+            if item.target_class in seen:
+                continue
+            seen.add(item.target_class)
+            classes.append(item.target_class)
+        self.class_combo.clear()
+        self.class_combo.addItems(classes)
+        self.event_combo.blockSignals(False)
+        self.sheet_combo.blockSignals(False)
+        self.class_combo.blockSignals(False)
+        self._class_user_set = False
+        self._refresh_class_suggestion()
+        if not quiet:
+            self.log(f"Workbook: {file.name} ({len(catalog.mappings)} class ranges).")
+        self._update_collection_status()
+        return True
+
+    def _on_class_edited(self, _text: str = "") -> None:
+        if self.class_combo.signalsBlocked():
+            return
+        self._class_user_set = True
+        text = self.class_combo.currentText().strip()
+        if self._catalog and text:
+            sheets = [item.worksheet for item in self._catalog.mappings if item.target_class == text]
+            unique = list(dict.fromkeys(sheets))
+            if len(unique) == 1:
+                self.sheet_combo.setCurrentText(unique[0])
+
+    def _refresh_class_suggestion(self) -> None:
+        if not hasattr(self, "class_combo") or self._catalog is None:
+            return
+        plan = self._try_plan()
+        if plan is None:
+            return
+        selected = self.class_combo.currentText().strip() if self._class_user_set else ""
+        sheet = self.sheet_combo.currentText().strip() if self._class_user_set else ""
+        match = suggest_class(
+            plan.start_hz,
+            plan.end_hz,
+            self._catalog.mappings,
+            selected_class=selected,
+            selected_sheet=sheet,
+        )
+        if match.unique and match.mapping is not None and not self._class_user_set:
+            self.class_combo.blockSignals(True)
+            self.sheet_combo.blockSignals(True)
+            self.class_combo.setCurrentText(match.mapping.target_class)
+            self.sheet_combo.setCurrentText(match.mapping.worksheet)
+            self.class_combo.blockSignals(False)
+            self.sheet_combo.blockSignals(False)
+
+    def _selected_mapping(self):
+        if self._catalog is None:
+            return None
+        plan = self._try_plan()
+        if plan is None:
+            return None
+        selected = self.class_combo.currentText().strip()
+        sheet = self.sheet_combo.currentText().strip()
+        if selected:
+            return suggest_class(
+                plan.start_hz,
+                plan.end_hz,
+                self._catalog.mappings,
+                selected_class=selected,
+                selected_sheet=sheet,
+            )
+        return suggest_class(plan.start_hz, plan.end_hz, self._catalog.mappings)
+
+    def _update_collection_status(self) -> None:
+        if not hasattr(self, "collection_status"):
+            return
+        pending = self._excel_store.pending_count()
+        if pending:
+            excel = f"Pending Excel updates: {pending}"
+        elif hasattr(self, "excel_check") and self.excel_check.isChecked():
+            excel = "Excel: Saved"
+        else:
+            excel = "Excel: Off"
+        self.collection_status.setText(
+            f"Recordings completed: {self._recordings_completed}  ·  "
+            f"Files found: {self._files_found}  ·  {excel}"
+        )
+
+    def _flush_excel(self) -> None:
+        saved, pending = flush_excel_queue(self._excel_store)
+        if saved:
+            self.log(f"Excel: saved {saved} row(s).")
+        if pending:
+            self.log(f"Pending Excel updates: {pending}.")
+        self._update_collection_status()
+
+    def _close_watch_browser(self) -> None:
+        browser = self._watch_browser
+        self._watch_browser = None
+        if browser is None or self._conn.demo:
+            return
+        try:
+            browser.close()
+        except Exception:
+            pass
+
+    def _on_stop_after_current(self) -> None:
+        if self._waiting:
+            self._cancel_wait("Stopped. The next recording was cancelled.")
+            self._end_series()
+            return
+        if not self._series_active:
+            return
+        self._stop_after_current = True
+        self.stop_btn.setEnabled(False)
+        self.log("Stop after the current recording. No further recordings will start.")
+        self._set_msg("Stopping after this recording.")
 
     def _sync_connection_label(self) -> None:
         self.conn_label.setText(self._conn.host or "not set")
@@ -730,13 +1096,16 @@ class MainWindow(QMainWindow):
             return None, self.msg.text() or "Check the frequency values."
         try:
             seconds = float(parse_recorded_time(self.time_edit.text()))
-            payload = build_payload_for_recording_time(
-                plan,
-                seconds,
-                recording_format=self._recording_format(),
-            )
+            payload = build_payload_for_recording_time(plan, seconds, recording_format=self._recording_format())
         except (ValidationError, RequestBuildError, FrequencyError) as exc:
             return None, str(exc)
+        scan = payload["remote_recording_scans"][0]
+        if (
+            scan["duration"] != scan["rate"]
+            or scan["duration"] != scan["capture_length"]
+            or float(scan["duration"]) != seconds
+        ):
+            return None, "duration, rate, and capture_length must match the recording time."
         self._set_msg("")
         return payload, None
 
@@ -753,6 +1122,7 @@ class MainWindow(QMainWindow):
             self.size_label.setText(f"Estimate ≈ {format_estimate(mb)}")
         except (SizeEstimateError, ValidationError, KeyError):
             self.size_label.setText("Estimate —")
+        self._refresh_class_suggestion()
 
     def _set_msg(self, text: str, *, error: bool = False) -> None:
         self.msg.setText(text)
@@ -787,7 +1157,7 @@ class MainWindow(QMainWindow):
         text = message if message is not None else PHASE_LABELS.get(phase, phase)
         if hasattr(self, "phase_label"):
             self.phase_label.setText(text)
-            if phase in {SUBMITTING, RECORDING, FINALIZING}:
+            if phase in {SUBMITTING, RECORDING, FINALIZING, WAITING}:
                 name = "phaseBusy"
             elif phase == CONFIRMED:
                 name = "phaseOk"
@@ -810,8 +1180,11 @@ class MainWindow(QMainWindow):
             self._set_msg(f"Recording {label}.")
             self.statusBar().showMessage(f"Recording {label}")
             return
-        self.start_btn.setEnabled(True)
-        self.start_btn.setText("Start Recording")
+        hold = self._series_active or self._watching or self._waiting
+        self.start_btn.setEnabled(not hold)
+        self.start_btn.setText("Recording series…" if hold else "Start Recording")
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.setEnabled((self._series_active or self._waiting) and not self._stop_after_current)
 
     def _start_job(
         self,
@@ -858,6 +1231,7 @@ class MainWindow(QMainWindow):
                 self._record_timer.stop()
                 self._set_recording_ui(False)
                 self._set_phase(IDLE)
+                self._end_series()
                 self.log(text, level="error")
                 return
             if self._ignore_late_http:
@@ -905,21 +1279,60 @@ class MainWindow(QMainWindow):
         payload, error = self._try_payload()
         if payload is None:
             self._submit_lock = False
+            if self._series_active:
+                self._end_series()
             QMessageBox.warning(self, "Cannot start", error or "Check frequency and time.")
             return
+        mapping = None
+        if hasattr(self, "excel_check") and self.excel_check.isChecked():
+            workbook = self.workbook_edit.text().strip()
+            if not workbook or self._catalog is None:
+                self._submit_lock = False
+                if self._series_active:
+                    self._end_series()
+                QMessageBox.warning(self, "Cannot start", "Choose a collection workbook before logging to Excel.")
+                return
+            match = self._selected_mapping()
+            if match is None or not match.unique or match.mapping is None:
+                self._submit_lock = False
+                if self._series_active:
+                    self._end_series()
+                QMessageBox.warning(
+                    self,
+                    "Cannot start",
+                    "Select the target class and worksheet before starting.",
+                )
+                return
+            mapping = match.mapping
         if not self._conn.host.strip():
             self._submit_lock = False
             self._open_settings()
             if not self._conn.host.strip():
+                if self._series_active:
+                    self._end_series()
                 return
             self._submit_lock = True
         try:
             target = self._target()
         except ValidationError as exc:
             self._submit_lock = False
+            if self._series_active:
+                self._end_series()
             QMessageBox.warning(self, "Connection", str(exc))
             self._open_settings()
             return
+        if self._repeat_mode() != "off" and not self._series_active:
+            self._series_active = True
+            self._stop_after_current = False
+            self._recordings_completed = 0
+            self._files_found = 0
+            mode = self._repeat_mode()
+            if mode == "until":
+                self._series_remaining = None
+            else:
+                self._series_remaining = max(int(self.repeat_spin.value()) - 1, 0)
+            if hasattr(self, "stop_btn"):
+                self.stop_btn.setEnabled(True)
         scan = payload["remote_recording_scans"][0]
         seconds = float(scan["duration"])
         plan = self._plan
@@ -944,6 +1357,14 @@ class MainWindow(QMainWindow):
             bandwidth_hz=plan.bandwidth_hz,
             duration_s=seconds,
             demo=self._conn.demo,
+            collection_event=self.event_combo.currentText().strip() if hasattr(self, "event_combo") else "",
+            target_class=mapping.target_class if mapping is not None else (
+                self.class_combo.currentText().strip() if hasattr(self, "class_combo") else ""
+            ),
+            worksheet=mapping.worksheet if mapping is not None else (
+                self.sheet_combo.currentText().strip() if hasattr(self, "sheet_combo") else ""
+            ),
+            sensor_id=self._sensor_info.serial if self._sensor_info.serial not in {"", "—"} else "",
         )
         add_recording(record)
         self._open_record_id = record.id
@@ -972,15 +1393,38 @@ class MainWindow(QMainWindow):
         self._start_job(work, self._show_recording_outcome, record=True, record_gen=gen)
 
     def _on_recording_time_elapsed(self) -> None:
-        self._set_recording_ui(False)
         self._http_in_flight = False
         client = self._record_client
         self._record_client = None
         if client is not None:
             self._ignore_late_http = True
             client.close()
+        if self._record_phase in {FINALIZING, CONFIRMED, UNKNOWN}:
+            return
         self._set_phase(FINALIZING)
-        if self._sftp_win is None:
+        self._elapsed_at = datetime.now()
+        self._watch_state = FileWatchState()
+        if self._uses_collection_watch():
+            self._watching = True
+        self._set_recording_ui(False)
+        if self._conn.demo and self._open_record_id:
+            record = next((item for item in load_recordings() if item.id == self._open_record_id), None)
+            if record is not None:
+                from dataclasses import replace
+
+                from .recording_history import iq_group_key
+
+                serial = "".join(ch if ch.isalnum() else "_" for ch in (record.sensor_id or "demo")) or "demo"
+                stem = f"iq_{serial}_{record.started_at:%Y%m%d_%H%M%S}_{record.id[:8]}"
+                parts = shared_demo_browser().publish_capture(
+                    stem,
+                    parts=max(int(self._demo_parts), 1),
+                    when=datetime.now(),
+                )
+                if parts:
+                    keyed = replace(record, iq_stem=iq_group_key(parts[0].name))
+                    add_recording(keyed)
+        if self._sftp_win is None and not self._uses_collection_watch():
             self._set_msg("Time elapsed. Open Sensor Files to check the recording.")
             self.statusBar().showMessage("Time elapsed")
             self.log("Time elapsed. Open Sensor Files to confirm the file.")
@@ -988,9 +1432,14 @@ class MainWindow(QMainWindow):
             self._set_msg("Time elapsed. Waiting for files…")
             self.statusBar().showMessage("Waiting for files")
             self.log("Time elapsed. Looking for recording files.")
-            self._sftp_win.retry_today()
-        self._schedule_sftp_part_refresh()
-        self._schedule_file_confirm()
+            if self._sftp_win is not None:
+                self._sftp_win.retry_today()
+        if self._uses_collection_watch():
+            self._watch_timer.start()
+            self._poll_collection_files()
+        else:
+            self._schedule_sftp_part_refresh()
+            self._schedule_file_confirm()
 
     def _refresh_open_sftp(self) -> None:
         if not self._alive or self._sftp_win is None:
@@ -1043,6 +1492,218 @@ class MainWindow(QMainWindow):
         self._set_phase(FINALIZING)
         self._set_msg(f"Recording file appeared ({len(entries)} part(s)). Checking size…")
 
+    def _poll_collection_files(self) -> None:
+        if not self._alive or self._record_phase not in {FINALIZING, UNKNOWN}:
+            return
+        record_id = self._open_record_id
+        if not record_id:
+            return
+        record = next((item for item in load_recordings() if item.id == record_id), None)
+        if record is None:
+            return
+        folders = folders_for_recording(record.started_at)
+        try:
+            if self._watch_browser is None:
+                self._watch_browser = _open_browser(self._conn)
+            entries = list_watch_entries(self._watch_browser, folders)
+        except Exception as exc:
+            self.log(f"Could not list sensor files: {exc}", level="error")
+            return
+        matched = match_recordings_to_entries(entries, [record], host=self._conn.host)
+        persist_matched_stems(matched)
+        mine = [entry for entry in entries if matched.get(entry.path) and matched[entry.path].id == record_id]
+        if self._sftp_win is not None:
+            self._sftp_win.refresh()
+        self._watch_state, newly = update_file_watch(
+            self._watch_state,
+            mine,
+            now=datetime.now(),
+            stable_needed=self._stable_needed,
+        )
+        for entry in newly:
+            try:
+                self._log_iq_file(record, entry)
+            except Exception as exc:
+                self.log(f"Excel log failed for {entry.name}: {exc}", level="error")
+        if newly:
+            self._set_phase(FINALIZING)
+            self._set_msg(f"Recording file found ({len(self._watch_state.finalized)} part(s)). Waiting for more…")
+            self.log(f"Logged {len(newly)} finalized IQ file(s).")
+        if capture_is_settled(
+            self._watch_state,
+            now=datetime.now(),
+            elapsed=True,
+            settle_s=self._settle_s,
+            elapsed_at=self._elapsed_at,
+        ):
+            self._finish_current_capture()
+
+    def _log_iq_file(self, record, entry) -> None:
+        self._files_found += 1
+        self._update_collection_status()
+        if not hasattr(self, "excel_check") or not self.excel_check.isChecked():
+            return
+        sensor_id = record.sensor_id or self._sensor_info.serial
+        if self._excel_store.is_logged(sensor_id, entry.path):
+            return
+        workbook = Path(self.workbook_edit.text().strip())
+        if not workbook.is_file() or self._catalog is None:
+            return
+        mapping = None
+        for item in self._catalog.mappings:
+            if item.target_class == record.target_class and item.worksheet == record.worksheet:
+                mapping = item
+                break
+        if mapping is None and self._catalog.mappings:
+            mapping = self._catalog.mappings[0]
+        if mapping is None:
+            return
+        local_dir = resolved_download_dir(self._conn.download_dir)
+        local = local_dir / entry.name
+        row = ExcelRow(
+            worksheet=record.worksheet or mapping.worksheet,
+            collection_event=record.collection_event or self.event_combo.currentText().strip(),
+            target_class=record.target_class or mapping.target_class,
+            start_hz=record.start_hz,
+            end_hz=record.end_hz,
+            start_style=mapping.start_style,
+            stop_style=mapping.stop_style,
+            sensor=workbook_sensor_name(
+                self._sensor_info.model,
+                list(self._catalog.sensor_names),
+            ),
+            filename=entry.name,
+            local_path=str(local) if local.is_file() else "",
+            remote_path=entry.path,
+            sensor_id=sensor_id,
+            duration_s=record.duration_s,
+            record_id=record.id,
+            group_key=recording_group_key(
+                sensor_id=sensor_id,
+                directory=remote_directory(entry.path),
+                stem=iq_group_key(entry.name),
+                record_id=record.id,
+            ),
+        )
+        item = pending_from_row(workbook=workbook, row=row)
+        if self._excel_store.enqueue(item):
+            self._flush_excel()
+
+    def _finish_current_capture(self) -> None:
+        if self._record_phase not in {FINALIZING, UNKNOWN}:
+            return
+        self._watch_timer.stop()
+        self._watching = False
+        parts = len(self._watch_state.finalized)
+        if parts:
+            self._set_phase(CONFIRMED)
+            self._set_msg(f"Recording finished ({parts} file(s)).")
+            self.log(f"Capture finished with {parts} file(s).")
+        else:
+            self._set_phase(UNKNOWN)
+            self._set_msg("Time elapsed. No matching recording file yet.")
+            self.log("File not confirmed.")
+        self._recordings_completed += 1
+        self._update_collection_status()
+        if self._series_active:
+            self._maybe_start_next()
+        else:
+            self._set_recording_ui(False)
+
+    def _end_series(self) -> None:
+        self._cancel_wait()
+        self._series_active = False
+        self._series_remaining = 0
+        self._stop_after_current = False
+        self._watching = False
+        self._watch_timer.stop()
+        self._close_watch_browser()
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.setEnabled(False)
+        if not self._recording_active:
+            self.start_btn.setEnabled(True)
+            self.start_btn.setText("Start Recording")
+        self._update_collection_status()
+
+    def _repeat_wait_s(self) -> float:
+        if not hasattr(self, "wait_spin"):
+            return 0.0
+        value = float(self.wait_spin.value())
+        if value < 0:
+            value = 0.0
+        if hasattr(self, "wait_unit") and self.wait_unit.currentText() == "Minutes":
+            return value * 60.0
+        return value
+
+    def _format_countdown(self, seconds: float) -> str:
+        total = max(0, int(seconds + 0.999) if seconds > 0 else 0)
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    def _begin_wait(self, seconds: float) -> None:
+        self._waiting = True
+        self._wait_deadline = time.monotonic() + max(seconds, 0.0)
+        self._set_phase(WAITING)
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.setEnabled(True)
+        self.start_btn.setEnabled(False)
+        self._tick_wait()
+        self._wait_timer.start()
+
+    def _cancel_wait(self, message: str = "") -> None:
+        self._wait_timer.stop()
+        was_waiting = self._waiting
+        self._waiting = False
+        self._wait_deadline = 0.0
+        if message and was_waiting:
+            self.log(message)
+            self._set_msg(message)
+
+    def _tick_wait(self) -> None:
+        if not self._waiting:
+            self._wait_timer.stop()
+            return
+        left = self._wait_deadline - time.monotonic()
+        if left <= 0:
+            self._wait_timer.stop()
+            self._waiting = False
+            self._start_next_now()
+            return
+        text = f"Next recording in {self._format_countdown(left)}"
+        self._set_phase(WAITING, text)
+        self._set_msg(text)
+        self.start_btn.setText(text)
+
+    def _start_next_now(self) -> None:
+        if not self._series_active or self._stop_after_current:
+            self._end_series()
+            return
+        if self._series_remaining is None:
+            QTimer.singleShot(0, self._on_start)
+            return
+        if self._series_remaining > 0:
+            self._series_remaining -= 1
+            QTimer.singleShot(0, self._on_start)
+            return
+        self.log("Series complete.")
+        self._end_series()
+
+    def _maybe_start_next(self) -> None:
+        if not self._series_active:
+            return
+        if self._stop_after_current:
+            self.log("Series stopped after the current recording.")
+            self._end_series()
+            return
+        if self._series_remaining is not None and self._series_remaining <= 0:
+            self.log("Series complete.")
+            self._end_series()
+            return
+        wait_s = self._repeat_wait_s()
+        if wait_s <= 0:
+            self._start_next_now()
+            return
+        self._begin_wait(wait_s)
+
     def _show_test_outcome(self, outcome: Any) -> None:
         self._show_http_outcome(outcome, recording=False)
 
@@ -1060,6 +1721,7 @@ class MainWindow(QMainWindow):
             self._record_timer.stop()
             self._set_recording_ui(False)
             self._set_phase(IDLE)
+            self._end_series()
             return
         if self._ignore_late_http and not self._recording_active:
             self._ignore_late_http = False
@@ -1074,6 +1736,7 @@ class MainWindow(QMainWindow):
             if self._open_record_id:
                 remove_recording(self._open_record_id)
                 self._open_record_id = None
+            self._end_series()
             self._set_msg(outcome.detail, error=True)
             self._show_http_outcome(outcome, recording=True)
             return
@@ -1126,6 +1789,7 @@ class MainWindow(QMainWindow):
             if self._sftp_win is not None:
                 self._sftp_win.close()
             self._sftp_win = SftpWindow(self._conn, None)
+            self._sftp_win.activity.connect(self.log)
             self._sftp_win.set_recent_record_id(self._open_record_id)
             self._sftp_win.show()
             self._sftp_win.raise_()

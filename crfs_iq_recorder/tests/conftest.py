@@ -21,3 +21,26 @@ def block_real_network(monkeypatch):
         raise RuntimeError("Tests must not open real SFTP connections.")
 
     monkeypatch.setattr("crfs_iq_recorder.sftp_client.connect_sftp", _blocked_sftp)
+
+
+@pytest.fixture(autouse=True)
+def reset_demo_sftp():
+    from crfs_iq_recorder.demo_sftp import reset_shared_demo_browser
+
+    reset_shared_demo_browser()
+    yield
+    reset_shared_demo_browser()
+
+
+@pytest.fixture(autouse=True)
+def isolated_excel_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "crfs_iq_recorder.paths.excel_log_path",
+        lambda: tmp_path / "excel_log.json",
+    )
+    monkeypatch.setattr(
+        "crfs_iq_recorder.excel_log.excel_log_path",
+        lambda: tmp_path / "excel_log.json",
+    )
+    monkeypatch.setattr("crfs_iq_recorder.excel_log.excel_has_workbook", lambda _path: False)
+    monkeypatch.setattr("crfs_iq_recorder.excel_com.excel_has_workbook", lambda _path: False)

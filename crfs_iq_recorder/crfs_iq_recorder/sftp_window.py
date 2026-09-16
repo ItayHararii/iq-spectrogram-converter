@@ -10,8 +10,6 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QCoreApplication,
-    QItemSelection,
-    QItemSelectionModel,
     QObject,
     QRect,
     QThread,
@@ -21,8 +19,9 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFrame,
     QHBoxLayout,
@@ -37,8 +36,8 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
-    QTableWidget,
-    QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -50,21 +49,22 @@ from .listing_sort import (
     COL_MODIFIED,
     COL_NAME,
     SORTABLE_COLUMNS,
+    build_listing_nodes,
     header_label,
-    sort_entries,
+    sort_listing_nodes,
 )
 from .paths import ensure_download_dir, resolved_download_dir
 from .recording_history import (
-    expand_group_entries,
     format_columns,
     group_part_counts,
     group_total_bytes,
     iq_group_key,
+    iq_part_label,
     load_recordings,
     match_recordings_to_entries,
     persist_matched_stems,
 )
-from .sftp_client import DemoSftpBrowser, RemoteEntry, SftpBrowser, SftpError, connect_sftp
+from .sftp_client import RemoteEntry, SftpBrowser, SftpError, connect_sftp
 from .sftp_paths import parent_directory, resolve_today_directory, today_remdata_directory
 from .spectrogram_preview import (
     PREVIEW_MAX_BYTES,
@@ -90,6 +90,10 @@ _TABLE_HEADERS = [
     "Bandwidth (MHz)",
     "Duration (s)",
 ]
+ROLE_PATH = int(Qt.ItemDataRole.UserRole)
+ROLE_KIND = ROLE_PATH + 1
+ROLE_GROUP = ROLE_PATH + 2
+ROLE_CHILD_PATHS = ROLE_PATH + 3
 
 
 def discovered_new_paths(previous: set[str] | None, current: set[str]) -> tuple[set[str], set[str]]:
@@ -146,7 +150,9 @@ class NewBadgeDelegate(QStyledItemDelegate):
 
 def _open_browser(state: ConnectionState) -> SftpBrowser:
     if state.demo:
-        return DemoSftpBrowser()
+        from .demo_sftp import shared_demo_browser
+
+        return shared_demo_browser()
     port = parse_optional_port(state.sftp_port)
     if port is None:
         port = DEFAULT_SFTP_PORT
@@ -161,6 +167,7 @@ class SftpBackend(QObject):
 
     listed = Signal(str, object, object)
     failed = Signal(str)
+    removed = Signal(object, object)
 
     def __init__(self, state: ConnectionState) -> None:
         super().__init__()
@@ -232,6 +239,27 @@ class SftpBackend(QObject):
         if self._closing:
             return
         self.listed.emit(path, entries, None)
+
+    @Slot(object)
+    def remove_files(self, paths: object) -> None:
+        browser = self._browser
+        wanted = [str(item) for item in (paths or []) if str(item).strip()]
+        if browser is None:
+            self.removed.emit([], [(path, "Not connected.") for path in wanted])
+            return
+        ok: list[str] = []
+        errors: list[tuple[str, str]] = []
+        for path in wanted:
+            try:
+                browser.remove_file(path)
+                ok.append(path)
+            except SftpError as exc:
+                errors.append((path, str(exc)))
+            except Exception as exc:
+                errors.append((path, str(exc)))
+        if self._closing:
+            return
+        self.removed.emit(ok, errors)
 
     @Slot()
     def shutdown(self) -> None:
@@ -356,9 +384,11 @@ class PreviewWorker(QObject):
 
 
 class SftpWindow(QWidget):
+    activity = Signal(str)
     _cmd_open = Signal()
     _cmd_try_today = Signal()
     _cmd_list = Signal(str)
+    _cmd_remove = Signal(object)
     _cmd_close = Signal()
 
     def __init__(self, state: ConnectionState, parent=None) -> None:
@@ -402,6 +432,7 @@ class SftpWindow(QWidget):
         self._sort_column: int | None = None
         self._sort_descending = True
         self._user_sort = False
+        self._expanded_groups: set[str] = set()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -456,19 +487,22 @@ class SftpWindow(QWidget):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
-        self.table = QTableWidget(0, len(_TABLE_HEADERS))
-        self.table.setHorizontalHeaderLabels(_TABLE_HEADERS)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table = QTreeWidget()
+        self.table.setColumnCount(len(_TABLE_HEADERS))
+        self.table.setHeaderLabels(_TABLE_HEADERS)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(False)
         self.table.setAlternatingRowColors(True)
-        self.table.setShowGrid(False)
+        self.table.setRootIsDecorated(True)
+        self.table.setItemsExpandable(True)
+        self.table.setExpandsOnDoubleClick(True)
+        self.table.setUniformRowHeights(True)
         self.table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(34)
-        header = self.table.horizontalHeader()
+        self.table.setIndentation(18)
+        header = self.table.header()
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
         header.setStretchLastSection(False)
         header.setMinimumSectionSize(72)
@@ -480,21 +514,20 @@ class SftpWindow(QWidget):
         header.sectionClicked.connect(self._on_header_clicked)
         self.table.setColumnWidth(0, 72)
         self.table.setItemDelegateForColumn(0, NewBadgeDelegate(self.table))
-        duration_header = self.table.horizontalHeaderItem(8)
+        duration_header = self.table.headerItem()
         if duration_header is not None:
-            duration_header.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            duration_header.setToolTip("Total recording time, not this file.")
-        size_header = self.table.horizontalHeaderItem(2)
-        if size_header is not None:
-            size_header.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            size_header.setToolTip("This file. Split total is in the cell tooltip.")
-        for col in range(len(_TABLE_HEADERS)):
-            item = self.table.horizontalHeaderItem(col)
-            if item is not None:
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            duration_header.setToolTip(8, "Total recording time, not this file.")
+            duration_header.setToolTip(2, "This file, or combined size for a split recording.")
+            for col in range(len(_TABLE_HEADERS)):
+                duration_header.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
         self._sync_sort_headers()
-        self.table.cellDoubleClicked.connect(self._open_row)
+        self.table.itemDoubleClicked.connect(self._open_item)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.table.itemExpanded.connect(self._on_item_expanded)
+        self.table.itemCollapsed.connect(self._on_item_collapsed)
+        delete_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.table)
+        delete_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        delete_shortcut.activated.connect(self._delete_selected_remote)
 
         self.empty_page = QLabel("Connecting…")
         self.empty_page.setObjectName("emptyState")
@@ -563,9 +596,11 @@ class SftpWindow(QWidget):
         self._cmd_open.connect(self._worker.open_today, queued)
         self._cmd_try_today.connect(self._worker.try_today, queued)
         self._cmd_list.connect(self._worker.listdir, queued)
+        self._cmd_remove.connect(self._worker.remove_files, queued)
         self._cmd_close.connect(self._worker.shutdown, queued)
         self._worker.listed.connect(self._on_listed, queued)
         self._worker.failed.connect(self._on_failed, queued)
+        self._worker.removed.connect(self._on_removed, queued)
         self._thread.start()
         self._set_busy(True)
         self._show_list_state("loading", f"Connecting to {state.host or 'the sensor'}…")
@@ -609,6 +644,7 @@ class SftpWindow(QWidget):
         for signal, slot in (
             (self._worker.listed, self._on_listed),
             (self._worker.failed, self._on_failed),
+            (self._worker.removed, self._on_removed),
         ):
             try:
                 signal.disconnect(slot)
@@ -722,30 +758,167 @@ class SftpWindow(QWidget):
             return
         self._request_list(parent_directory(current))
 
-    def _open_row(self, row: int, _col: int) -> None:
-        entry = self._entry_at(row)
-        if entry is None:
-            return
-        if entry.is_dir:
+    def _iter_tree_items(self):
+        root = self.table.invisibleRootItem()
+        stack = [root.child(i) for i in range(root.childCount())]
+        while stack:
+            item = stack.pop(0)
+            yield item
+            stack.extend(item.child(i) for i in range(item.childCount()))
+
+    def _item_identity(self, item: QTreeWidgetItem) -> str:
+        kind = str(item.data(0, ROLE_KIND) or "")
+        if kind == "group":
+            return f"g:{item.data(0, ROLE_GROUP) or ''}"
+        path = str(item.data(0, ROLE_PATH) or "")
+        if kind == "dir":
+            return f"d:{path}"
+        return f"f:{path}"
+
+    def _paths_for_item(self, item: QTreeWidgetItem) -> list[str]:
+        kind = str(item.data(0, ROLE_KIND) or "")
+        if kind == "group":
+            return [str(path) for path in (item.data(0, ROLE_CHILD_PATHS) or ()) if path]
+        if kind == "dir":
+            return []
+        path = str(item.data(0, ROLE_PATH) or "").strip()
+        return [path] if path else []
+
+    def _open_item(self, item: QTreeWidgetItem, _col: int) -> None:
+        kind = str(item.data(0, ROLE_KIND) or "")
+        if kind == "dir":
             if self._busy or self._dl_active:
                 return
-            path = entry.path if entry.path.endswith("/") else entry.path + "/"
-            self._request_list(path)
+            path = str(item.data(0, ROLE_PATH) or "")
+            if not path:
+                return
+            folder = path if path.endswith("/") else path + "/"
+            self._request_list(folder)
             return
-        self._request_preview(entry)
+        files = []
+        by_path = {entry.path: entry for entry in self._entries if not entry.is_dir}
+        for path in self._paths_for_item(item):
+            entry = by_path.get(path)
+            if entry is not None:
+                files.append(entry)
+        if files:
+            self._request_preview(files[0])
+
+    def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
+        key = str(item.data(0, ROLE_GROUP) or "")
+        if key:
+            self._expanded_groups.add(key)
+
+    def _on_item_collapsed(self, item: QTreeWidgetItem) -> None:
+        key = str(item.data(0, ROLE_GROUP) or "")
+        if key:
+            self._expanded_groups.discard(key)
+
+    def _selected_items(self) -> list[QTreeWidgetItem]:
+        return [item for item in self._iter_tree_items() if item.isSelected()]
+
+    def select_paths(self, paths: list[str]) -> None:
+        wanted = {str(path) for path in paths if path}
+        self.table.clearSelection()
+        items: list[QTreeWidgetItem] = []
+        for item in self._iter_tree_items():
+            if str(item.data(0, ROLE_KIND) or "") != "file":
+                continue
+            if str(item.data(0, ROLE_PATH) or "") not in wanted:
+                continue
+            items.append(item)
+        for item in items:
+            item.setSelected(True)
+        if items:
+            self.table.scrollToItem(items[0])
 
     def _selected_files(self) -> list[RemoteEntry]:
-        rows = sorted({index.row() for index in self.table.selectedIndexes()})
-        files: list[RemoteEntry] = []
-        for row in rows:
-            entry = self._entry_at(row)
-            if entry is not None and not entry.is_dir:
-                files.append(entry)
-        return files
+        paths = self._selected_file_paths()
+        by_path = {entry.path: entry for entry in self._entries if not entry.is_dir}
+        return [by_path[path] for path in paths if path in by_path]
+
+    def _selected_file_paths(self) -> list[str]:
+        """Resolve selected parents to listed parts and selected children to those files only."""
+        seen: list[str] = []
+        found: set[str] = set()
+        by_path = {entry.path: entry for entry in self._entries}
+        for item in self._selected_items():
+            for path in self._paths_for_item(item):
+                if not path or path in found:
+                    continue
+                entry = by_path.get(path)
+                if entry is None or entry.is_dir:
+                    continue
+                found.add(path)
+                seen.append(path)
+        return seen
+
+    def _delete_selected_remote(self) -> None:
+        if self._busy or self._closing or self._dl_active or self._dl_pending:
+            return
+        if not self.table.hasFocus():
+            return
+        paths = self._selected_file_paths()
+        if not paths:
+            return
+        self._deleting_paths = list(paths)
+        self._set_busy(True)
+        self.status.setText(f"Deleting {len(paths)} file(s)…")
+        self._cmd_remove.emit(list(paths))
+
+    @Slot(object, object)
+    def _on_removed(self, ok: object, errors: object) -> None:
+        deleted = [str(item) for item in (ok or [])]
+        failed = [(str(path), str(message)) for path, message in (errors or [])]
+        preview_path = str(self.preview_file.property("remote_path") or "")
+        for path in deleted:
+            name = path.replace("\\", "/").rsplit("/", 1)[-1]
+            self.activity.emit(f"Deleted {name} from the sensor.")
+            self._new_paths.discard(path)
+        for path, message in failed:
+            name = path.replace("\\", "/").rsplit("/", 1)[-1]
+            self.activity.emit(f"Could not delete {name}: {message}")
+        if preview_path in deleted or (self.preview_file.text() and any(
+            path.endswith("/" + self.preview_file.text()) or path.endswith(self.preview_file.text())
+            for path in deleted
+        )):
+            self._clear_preview()
+        if deleted and not failed:
+            self.status.setText(f"Deleted {len(deleted)} file(s).")
+        elif deleted and failed:
+            self.status.setText(f"Deleted {len(deleted)}; {len(failed)} failed.")
+        elif failed:
+            self.status.setText(f"Could not delete {len(failed)} file(s).")
+        self._set_busy(False)
+        self.refresh()
+
+    def _clear_preview(self) -> None:
+        self._preview_token += 1
+        self._preview_pending = None
+        self._preview_source = None
+        self._preview_scaled_key = None
+        self.preview_file.setText("Select a WAVE file")
+        self.preview_file.setProperty("remote_path", "")
+        self.preview_caption.setText("Select a WAVE file.")
+        self.preview_image.setPixmap(QPixmap())
+        self.preview_image.setText("The waterfall appears here.")
+        self._set_preview_busy(False)
 
     def _on_selection_changed(self) -> None:
         files = self._selected_files()
-        if len(files) == 1:
+        selected = self._selected_items()
+        one_group = len(selected) == 1 and str(selected[0].data(0, ROLE_KIND) or "") == "group"
+        if one_group and files:
+            self._request_preview(files[0])
+            rec = self._matched.get(files[0].path)
+            total = sum(item.size for item in files)
+            extra = f"{len(files)} parts, {total:,} B"
+            name = selected[0].text(1)
+            if rec is not None:
+                self.status.setText(f"{name}  ·  {rec.duration_s:g} s  ·  {extra}")
+            else:
+                self.status.setText(f"{name}  ·  {extra}")
+        elif len(files) == 1:
             self._request_preview(files[0])
             rec = self._matched.get(files[0].path)
             stem = iq_group_key(files[0].name)
@@ -760,11 +933,7 @@ class SftpWindow(QWidget):
                 self.status.setText(f"{files[0].name}.{extra}")
         elif len(files) > 1:
             total = sum(item.size for item in files)
-            expanded = expand_group_entries(files, self._entries)
-            extra = ""
-            if len(expanded) > len(files):
-                extra = f"  Download includes {len(expanded)} part(s)."
-            self.status.setText(f"{len(files)} selected, {total:,} B.{extra}")
+            self.status.setText(f"{len(files)} selected, {total:,} B.")
         self._update_download_button()
 
     def set_connection_state(self, state: ConnectionState) -> None:
@@ -780,15 +949,13 @@ class SftpWindow(QWidget):
         if not files:
             self.download_btn.setText("Download")
             return
-        counts = group_part_counts(self._entries)
-        groups = {iq_group_key(entry.name) for entry in files}
-        split = any(counts.get(iq_group_key(entry.name), 1) > 1 for entry in files)
-        expanded = expand_group_entries(files, self._entries)
-        if split and len(groups) == 1:
+        selected = self._selected_items()
+        one_group = len(selected) == 1 and str(selected[0].data(0, ROLE_KIND) or "") == "group"
+        if one_group:
             self.download_btn.setText("Download this recording")
             return
-        if len(expanded) > 1:
-            self.download_btn.setText(f"Download Selected ({len(expanded)})")
+        if len(files) > 1:
+            self.download_btn.setText(f"Download Selected ({len(files)})")
             return
         self.download_btn.setText("Download")
 
@@ -807,7 +974,7 @@ class SftpWindow(QWidget):
         if not files:
             QMessageBox.information(self, "Download", "Select files first.")
             return
-        self._begin_downloads(expand_group_entries(files, self._entries))
+        self._begin_downloads(files)
 
     def _begin_downloads(self, files: list[RemoteEntry]) -> None:
         if self._busy or self._dl_active or self._closing:
@@ -943,11 +1110,6 @@ class SftpWindow(QWidget):
         if self._dl_ok and self._dl_folder is not None:
             self._open_recordings_folder(self._dl_folder)
 
-    def _entry_at(self, row: int) -> RemoteEntry | None:
-        if row < 0 or row >= len(self._entries):
-            return None
-        return self._entries[row]
-
     def _reset_default_sort(self) -> None:
         self._sort_column = None
         self._sort_descending = True
@@ -956,12 +1118,14 @@ class SftpWindow(QWidget):
     def _sync_sort_headers(self) -> None:
         active = self._sort_column if self._user_sort else COL_MODIFIED
         descending = self._sort_descending
+        header = self.table.headerItem()
+        if header is None:
+            return
         for col, base in enumerate(_TABLE_HEADERS):
-            item = self.table.horizontalHeaderItem(col)
-            if item is None:
-                continue
-            item.setText(header_label(base, active=col == active, descending=descending))
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            header.setText(col, header_label(base, active=col == active, descending=descending))
+            header.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
+        header.setToolTip(2, "This file, or combined size for a split recording.")
+        header.setToolTip(8, "Total recording time, not this file.")
 
     def _on_header_clicked(self, section: int) -> None:
         if section not in SORTABLE_COLUMNS:
@@ -980,48 +1144,81 @@ class SftpWindow(QWidget):
         else:
             self._sync_sort_headers()
 
-    def _selected_entry_paths(self) -> list[str]:
-        rows = sorted({index.row() for index in self.table.selectedIndexes()})
-        paths: list[str] = []
-        for row in rows:
-            entry = self._entry_at(row)
-            if entry is not None:
-                paths.append(entry.path)
-        return paths
-
-    def _restore_selected_paths(self, paths: list[str]) -> None:
-        if not paths:
-            self.table.clearSelection()
-            return
-        wanted = set(paths)
-        model = self.table.selectionModel()
-        if model is None:
-            return
-        selection = QItemSelection()
-        current = None
-        columns = max(0, self.table.columnCount() - 1)
-        table_model = self.table.model()
-        if table_model is None:
-            return
-        for row, entry in enumerate(self._entries):
-            if entry.path not in wanted:
+    def _selected_identities(self) -> list[str]:
+        found: list[str] = []
+        seen: set[str] = set()
+        for item in self._selected_items():
+            ident = self._item_identity(item)
+            if not ident or ident in seen:
                 continue
-            left = table_model.index(row, 0)
-            right = table_model.index(row, columns)
-            selection.select(left, right)
+            seen.add(ident)
+            found.append(ident)
+        return found
+
+    def _restore_selected_identities(self, identities: list[str]) -> None:
+        self.table.clearSelection()
+        if not identities:
+            return
+        wanted = set(identities)
+        current = None
+        for item in self._iter_tree_items():
+            ident = self._item_identity(item)
+            if ident not in wanted:
+                continue
+            parent = item.parent()
+            if parent is not None:
+                parent.setExpanded(True)
+                key = str(parent.data(0, ROLE_GROUP) or "")
+                if key:
+                    self._expanded_groups.add(key)
+            item.setSelected(True)
             if current is None:
-                current = left
-        flags = (
-            QItemSelectionModel.SelectionFlag.ClearAndSelect
-            | QItemSelectionModel.SelectionFlag.Rows
-        )
-        model.select(selection, flags)
+                current = item
         if current is not None:
-            model.setCurrentIndex(current, QItemSelectionModel.SelectionFlag.NoUpdate)
-            self.table.scrollTo(current)
+            self.table.setCurrentItem(current)
+            self.table.scrollToItem(current)
+
+    def _set_item_roles(
+        self,
+        item: QTreeWidgetItem,
+        *,
+        path: str,
+        kind: str,
+        group_key: str = "",
+        child_paths: tuple[str, ...] = (),
+    ) -> None:
+        for col in range(len(_TABLE_HEADERS)):
+            item.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
+            item.setData(col, ROLE_PATH, path)
+            item.setData(col, ROLE_KIND, kind)
+            item.setData(col, ROLE_GROUP, group_key)
+            item.setData(col, ROLE_CHILD_PATHS, child_paths)
+
+    def _fill_row_values(
+        self,
+        *,
+        name: str,
+        size_text: str,
+        modified,
+        rec,
+        is_new: bool,
+    ) -> list[str]:
+        mtime = format_display_datetime(modified) if modified else ""
+        values = ["NEW" if is_new else "", name, size_text, mtime, "", "", "", "", ""]
+        if rec is not None:
+            start, end, center_hz, bw, duration = format_columns(rec)
+            values[4:] = [start, end, center_hz, bw, duration]
+        return values
+
+    def _is_new_entry(self, entry: RemoteEntry, rec, new_paths: set[str]) -> bool:
+        if entry.is_dir:
+            return False
+        return entry.path in new_paths or (
+            rec is not None and rec.id == self._recent_record_id and bool(self._recent_record_id)
+        )
 
     def _fill(self, entries: list[RemoteEntry]) -> None:
-        selected_paths = self._selected_entry_paths()
+        selected = self._selected_identities()
         current_paths = {entry.path for entry in entries if not entry.is_dir}
         new_paths, seen = discovered_new_paths(self._seen_by_dir.get(self._path), current_paths)
         self._seen_by_dir[self._path] = seen
@@ -1033,54 +1230,114 @@ class SftpWindow(QWidget):
         )
         persist_matched_stems(matched)
         self._matched = matched
-        ordered = sort_entries(
-            entries,
+        self._entries = list(entries)
+        nodes = sort_listing_nodes(
+            build_listing_nodes(entries, matched),
             matched=matched,
             column=self._sort_column if self._user_sort else None,
             descending=self._sort_descending,
         )
-        self._entries = ordered
-        totals = group_total_bytes(ordered)
-        counts = group_part_counts(ordered)
+        totals = group_total_bytes(entries)
+        counts = group_part_counts(entries)
         self.table.blockSignals(True)
-        self.table.clearContents()
-        self.table.setRowCount(len(ordered))
-        center = Qt.AlignmentFlag.AlignCenter
-        for row, entry in enumerate(ordered):
+        while self.table.topLevelItemCount():
+            self.table.takeTopLevelItem(0)
+        for node in nodes:
+            if node.kind == "group":
+                lead = node.lead
+                rec = next((matched.get(entry.path) for entry in node.entries if matched.get(entry.path)), None)
+                combined = sum(int(entry.size or 0) for entry in node.entries)
+                newest = max((entry.modified for entry in node.entries if entry.modified), default=None)
+                is_new = any(self._is_new_entry(entry, matched.get(entry.path), new_paths) for entry in node.entries)
+                parent = QTreeWidgetItem(
+                    self._fill_row_values(
+                        name=node.name,
+                        size_text=format_bytes(combined),
+                        modified=newest,
+                        rec=rec,
+                        is_new=is_new,
+                    )
+                )
+                child_paths = tuple(entry.path for entry in node.entries)
+                self._set_item_roles(
+                    parent,
+                    path=lead.path,
+                    kind="group",
+                    group_key=node.group_key,
+                    child_paths=child_paths,
+                )
+                parent.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
+                parent.setToolTip(1, f"{len(node.entries)} parts")
+                parent.setToolTip(2, f"Combined size: {combined:,} B")
+                if newest:
+                    parent.setToolTip(3, format_display_datetime(newest))
+                if rec is not None:
+                    parent.setToolTip(8, "Total recording time for this capture.")
+                for entry in node.entries:
+                    child_rec = matched.get(entry.path)
+                    child_new = self._is_new_entry(entry, child_rec, new_paths)
+                    child = QTreeWidgetItem(
+                        self._fill_row_values(
+                            name=iq_part_label(entry.name),
+                            size_text=format_bytes(entry.size),
+                            modified=entry.modified,
+                            rec=child_rec,
+                            is_new=child_new,
+                        )
+                    )
+                    self._set_item_roles(child, path=entry.path, kind="file", group_key=node.group_key)
+                    child.setChildIndicatorPolicy(
+                        QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicatorWhenChildless
+                    )
+                    child.setToolTip(1, entry.name)
+                    child.setToolTip(2, f"{entry.size:,} B")
+                    if entry.modified:
+                        child.setToolTip(3, format_display_datetime(entry.modified))
+                    if child_rec is not None:
+                        child.setToolTip(8, "Total recording time, not this part.")
+                    parent.addChild(child)
+                self.table.addTopLevelItem(parent)
+                parent.setExpanded(node.group_key in self._expanded_groups)
+                continue
+            entry = node.lead
+            rec = matched.get(entry.path)
+            is_new = self._is_new_entry(entry, rec, new_paths)
             name = entry.name + ("/" if entry.is_dir else "")
             size_text = "" if entry.is_dir else format_bytes(entry.size)
-            mtime = format_display_datetime(entry.modified) if entry.modified else ""
-            rec = matched.get(entry.path)
-            is_new = (not entry.is_dir) and (
-                entry.path in new_paths
-                or (rec is not None and rec.id == self._recent_record_id and self._recent_record_id)
+            item = QTreeWidgetItem(
+                self._fill_row_values(
+                    name=name,
+                    size_text=size_text,
+                    modified=entry.modified,
+                    rec=rec,
+                    is_new=is_new,
+                )
             )
-            values = ["NEW" if is_new else "", name, size_text, mtime, "", "", "", "", ""]
+            self._set_item_roles(
+                item,
+                path=entry.path,
+                kind="dir" if entry.is_dir else "file",
+            )
+            item.setChildIndicatorPolicy(
+                QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicatorWhenChildless
+            )
+            if not entry.is_dir:
+                stem = iq_group_key(entry.name)
+                parts = counts.get(stem, 1)
+                combined = totals.get(stem, entry.size)
+                if parts > 1:
+                    item.setToolTip(2, f"This file: {entry.size:,} B. All {parts} parts: {combined:,} B.")
+                else:
+                    item.setToolTip(2, f"{entry.size:,} B")
+            if entry.modified:
+                item.setToolTip(3, format_display_datetime(entry.modified))
             if rec is not None:
-                start, end, center_hz, bw, duration = format_columns(rec)
-                values[4:] = [start, end, center_hz, bw, duration]
-            for col, text in enumerate(values):
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(center)
-                item.setData(Qt.ItemDataRole.UserRole, entry.path)
-                if col == 2 and not entry.is_dir:
-                    stem = iq_group_key(entry.name)
-                    parts = counts.get(stem, 1)
-                    combined = totals.get(stem, entry.size)
-                    if parts > 1:
-                        item.setToolTip(
-                            f"This file: {entry.size:,} B. All {parts} parts: {combined:,} B."
-                        )
-                    else:
-                        item.setToolTip(f"{entry.size:,} B")
-                if col == 3 and entry.modified:
-                    item.setToolTip(format_display_datetime(entry.modified))
-                if col == 8 and rec is not None:
-                    item.setToolTip("Total recording time, not this part.")
-                self.table.setItem(row, col, item)
+                item.setToolTip(8, "Total recording time, not this part.")
+            self.table.addTopLevelItem(item)
         self._sync_sort_headers()
-        self._restore_selected_paths(selected_paths)
+        self._restore_selected_identities(selected)
         self.table.blockSignals(False)
+        self._on_selection_changed()
 
     def apply_theme(self) -> None:
         from .theme import restyle
@@ -1096,6 +1353,7 @@ class SftpWindow(QWidget):
         mtime_ts = entry.modified.timestamp() if entry.modified else 0
         key = cache_key(entry.path, entry.size, mtime_ts)
         self.preview_file.setText(entry.name)
+        self.preview_file.setProperty("remote_path", entry.path)
         cached = self._preview_cache.get(key)
         if cached is not None:
             self._set_preview_busy(False)

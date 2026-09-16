@@ -37,3 +37,41 @@ def write_stereo_iq_tone_wav(path, **kwargs) -> int:
     payload = stereo_iq_tone_wav_bytes(**kwargs)
     path.write_bytes(payload)
     return len(payload)
+
+
+def wav_duration_seconds(data: bytes | None) -> float | None:
+    """Duration from a WAVE header. Returns None when the header cannot be verified."""
+    if not data or len(data) < 44:
+        return None
+    try:
+        with wave.open(io.BytesIO(data), "rb") as handle:
+            rate = int(handle.getframerate() or 0)
+            frames = int(handle.getnframes() or 0)
+    except (wave.Error, EOFError, OSError, ValueError):
+        return None
+    if rate <= 0 or frames < 0:
+        return None
+    return frames / float(rate)
+
+
+def probe_remote_wav_duration(browser, remote_path: str, *, max_bytes: int = 512) -> float | None:
+    """Read a WAVE header from the sensor. Does not invent a duration."""
+    if browser is None or not remote_path:
+        return None
+    import os
+    import tempfile
+    from pathlib import Path
+
+    fd, name = tempfile.mkstemp(prefix="crfs-iq-dur-", suffix=".wav")
+    os.close(fd)
+    path = Path(name)
+    try:
+        browser.read_prefix(remote_path, path, int(max_bytes))
+        return wav_duration_seconds(path.read_bytes())
+    except Exception:
+        return None
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass

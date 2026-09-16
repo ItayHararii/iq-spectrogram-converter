@@ -35,6 +35,10 @@ class RecordingParams:
     duration_s: float
     demo: bool = False
     iq_stem: str = ""
+    collection_event: str = ""
+    target_class: str = ""
+    worksheet: str = ""
+    sensor_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -48,6 +52,10 @@ class RecordingParams:
             "duration_s": float(self.duration_s),
             "demo": bool(self.demo),
             "iq_stem": self.iq_stem,
+            "collection_event": self.collection_event,
+            "target_class": self.target_class,
+            "worksheet": self.worksheet,
+            "sensor_id": self.sensor_id,
         }
 
     @classmethod
@@ -64,6 +72,10 @@ class RecordingParams:
             duration_s=float(data["duration_s"]),
             demo=bool(data.get("demo", False)),
             iq_stem=str(data.get("iq_stem") or ""),
+            collection_event=str(data.get("collection_event") or ""),
+            target_class=str(data.get("target_class") or ""),
+            worksheet=str(data.get("worksheet") or ""),
+            sensor_id=str(data.get("sensor_id") or ""),
         )
 
 
@@ -78,6 +90,10 @@ def new_recording(
     started_at: datetime | None = None,
     demo: bool = False,
     iq_stem: str = "",
+    collection_event: str = "",
+    target_class: str = "",
+    worksheet: str = "",
+    sensor_id: str = "",
 ) -> RecordingParams:
     return RecordingParams(
         id=str(uuid.uuid4()),
@@ -90,6 +106,10 @@ def new_recording(
         duration_s=float(duration_s),
         demo=demo,
         iq_stem=str(iq_stem or ""),
+        collection_event=str(collection_event or ""),
+        target_class=str(target_class or ""),
+        worksheet=str(worksheet or ""),
+        sensor_id=str(sensor_id or ""),
     )
 
 
@@ -126,6 +146,80 @@ def iq_part_number(name: str) -> int | None:
     if not match:
         return None
     return int(match.group("part"))
+
+
+def iq_group_display_name(name: str) -> str:
+    match = _PART_SUFFIX.match(name or "")
+    if match:
+        return match.group("stem")
+    return name or ""
+
+
+def iq_part_label(name: str) -> str:
+    match = _PART_SUFFIX.match(name or "")
+    if not match:
+        return name or ""
+    return f"_{match.group('part')}{match.group('ext')}"
+
+
+def remote_directory(path: str) -> str:
+    text = (path or "/").replace("\\", "/")
+    if text != "/" and text.endswith("/"):
+        text = text.rstrip("/")
+    if "/" not in text:
+        return "/"
+    parent = text.rsplit("/", 1)[0]
+    return parent or "/"
+
+
+def recording_group_key(
+    *,
+    sensor_id: str = "",
+    directory: str = "",
+    stem: str = "",
+    record_id: str = "",
+) -> str:
+    identity = (sensor_id or "").strip() or "unknown"
+    folder = (directory or "/").replace("\\", "/")
+    if folder != "/" and folder.endswith("/"):
+        folder = folder.rstrip("/")
+    folder = folder or "/"
+    return f"{identity}|{folder}|{(stem or '').casefold()}|{(record_id or '').strip()}"
+
+
+def sort_iq_filenames(names: list[str] | tuple[str, ...]) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        text = str(name or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        found.append(text)
+
+    def _order(name: str) -> tuple:
+        part = iq_part_number(name)
+        return (part is None, part or 0, name.casefold())
+
+    found.sort(key=_order)
+    return found
+
+
+def split_iq_filenames(value) -> list[str]:
+    if value in (None, ""):
+        return []
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    return sort_iq_filenames(text.split("\n"))
+
+
+def join_iq_filenames(names: list[str] | tuple[str, ...]) -> str:
+    return "\n".join(sort_iq_filenames(names))
+
+
+def cluster_key(entry: RemoteEntry, matched: dict | None = None) -> tuple[str, str, str]:
+    rec = (matched or {}).get(entry.path)
+    record_id = str(getattr(rec, "id", "") or "") if rec is not None else ""
+    return (remote_directory(entry.path), iq_group_key(entry.name), record_id)
 
 
 def expand_group_entries(

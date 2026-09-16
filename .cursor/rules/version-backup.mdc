@@ -1,0 +1,19 @@
+---
+description: Back up each CRFS IQ Recorder version to Git with a tag and EXE release
+alwaysApply: true
+---
+
+# Version backup to Git
+
+When shipping a **new CRFS IQ Recorder version** (bump `__version__` and/or share a new EXE), do this without waiting to be asked. Keep older tags and GitHub Releases for rollback.
+
+1. Set `__version__` in `crfs_iq_recorder/crfs_iq_recorder/__init__.py`. Match Quick Start **Version**.
+2. Commit source and build config (`build_exe.bat`, `CRFS_IQ_Recorder.spec`, `requirements.txt`). Clear message of what changed.
+3. Create annotated tag `vX.Y.Z` matching `__version__` (example: `v1.7.0`).
+4. Push the branch **and** the tag to the configured remote (this branch tracks `personal` → `ItayHararii/iq-spectrogram-converter`). Do not force-push tags or `main`.
+5. Create a GitHub Release on that tag and attach `crfs_iq_recorder/dist/CRFS_IQ_Recorder.exe`. Short notes. Do not put IPs or passwords in notes.
+6. Verify with `gh release view vX.Y.Z --repo ItayHararii/iq-spectrogram-converter` and give Itay the version and release URL.
+
+Never commit credentials, settings/secrets JSON, IQ recordings (`*.wav`), collection workbooks (`*.xlsm` / `*.xlsx`), Excel backups (`*.crfs-backup-*`), or the EXE in Git (`dist/`, `*.exe`). The EXE belongs only on the Release.
+
+If push or EXE upload fails, say **the backup is incomplete** and what still needs to happen. Do not delete previous versions.

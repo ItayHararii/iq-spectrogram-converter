@@ -28,17 +28,23 @@ def test_redact_basic_in_text():
     assert "***" in text
 
 
-def test_connection_state_persistable_omits_passwords():
+def test_connection_state_persistable_omits_plaintext_passwords():
     state = ConnectionState(http_password="secret-http", sftp_password="secret-sftp")
     data = state.persistable()
     blob = json.dumps(data)
-    assert "password" not in data
     assert "http_password" not in data
     assert "sftp_password" not in data
     assert "secret-http" not in blob
     assert "secret-sftp" not in blob
+    assert data["http_secret"]
+    assert data["sftp_secret"]
+    restored = ConnectionState.from_settings(data)
+    assert restored.http_password == "secret-http"
+    assert restored.sftp_password == "secret-sftp"
     assert "demo" not in data
     assert data["download_dir"]
+    assert data["repeat_wait_s"] == 5.0
+    assert data["repeat_wait_unit"] == "seconds"
 
 
 def test_saved_demo_flag_is_ignored_unless_constructor_requests_it():

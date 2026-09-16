@@ -7,6 +7,7 @@ rejected rather than rounded.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Mapping
@@ -82,6 +83,46 @@ def display_from_hz(hz: int, unit: str) -> str:
 
 def parse_to_integer_hz(text: str, unit: str, *, field: str) -> int:
     return require_integer_hz(to_hz(parse_decimal(text, field=field), unit, field=field), field=field)
+
+
+_FREQ_WITH_UNIT = re.compile(
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(Hz|kHz|MHz|GHz)\s*$",
+    re.IGNORECASE,
+)
+
+_UNIT_CANON = {name.casefold(): name for name in UNIT_TO_HZ}
+
+
+@dataclass(frozen=True)
+class FreqTextStyle:
+    unit: str
+    space_before_unit: bool
+
+
+def parse_freq_text(text: str, *, field: str = "Frequency") -> int:
+    """Parse values such as `1626MHz`, `1626.5 MHz`, or `2.9 GHz` to integer Hz."""
+    raw = (text or "").strip().replace(",", "")
+    match = _FREQ_WITH_UNIT.match(raw)
+    if not match:
+        raise FrequencyError(f"{field} is not a frequency with a unit: {text!r}.")
+    unit = _UNIT_CANON[match.group(2).casefold()]
+    return parse_to_integer_hz(match.group(1), unit, field=field)
+
+
+def freq_text_style(text: str) -> FreqTextStyle | None:
+    raw = (text or "").strip().replace(",", "")
+    match = _FREQ_WITH_UNIT.match(raw)
+    if not match:
+        return None
+    unit = _UNIT_CANON[match.group(2).casefold()]
+    between = raw[match.start(1) + len(match.group(1)) : match.start(2)]
+    return FreqTextStyle(unit=unit, space_before_unit=(" " in between))
+
+
+def format_freq_text(hz: int, style: FreqTextStyle) -> str:
+    number = display_from_hz(int(hz), style.unit)
+    gap = " " if style.space_before_unit else ""
+    return f"{number}{gap}{style.unit}"
 
 
 @dataclass(frozen=True)

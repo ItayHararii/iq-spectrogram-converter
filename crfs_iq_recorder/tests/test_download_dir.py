@@ -86,10 +86,14 @@ def test_settings_remember_download_dir(tmp_path, monkeypatch):
     loaded = ConnectionState.from_settings(load_settings())
     assert loaded.host == "192.0.2.10"
     assert loaded.download_dir == str(chosen)
-    assert "http_password" not in load_settings()
-    assert "sftp_password" not in load_settings()
-    assert "demo" not in load_settings()
-    assert "password" not in settings.read_text(encoding="utf-8").casefold()
+    stored = load_settings()
+    assert "http_password" not in stored
+    assert "sftp_password" not in stored
+    assert "demo" not in stored
+    assert stored.get("http_secret")
+    assert stored.get("sftp_secret")
+    assert loaded.http_password == state.http_password
+    assert loaded.sftp_password == state.sftp_password
 
 
 def test_settings_remember_band_time_unit_and_format(tmp_path, monkeypatch):
@@ -107,6 +111,8 @@ def test_settings_remember_band_time_unit_and_format(tmp_path, monkeypatch):
         bandwidth_hz=20_000_000,
         recorded_time_s=4,
         recording_format="HDF5",
+        repeat_wait_s=0,
+        repeat_wait_unit="minutes",
     )
     save_settings(state.persistable())
     loaded = ConnectionState.from_settings(load_settings())
@@ -116,6 +122,8 @@ def test_settings_remember_band_time_unit_and_format(tmp_path, monkeypatch):
     assert loaded.end_hz == 810_000_000
     assert loaded.recorded_time_s == 4
     assert loaded.recording_format == "HDF5"
+    assert loaded.repeat_wait_s == 0
+    assert loaded.repeat_wait_unit == "minutes"
     plan = loaded.frequency_plan()
     assert plan.center_hz == 800_000_000
     assert plan.bandwidth_hz == 20_000_000

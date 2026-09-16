@@ -34,6 +34,14 @@ def test_iq_group_key_strips_part_suffix():
     assert iq_group_key("iq-demo.wav") == "iq-demo.wav"
 
 
+def test_iq_filenames_join_split_and_dedupe():
+    from crfs_iq_recorder.recording_history import join_iq_filenames, split_iq_filenames
+
+    text = join_iq_filenames(["iq_x_0002.wav", "iq_x_0001.wav", "iq_x_0001.wav"])
+    assert text == "iq_x_0001.wav\niq_x_0002.wav"
+    assert split_iq_filenames(text) == ["iq_x_0001.wav", "iq_x_0002.wav"]
+
+
 def test_expand_group_entries_includes_all_split_parts():
     from datetime import datetime
 

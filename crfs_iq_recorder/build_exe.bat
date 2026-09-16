@@ -20,7 +20,7 @@ echo Building exe...
 if errorlevel 1 goto :error
 
 echo.
-echo Done. Give colleagues dist\CRFS_IQ_Recorder.exe — Python is not required.
+echo Done. Give colleagues dist\CRFS_IQ_Recorder.exe - Python is not required.
 echo Downloads default to %USERPROFILE%\CRFS IQ Recorder\Recordings (local disk, not OneDrive)
 echo.
 if /I not "%CRFS_BUILD_NOPAUSE%"=="1" pause

@@ -4,10 +4,10 @@ CRFS IQ Recorder is a Windows app for CRFS sensors. It starts an IQ recording, d
 
 ## Download and run
 
-**Version:** 1.4.0
+**Version:** 1.7.0
 **File:** `CRFS_IQ_Recorder.exe` - one file, no Python, no install.
 
-> Download link not published yet. Attach `CRFS_IQ_Recorder.exe` to this page, or replace this note with the shared link.
+> Windows EXE: [CRFS IQ Recorder 1.7.0](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.7.0)
 
 1. Save the exe on this PC (Desktop or a local folder).
 2. Double-click **CRFS_IQ_Recorder.exe**. The first launch can be slower.
@@ -25,6 +25,10 @@ Do not put real sensor IPs, logins, or passwords on this page or in screenshots.
 4. Enter **Recording time (s)** and check **Estimate**.
 5. Click **Start Recording**. Status goes **Sending request...**, then **Recording...**, then **WAVE file found** when files appear.
 
+To log into a collection workbook: tick **Log recordings to Excel**, choose the `.xlsm` file, check the collection event and target class, then start. Repeat count or Until stopped runs consecutive recordings, with a wait between them (default 5 seconds). **Stop after current recording** finishes the capture that is already running, or cancels the countdown, and does not start another.
+
+HTTP and SFTP logins are remembered on this computer. In Sensor Files, select files and press Delete to remove them from the sensor.
+
 ![Main window: Settings, band and time, Start Recording, and Sensor Files. The header shows the connected sensor.](01-main-window.png)
 
 *Main window - Settings, band and time, Start Recording, and Sensor Files. The header shows the connected sensor.*
@@ -32,9 +36,9 @@ Do not put real sensor IPs, logins, or passwords on this page or in screenshots.
 ## Find and download recordings
 
 1. Click **Sensor Files**.
-2. Today's folder on the sensor opens (`/mnt/1/remdata/YYYYMMDD/`). New files show **NEW**. A split capture appears as `_0001`, `_0002`, and so on.
-3. Start, end, center, bandwidth, and duration are shown when the app has them.
-4. Select one or more files and click **Download**. There is no save dialog.
+2. Today's folder on the sensor opens (`/mnt/1/remdata/YYYYMMDD/`). New files show **NEW**. A split capture appears as a collapsible parent such as `iq_20260915_142718`, with `_0001.wav` and `_0002.wav` underneath. Single files stay as normal rows.
+3. Start, end, center, bandwidth, and duration are shown when the app has them. The parent shows part count and combined size.
+4. Select the parent and click **Download this recording** for every listed part, or select individual children to download only those files. There is no save dialog. Delete is keyboard-only on the focused file list.
 
 Default local folder: `%USERPROFILE%\CRFS IQ Recorder\Recordings`
 
@@ -56,5 +60,5 @@ Click a WAVE file. A short waterfall of the first portion appears under the list
 
 - Recordings are saved on the sensor first. **Download** copies them to this computer.
 - Today's sensor folder is created after the first recording task is submitted.
-- Large recordings may be split into numbered files. Download every part if you need the complete capture.
+- Large recordings may be split into numbered files. The parent row represents the whole capture; download or delete that parent if you need every listed part.
 - The waterfall preview is a short overview of the start of the file.

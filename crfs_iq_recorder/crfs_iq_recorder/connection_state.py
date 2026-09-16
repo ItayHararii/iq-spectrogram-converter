@@ -1,4 +1,4 @@
-"""In-memory connection and last-used recording settings. Passwords are never written to disk."""
+"""In-memory connection and last-used recording settings. Passwords are stored protected, not in logs."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from .constants import (
     DEFAULT_FREQ_UNIT,
     DEFAULT_PASSWORD,
     DEFAULT_RECORDED_TIME_S,
+    DEFAULT_REPEAT_WAIT_S,
+    DEFAULT_REPEAT_WAIT_UNIT,
     DEFAULT_RECORDING_FORMAT,
     DEFAULT_SFTP_PASSWORD,
     DEFAULT_SFTP_PORT,
@@ -48,6 +50,16 @@ def _as_float(data: dict, key: str, default: float) -> float:
     return value
 
 
+def _as_wait_s(data: dict, key: str, default: float) -> float:
+    try:
+        value = float(data.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        return default
+    return value
+
+
 @dataclass
 class ConnectionState:
     host: str = ""
@@ -71,6 +83,13 @@ class ConnectionState:
     recorded_time_s: float = DEFAULT_RECORDED_TIME_S
     recording_format: str = DEFAULT_RECORDING_FORMAT
     ui_theme: str = "light"
+    excel_enabled: bool = False
+    excel_workbook: str = ""
+    collection_event: str = ""
+    repeat_mode: str = "off"
+    repeat_count: int = 2
+    repeat_wait_s: float = DEFAULT_REPEAT_WAIT_S
+    repeat_wait_unit: str = DEFAULT_REPEAT_WAIT_UNIT
 
     def sftp_user(self) -> str:
         return (self.sftp_username or DEFAULT_SFTP_USERNAME).strip()
@@ -87,6 +106,12 @@ class ConnectionState:
             return from_center_bandwidth(DEFAULT_CENTER_HZ, DEFAULT_BANDWIDTH_HZ)
 
     def persistable(self) -> dict:
+        from .secrets_store import protect_secret
+
+        wait_unit = self.repeat_wait_unit if self.repeat_wait_unit in {"seconds", "minutes"} else "seconds"
+        wait_s = float(self.repeat_wait_s)
+        if wait_s != wait_s or wait_s < 0:
+            wait_s = DEFAULT_REPEAT_WAIT_S
         return {
             "host": self.host,
             "http_port": self.http_port,
@@ -106,6 +131,15 @@ class ConnectionState:
             "recorded_time_s": float(self.recorded_time_s),
             "recording_format": self.recording_format,
             "ui_theme": "dark" if self.ui_theme == "dark" else "light",
+            "excel_enabled": bool(self.excel_enabled),
+            "excel_workbook": self.excel_workbook,
+            "collection_event": self.collection_event,
+            "repeat_mode": self.repeat_mode if self.repeat_mode in {"off", "count", "until"} else "off",
+            "repeat_count": int(self.repeat_count) if int(self.repeat_count) > 0 else 2,
+            "repeat_wait_s": wait_s,
+            "repeat_wait_unit": wait_unit,
+            "http_secret": protect_secret(self.http_password),
+            "sftp_secret": protect_secret(self.sftp_password),
         }
 
     @classmethod
@@ -126,7 +160,18 @@ class ConnectionState:
             state.sftp_username = DEFAULT_SFTP_USERNAME
         else:
             state.sftp_username = saved_user
-        state.sftp_password = DEFAULT_SFTP_PASSWORD
+        from .secrets_store import unprotect_secret
+
+        if "http_secret" in data:
+            recovered = unprotect_secret(str(data.get("http_secret") or ""))
+            state.http_password = recovered if recovered is not None else DEFAULT_PASSWORD
+        else:
+            state.http_password = DEFAULT_PASSWORD
+        if "sftp_secret" in data:
+            recovered = unprotect_secret(str(data.get("sftp_secret") or ""))
+            state.sftp_password = recovered if recovered is not None else DEFAULT_SFTP_PASSWORD
+        else:
+            state.sftp_password = DEFAULT_SFTP_PASSWORD
         if demo and not state.host:
             state.host = "192.0.2.10"
         stored = str(data.get("download_dir") or "").strip()
@@ -147,4 +192,17 @@ class ConnectionState:
         state.recording_format = fmt if info is not None and info.emp_verified else DEFAULT_RECORDING_FORMAT
         theme = str(data.get("ui_theme") or "light").strip().casefold()
         state.ui_theme = "dark" if theme == "dark" else "light"
+        state.excel_enabled = bool(data.get("excel_enabled", False))
+        state.excel_workbook = str(data.get("excel_workbook") or "")
+        state.collection_event = str(data.get("collection_event") or "")
+        mode = str(data.get("repeat_mode") or "off").strip().casefold()
+        state.repeat_mode = mode if mode in {"off", "count", "until"} else "off"
+        try:
+            count = int(data.get("repeat_count", 2))
+        except (TypeError, ValueError):
+            count = 2
+        state.repeat_count = count if count > 0 else 2
+        state.repeat_wait_s = _as_wait_s(data, "repeat_wait_s", DEFAULT_REPEAT_WAIT_S)
+        wait_unit = str(data.get("repeat_wait_unit") or DEFAULT_REPEAT_WAIT_UNIT).strip().casefold()
+        state.repeat_wait_unit = wait_unit if wait_unit in {"seconds", "minutes"} else DEFAULT_REPEAT_WAIT_UNIT
         return state

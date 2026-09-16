@@ -6,10 +6,12 @@ from crfs_iq_recorder.listing_sort import (
     COL_NAME,
     COL_SIZE,
     COL_START,
+    build_listing_nodes,
     header_label,
     parse_date_folder_name,
     sort_entries,
     sort_entries_newest_first,
+    sort_listing_nodes,
 )
 from crfs_iq_recorder.recording_history import new_recording
 from crfs_iq_recorder.sftp_client import RemoteEntry
@@ -133,3 +135,66 @@ def test_header_label_arrows():
     assert header_label("Name", active=False, descending=True) == "Name"
     assert header_label("Modified", active=True, descending=True).endswith("▼")
     assert header_label("Modified ▼", active=True, descending=False).endswith("▲")
+
+
+def test_split_parts_build_one_group_and_keep_single_files():
+    now = datetime(2026, 9, 15, 14, 27, 18)
+    part1 = _file("iq_20260915_150000_0001.wav", now, size=10)
+    part2 = _file("iq_20260915_150000_0002.wav", now, size=20)
+    lone = _file("iq_20260915_142800_0001.wav", now, size=5)
+    plain = _file("iq-demo.wav", now, size=7)
+    nodes = build_listing_nodes([part1, part2, lone, plain])
+    groups = [node for node in nodes if node.kind == "group"]
+    files = [node for node in nodes if node.kind == "file"]
+    assert len(groups) == 1
+    assert groups[0].name == "iq_20260915_150000"
+    assert [entry.name for entry in groups[0].entries] == [
+        "iq_20260915_150000_0001.wav",
+        "iq_20260915_150000_0002.wav",
+    ]
+    assert {node.name for node in files} == {"iq_20260915_142800_0001.wav", "iq-demo.wav"}
+    ordered = sort_listing_nodes(nodes)
+    assert ordered[0].kind == "group"
+    by_size = sort_listing_nodes(nodes, column=COL_SIZE, descending=True)
+    assert by_size[0].kind == "group"
+    assert sum(entry.size for entry in by_size[0].entries) == 30
+
+
+def test_same_stem_in_different_folders_stays_separate():
+    now = datetime(2026, 9, 15, 14, 27, 18)
+    first = [
+        RemoteEntry("iq_x_0001.wav", "/a/iq_x_0001.wav", False, 1, now),
+        RemoteEntry("iq_x_0002.wav", "/a/iq_x_0002.wav", False, 1, now),
+    ]
+    second = [
+        RemoteEntry("iq_x_0001.wav", "/b/iq_x_0001.wav", False, 1, now),
+        RemoteEntry("iq_x_0002.wav", "/b/iq_x_0002.wav", False, 1, now),
+    ]
+    rec_a = new_recording(
+        host="h",
+        start_hz=1,
+        end_hz=2,
+        center_hz=1,
+        bandwidth_hz=1,
+        duration_s=1,
+        started_at=now,
+    )
+    rec_b = new_recording(
+        host="h",
+        start_hz=3,
+        end_hz=4,
+        center_hz=3,
+        bandwidth_hz=1,
+        duration_s=2,
+        started_at=now,
+    )
+    matched = {
+        first[0].path: rec_a,
+        first[1].path: rec_a,
+        second[0].path: rec_b,
+        second[1].path: rec_b,
+    }
+    nodes = build_listing_nodes(first + second, matched)
+    groups = [node for node in nodes if node.kind == "group"]
+    assert len(groups) == 2
+    assert groups[0].group_key != groups[1].group_key

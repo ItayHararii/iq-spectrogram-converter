@@ -344,9 +344,16 @@ QLineEdit, QPlainTextEdit, QComboBox, QSpinBox {{
 QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{
     border: 1px solid {p.focus};
 }}
-QLineEdit:disabled, QComboBox:disabled {{
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{
     color: {p.muted};
     background: {p.bg};
+}}
+QCheckBox {{
+    color: {p.text};
+    spacing: 8px;
+}}
+QCheckBox:disabled {{
+    color: {p.muted};
 }}
 QLineEdit#bareField {{
     border: none;
@@ -489,7 +496,7 @@ QHeaderView::section:pressed {{
     color: {p.text};
     background: {p.border};
 }}
-QTableWidget {{
+QTableWidget, QTreeWidget {{
     background: {p.surface};
     alternate-background-color: {p.log_bg};
     color: {p.text};
@@ -499,12 +506,18 @@ QTableWidget {{
     selection-background-color: {p.accent};
     selection-color: #FFFFFF;
 }}
-QTableWidget::item {{
+QTableWidget::item, QTreeWidget::item {{
     padding: 6px 8px;
 }}
-QTableWidget::item:selected {{
+QTableWidget::item:selected, QTreeWidget::item:selected {{
     background: {p.accent};
     color: #FFFFFF;
+}}
+QTreeWidget::branch {{
+    background: {p.surface};
+}}
+QTreeWidget::branch:selected {{
+    background: {p.accent};
 }}
 QProgressBar {{
     background: {p.bg};

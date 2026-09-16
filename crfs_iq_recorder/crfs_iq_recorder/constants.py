@@ -8,7 +8,7 @@ APP_NAME = "CRFS IQ Recorder"
 APP_ID = "Sensorz.CRFSIQRecorder"
 
 DEFAULT_USERNAME = "admin"
-DEFAULT_PASSWORD = ""
+DEFAULT_PASSWORD = "pass"
 DEFAULT_TIMEOUT_S = 30.0
 DEFAULT_PORT = 80
 EMP_PATH = "/emp/"
@@ -30,10 +30,12 @@ DEFAULT_START_HZ = 793_750_000
 DEFAULT_END_HZ = 806_250_000
 
 DEFAULT_RECORDED_TIME_S = 0.1
+DEFAULT_REPEAT_WAIT_S = 5.0
+DEFAULT_REPEAT_WAIT_UNIT = "seconds"
 DEFAULT_SFTP_PORT = 22
-# SFTP uses a different account from HTTP Basic Auth. Passwords start empty.
+# SFTP uses a different account from HTTP Basic Auth.
 DEFAULT_SFTP_USERNAME = "root"
-DEFAULT_SFTP_PASSWORD = ""
+DEFAULT_SFTP_PASSWORD = "rf3y3"
 SFTP_REMDATA_ROOT = "/mnt/1/remdata/"
 
 EMPIRICAL_REF_SIZE_MB = "61.051"
@@ -51,6 +53,7 @@ DEFAULT_FREQ_UNIT = "MHz"
 SETTINGS_FILENAME = ".crfs_iq_recorder_settings.json"
 RECORDINGS_FILENAME = ".crfs_iq_recorder_recordings.json"
 PRESET_FILTER = "Recording presets (*.json);;All files (*.*)"
+EXCEL_LOG_FILENAME = ".crfs_iq_recorder_excel_log.json"
 DOWNLOAD_APP_FOLDER = "CRFS IQ Recorder"
 DOWNLOAD_SUBFOLDER = "Recordings"
 

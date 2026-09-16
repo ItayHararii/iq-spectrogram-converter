@@ -1,4 +1,4 @@
-"""Application paths and small persistence (no passwords)."""
+"""Application paths and small persistence. Connection secrets are stored protected."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Any
 from .constants import (
     DOWNLOAD_APP_FOLDER,
     DOWNLOAD_SUBFOLDER,
+    EXCEL_LOG_FILENAME,
     RECORDINGS_FILENAME,
     SETTINGS_FILENAME,
 )
@@ -46,6 +47,10 @@ def recordings_path() -> Path:
 
 def settings_path() -> Path:
     return user_config_dir() / SETTINGS_FILENAME
+
+
+def excel_log_path() -> Path:
+    return user_config_dir() / EXCEL_LOG_FILENAME
 
 
 def _local_app_folder() -> Path:
@@ -172,10 +177,17 @@ def load_settings() -> dict[str, Any]:
 
 
 def save_settings(data: dict[str, Any]) -> None:
-    payload = redact_obj(dict(data))
+    raw = dict(data)
+    http_secret = raw.get("http_secret")
+    sftp_secret = raw.get("sftp_secret")
+    payload = redact_obj(raw)
     if isinstance(payload, dict):
         for secret in ("password", "passwd", "pwd", "http_password", "sftp_password"):
             payload.pop(secret, None)
+        if isinstance(http_secret, str) and http_secret:
+            payload["http_secret"] = http_secret
+        if isinstance(sftp_secret, str) and sftp_secret:
+            payload["sftp_secret"] = sftp_secret
         path = settings_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import pytest
+from openpyxl import load_workbook
 
 from crfs_iq_recorder.request_builder import default_payload
 
@@ -45,7 +46,43 @@ def no_explorer(monkeypatch):
     )
 
 
-def test_gui_default_recording_request(qapp):
+def _wait_listing(window, qapp, count=1, timeout=3, *, idle=False):
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        qapp.processEvents()
+        ready = window.table.topLevelItemCount() >= count
+        if idle:
+            ready = ready and not window._busy
+        if ready:
+            break
+        time.sleep(0.05)
+    return window.table.topLevelItemCount()
+
+
+def _top_texts(window, col=1):
+    return [
+        window.table.topLevelItem(i).text(col)
+        for i in range(window.table.topLevelItemCount())
+        if window.table.topLevelItem(i) is not None
+    ]
+
+
+def _header_text(window, col):
+    item = window.table.headerItem()
+    return item.text(col) if item is not None else ""
+
+
+def _group_item(window, stem: str):
+    for index in range(window.table.topLevelItemCount()):
+        item = window.table.topLevelItem(index)
+        if item is not None and item.text(1) == stem:
+            return item
+    return None
+
+
+def test_gui_default_payload(qapp):
     from crfs_iq_recorder.gui import MainWindow
 
     window = MainWindow(demo=True)
@@ -63,6 +100,9 @@ def test_gui_default_recording_request(qapp):
         assert window.firmware_value.text() == "2.25-325"
         assert window.serial_value.text() == "rfeyeDEMO"
         assert window.status_value.text() == "Demo"
+        assert window.wait_spin.value() == 5
+        assert window.wait_unit.currentText() == "Seconds"
+        assert window._repeat_wait_s() == 5
     finally:
         window.close()
 
@@ -125,19 +165,16 @@ def test_sftp_window_fills_demo_listing_without_crashing(qapp):
 
     window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
     try:
-        deadline = time.time() + 3
-        while time.time() < deadline and window.table.rowCount() == 0:
-            qapp.processEvents()
-            time.sleep(0.05)
-        assert window.table.rowCount() >= 1
-        assert window.table.item(0, 0) is not None
+        _wait_listing(window, qapp)
+        assert window.table.topLevelItemCount() >= 1
+        assert window.table.topLevelItem(0) is not None
         window.refresh()
         deadline = time.time() + 3
         while time.time() < deadline and window._busy:
             qapp.processEvents()
             time.sleep(0.05)
         qapp.processEvents()
-        assert window.table.rowCount() >= 1
+        assert window.table.topLevelItemCount() >= 1
     finally:
         window.close()
         qapp.processEvents()
@@ -235,17 +272,14 @@ def test_sftp_table_shows_saved_recording_parameters(qapp, tmp_path):
     )
     window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
     try:
-        deadline = time.time() + 3
-        while time.time() < deadline and window.table.rowCount() == 0:
-            qapp.processEvents()
-            time.sleep(0.05)
+        _wait_listing(window, qapp)
         assert window.table.columnCount() == 9
         shown = [
-            (
-                window.table.item(row, 4).text() if window.table.item(row, 4) else "",
-                window.table.item(row, 8).text() if window.table.item(row, 8) else "",
+            (item.text(4), item.text(8))
+            for item in (
+                window.table.topLevelItem(i) for i in range(window.table.topLevelItemCount())
             )
-            for row in range(window.table.rowCount())
+            if item is not None
         ]
         assert any(start == "790" and duration == "4" for start, duration in shown)
     finally:
@@ -261,10 +295,7 @@ def test_sftp_downloads_multiple_files(qapp, tmp_path):
 
     window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
     try:
-        deadline = time.time() + 3
-        while time.time() < deadline and window.table.rowCount() < 2:
-            qapp.processEvents()
-            time.sleep(0.05)
+        _wait_listing(window, qapp, 2)
         files = [entry for entry in window._entries if not entry.is_dir]
         assert len(files) >= 2
         jobs = [(entry, str(tmp_path / entry.name)) for entry in files[:2]]
@@ -306,10 +337,7 @@ def test_sftp_begin_downloads_uses_fixed_folder_without_dialogs(qapp, tmp_path, 
         ConnectionState(demo=True, host="192.0.2.10", download_dir=str(dest))
     )
     try:
-        deadline = time.time() + 3
-        while time.time() < deadline and window.table.rowCount() < 2:
-            qapp.processEvents()
-            time.sleep(0.05)
+        _wait_listing(window, qapp, 2)
         files = [entry for entry in window._entries if not entry.is_dir]
         assert len(files) >= 2
         window._begin_downloads(files[:2])
@@ -494,44 +522,34 @@ def test_sftp_lists_newest_files_first_without_new_on_first_listing(qapp):
 
     window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
     try:
-        deadline = time.time() + 3
-        while time.time() < deadline and window.table.rowCount() == 0:
-            qapp.processEvents()
-            time.sleep(0.05)
+        _wait_listing(window, qapp)
         files = [entry for entry in window._entries if not entry.is_dir]
         assert files
-        from crfs_iq_recorder.listing_sort import entry_newest_time
-
-        newest_times = [entry_newest_time(entry) for entry in files]
-        assert newest_times == sorted(newest_times, reverse=True)
-        new_flags = [
-            window.table.item(row, 0).text()
-            for row in range(window.table.rowCount())
-            if window.table.item(row, 0)
-        ]
+        names = [text.rstrip("/") for text in _top_texts(window)]
+        assert names[0] == "iq-demo-2.wav"
+        assert "iq_20260910_161629" in names
+        new_flags = _top_texts(window, 0)
         assert all(flag == "" for flag in new_flags)
-        header = window.table.horizontalHeaderItem(3)
-        assert header is not None
-        assert "▼" in header.text()
-        keep_name = files[0].name
-        window.table.selectRow(0)
+        assert "▼" in _header_text(window, 3)
+        keep = window.table.topLevelItem(0)
+        assert keep is not None
+        window.table.clearSelection()
+        keep.setSelected(True)
+        window.table.setCurrentItem(keep)
+        newest = max((entry.modified for entry in files if entry.modified), default=None)
         extra = RemoteEntry(
             "iq_brand_new.wav",
             files[0].path.rsplit("/", 1)[0] + "/iq_brand_new.wav",
             False,
             100,
-            files[0].modified + timedelta(seconds=30) if files[0].modified else None,
+            newest + timedelta(seconds=30) if newest else None,
         )
         window._fill(window._entries + [extra])
-        assert window.table.item(0, 1).text() == "iq_brand_new.wav"
-        assert window.table.item(0, 0).text() == "NEW"
-        selected = [
-            window._entry_at(index.row()).name
-            for index in window.table.selectionModel().selectedRows()
-            if window._entry_at(index.row()) is not None
-        ]
-        assert keep_name in selected
-        assert "iq_brand_new.wav" not in selected
+        assert window.table.topLevelItem(0).text(1) == "iq_brand_new.wav"
+        assert window.table.topLevelItem(0).text(0) == "NEW"
+        selected = window._selected_file_paths()
+        assert any(path.endswith("iq-demo-2.wav") for path in selected)
+        assert extra.path not in selected
     finally:
         window.close()
         qapp.processEvents()
@@ -604,29 +622,67 @@ def test_gui_remembers_band_time_unit_format(qapp):
         window2.close()
 
 
-def test_download_this_recording_expands_split_parts(qapp):
+def test_download_parent_downloads_split_parts(qapp):
     import time
 
     from crfs_iq_recorder.connection_state import ConnectionState
+    from crfs_iq_recorder.sftp_client import RemoteEntry
     from crfs_iq_recorder.sftp_window import SftpWindow
 
     window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
     try:
-        deadline = time.time() + 3
-        while time.time() < deadline and window.table.rowCount() == 0:
-            qapp.processEvents()
-            time.sleep(0.05)
-        row = next(i for i, entry in enumerate(window._entries) if entry.name.endswith("_0001.wav"))
-        window.table.selectRow(row)
+        _wait_listing(window, qapp)
+        group = _group_item(window, "iq_20260910_161629")
+        assert group is not None
+        assert group.childCount() == 2
+        assert group.child(0).text(1) == "_0001.wav"
+        assert group.child(1).text(1) == "_0002.wav"
+        window.table.clearSelection()
+        group.setSelected(True)
+        window.table.setCurrentItem(group)
         window._on_selection_changed()
         assert window.download_btn.text() == "Download this recording"
         captured = []
         window._begin_downloads = lambda files: captured.extend(files)
         window._download_selected()
         names = {entry.name for entry in captured}
-        assert "iq_20260910_161629_0001.wav" in names
-        assert "iq_20260910_161629_0002.wav" in names
+        assert names == {"iq_20260910_161629_0001.wav", "iq_20260910_161629_0002.wav"}
+        captured.clear()
+        window.table.clearSelection()
+        group.setExpanded(True)
+        child = group.child(0)
+        child.setSelected(True)
+        window.table.setCurrentItem(child)
+        window._on_selection_changed()
+        assert window.download_btn.text() == "Download"
+        window._download_selected()
+        assert [entry.name for entry in captured] == ["iq_20260910_161629_0001.wav"]
         assert window.open_folder_btn.text() == "Open recordings folder"
+        window.table.clearSelection()
+        group.setExpanded(True)
+        group.setSelected(True)
+        group.child(0).setSelected(True)
+        window._on_selection_changed()
+        assert set(window._selected_file_paths()) == {
+            next(entry.path for entry in window._entries if entry.name.endswith("161629_0001.wav")),
+            next(entry.path for entry in window._entries if entry.name.endswith("161629_0002.wav")),
+        }
+        group.setExpanded(True)
+        qapp.processEvents()
+        part1 = next(entry for entry in window._entries if entry.name.endswith("161629_0001.wav"))
+        extra = RemoteEntry(
+            "iq_20260910_161629_0003.wav",
+            part1.path.rsplit("/", 1)[0] + "/iq_20260910_161629_0003.wav",
+            False,
+            100,
+            part1.modified,
+        )
+        window._fill(window._entries + [extra])
+        group = _group_item(window, "iq_20260910_161629")
+        assert group is not None
+        assert group.childCount() == 3
+        assert [group.child(i).text(1) for i in range(3)] == ["_0001.wav", "_0002.wav", "_0003.wav"]
+        assert group.isExpanded()
     finally:
         window.close()
         qapp.processEvents()
@@ -714,10 +770,7 @@ def test_sftp_up_opens_parent_folder(qapp):
 
     window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
     try:
-        deadline = time.time() + 3
-        while time.time() < deadline and window.table.rowCount() == 0:
-            qapp.processEvents()
-            time.sleep(0.05)
+        _wait_listing(window, qapp)
         today = today_remdata_directory()
         assert window.path_label.text().rstrip("/") == today.rstrip("/")
 
@@ -735,15 +788,11 @@ def test_sftp_up_opens_parent_folder(qapp):
         window._go_parent()
         parent = parent_directory(today)
         assert wait_path(parent)
-        names = [
-            window.table.item(row, 1).text()
-            for row in range(window.table.rowCount())
-            if window.table.item(row, 1)
-        ]
-        assert any(name.rstrip("/").isdigit() and len(name.rstrip("/")) == 8 for name in names)
+        names = [text.rstrip("/") for text in _top_texts(window)]
+        assert any(name.isdigit() and len(name) == 8 for name in names)
         today_name = today.rstrip("/").rsplit("/", 1)[-1]
-        assert names[0].rstrip("/") == today_name
-        folder_dates = [name.rstrip("/") for name in names if name.rstrip("/").isdigit() and len(name.rstrip("/")) == 8]
+        assert names[0] == today_name
+        folder_dates = [name for name in names if name.isdigit() and len(name) == 8]
         assert folder_dates == sorted(folder_dates, reverse=True)
         for expected in ("/mnt/1/", "/mnt/", "/"):
             window._go_parent()
@@ -791,28 +840,17 @@ def test_sftp_column_sort_persists_until_directory_change(qapp):
 
     window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
     try:
-        deadline = time.time() + 3
-        while time.time() < deadline and (window.table.rowCount() == 0 or window._busy):
-            qapp.processEvents()
-            time.sleep(0.05)
-        assert window.table.rowCount() > 0
+        _wait_listing(window, qapp, idle=True)
+        assert window.table.topLevelItemCount() > 0
         assert window._user_sort is False
         window._on_header_clicked(COL_NAME)
         qapp.processEvents()
-        names = [
-            window.table.item(row, 1).text().rstrip("/")
-            for row in range(window.table.rowCount())
-            if window.table.item(row, 1)
-        ]
+        names = [text.rstrip("/") for text in _top_texts(window)]
         assert names == sorted(names, key=str.casefold)
-        assert "▲" in window.table.horizontalHeaderItem(COL_NAME).text()
+        assert "▲" in _header_text(window, COL_NAME)
         window._on_header_clicked(COL_NAME)
         qapp.processEvents()
-        names_desc = [
-            window.table.item(row, 1).text().rstrip("/")
-            for row in range(window.table.rowCount())
-            if window.table.item(row, 1)
-        ]
+        names_desc = [text.rstrip("/") for text in _top_texts(window)]
         assert names_desc == sorted(names, key=str.casefold, reverse=True)
         window._on_header_clicked(COL_SIZE)
         qapp.processEvents()
@@ -832,7 +870,284 @@ def test_sftp_column_sort_persists_until_directory_change(qapp):
                 break
             time.sleep(0.05)
         assert window._user_sort is False
-        assert "▼" in window.table.horizontalHeaderItem(3).text()
+        assert "▼" in _header_text(window, 3)
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def _drive_capture(window, qapp) -> None:
+    qapp.processEvents()
+    window._record_timer.stop()
+    if window._recording_active:
+        window._on_recording_time_elapsed()
+    qapp.processEvents()
+    for _ in range(4):
+        window._poll_collection_files()
+    qapp.processEvents()
+
+
+def test_gui_suggests_iridium_and_logs_repeat_parts(qapp, tmp_path):
+    from crfs_iq_recorder.gui import MainWindow
+    from test_collection_excel import build_sample_workbook
+
+    path = build_sample_workbook(tmp_path / "collection.xlsm")
+    window = MainWindow(demo=True)
+    try:
+        window._settle_s = 0
+        window._stable_needed = 2
+        window._demo_parts = 3
+        window.excel_check.setChecked(True)
+        assert window._load_workbook(str(path), quiet=True)
+        window.mode_start.setChecked(True)
+        window.unit_combo.setCurrentText("MHz")
+        window.field_a.setText("1616")
+        window.field_b.setText("1626")
+        window._refresh_class_suggestion()
+        assert window.class_combo.currentText() == "Iridium"
+        assert window.sheet_combo.currentText() == "SATCOM"
+        window.time_edit.setText("0.05")
+        window.wait_spin.setValue(0)
+        window.repeat_n.setChecked(True)
+        window.repeat_spin.setValue(2)
+        window._on_start()
+        assert window._series_active
+        _drive_capture(window, qapp)
+        _drive_capture(window, qapp)
+        assert window._recordings_completed == 2
+        assert window._files_found == 6
+        assert window._series_active is False
+        from crfs_iq_recorder.recording_history import split_iq_filenames
+
+        wb = load_workbook(path)
+        iq_cells = [
+            cell
+            for cell in wb["SATCOM"]["I"]
+            if cell.row > 1 and any(name.lower().endswith(".wav") for name in split_iq_filenames(cell.value))
+        ]
+        assert len(iq_cells) == 2
+        all_names = [name for cell in iq_cells for name in split_iq_filenames(cell.value)]
+        assert len(all_names) == 6
+        assert len(set(all_names)) == 6
+        assert all(str(cell.value).count("\n") == 2 for cell in iq_cells)
+        logged_classes = [wb["SATCOM"][f"B{cell.row}"].value for cell in iq_cells]
+        assert set(logged_classes) == {"Iridium"}
+        starts = [wb["SATCOM"][f"C{cell.row}"].value for cell in iq_cells]
+        assert starts[-1] == "1616 MHz"
+        durations = [wb["SATCOM"][f"K{cell.row}"].value for cell in iq_cells]
+        assert all(value == "0.05 seconds" for value in durations)
+        assert all(wb["SATCOM"][f"M{cell.row}"].value in (None, "") for cell in iq_cells)
+        assert all(cell.alignment.wrap_text is True for cell in iq_cells)
+        wb.close()
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_gui_suggests_satcom_for_full_range(qapp, tmp_path):
+    from crfs_iq_recorder.gui import MainWindow
+    from test_collection_excel import build_sample_workbook
+
+    path = build_sample_workbook(tmp_path / "collection.xlsm")
+    window = MainWindow(demo=True)
+    try:
+        window.excel_check.setChecked(True)
+        assert window._load_workbook(str(path), quiet=True)
+        window.mode_start.setChecked(True)
+        window.unit_combo.setCurrentText("MHz")
+        window.field_a.setText("1616")
+        window.field_b.setText("1660.5")
+        window._refresh_class_suggestion()
+        assert window.class_combo.currentText() == "Satcom"
+        assert window.sheet_combo.currentText() == "SATCOM"
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_gui_stop_after_current_does_not_start_next(qapp, tmp_path):
+    from crfs_iq_recorder.gui import MainWindow
+    from test_collection_excel import build_sample_workbook
+
+    path = build_sample_workbook(tmp_path / "collection.xlsm")
+    window = MainWindow(demo=True)
+    try:
+        window._settle_s = 0
+        window._stable_needed = 2
+        window._demo_parts = 1
+        window.excel_check.setChecked(True)
+        window._load_workbook(str(path), quiet=True)
+        window.mode_start.setChecked(True)
+        window.field_a.setText("156")
+        window.field_b.setText("162")
+        window.time_edit.setText("0.05")
+        window.wait_spin.setValue(0)
+        window.repeat_until.setChecked(True)
+        window._on_start()
+        window._on_stop_after_current()
+        assert window._stop_after_current
+        _drive_capture(window, qapp)
+        qapp.processEvents()
+        assert window._recordings_completed == 1
+        assert window._series_active is False
+        assert window.start_btn.isEnabled()
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_gui_wait_minutes_and_stop_during_countdown(qapp, tmp_path):
+    from crfs_iq_recorder.gui import MainWindow
+    from test_collection_excel import build_sample_workbook
+
+    path = build_sample_workbook(tmp_path / "collection.xlsm")
+    window = MainWindow(demo=True)
+    try:
+        window._settle_s = 0
+        window._stable_needed = 2
+        window._demo_parts = 1
+        window.excel_check.setChecked(True)
+        window._load_workbook(str(path), quiet=True)
+        window.mode_start.setChecked(True)
+        window.field_a.setText("156")
+        window.field_b.setText("162")
+        window.time_edit.setText("0.05")
+        window.wait_unit.setCurrentText("Minutes")
+        window.wait_spin.setValue(2)
+        assert window._repeat_wait_s() == 120
+        window.wait_unit.setCurrentText("Seconds")
+        window.wait_spin.setValue(30)
+        assert window._repeat_wait_s() == 30
+        window.repeat_until.setChecked(True)
+        window._on_start()
+        _drive_capture(window, qapp)
+        assert window._recordings_completed == 1
+        assert window._waiting is True
+        assert window._series_active is True
+        assert "Next recording in" in (window.phase_label.text() + window.start_btn.text())
+        window._on_stop_after_current()
+        qapp.processEvents()
+        assert window._waiting is False
+        assert window._series_active is False
+        assert window._recordings_completed == 1
+    finally:
+        window._wait_timer.stop()
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_gui_remembers_wait_and_credentials(qapp):
+    from crfs_iq_recorder.gui import MainWindow
+
+    window = MainWindow(demo=True)
+    try:
+        window.wait_unit.setCurrentText("Minutes")
+        window.wait_spin.setValue(7)
+        window._conn.http_password = "custom-http"
+        window._conn.sftp_password = "custom-sftp"
+    finally:
+        window.close()
+        qapp.processEvents()
+    restored = MainWindow(demo=True)
+    try:
+        assert restored.wait_unit.currentText() == "Minutes"
+        assert restored._repeat_wait_s() == 420
+        assert restored._conn.http_password == "custom-http"
+        assert restored._conn.sftp_password == "custom-sftp"
+        assert restored.wait_spin.value() == 7
+    finally:
+        restored.close()
+        qapp.processEvents()
+
+
+def test_sftp_delete_removes_selected_files_only(qapp, monkeypatch):
+    import time
+
+    from crfs_iq_recorder.connection_state import ConnectionState
+    from crfs_iq_recorder.demo_sftp import shared_demo_browser
+    from crfs_iq_recorder.sftp_client import join_remote
+    from crfs_iq_recorder.sftp_paths import today_remdata_directory
+    from crfs_iq_recorder.sftp_window import SftpWindow
+
+    browser = shared_demo_browser()
+    today = today_remdata_directory()
+    target = join_remote(today, "iq-demo.wav")
+    other = join_remote(today, "iq-demo-2.wav")
+    keep = browser.publish_capture("iq_keep_local", parts=1)[0]
+    window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
+    logs: list[str] = []
+    window.activity.connect(logs.append)
+    monkeypatch.setattr(window.table, "hasFocus", lambda: True)
+    try:
+        _wait_listing(window, qapp, 3, timeout=4)
+        assert window.table.topLevelItemCount() >= 3
+        window.select_paths([target])
+        assert window._selected_file_paths() == [target]
+        window._delete_selected_remote()
+        deadline = time.time() + 4
+        while time.time() < deadline and target in browser._files:
+            qapp.processEvents()
+            time.sleep(0.05)
+        assert target not in browser._files
+        assert other in browser._files
+        assert keep.path in browser._files
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            qapp.processEvents()
+            names = [entry.name for entry in window._entries if not entry.is_dir]
+            if "iq-demo.wav" not in names and "iq-demo-2.wav" in names:
+                break
+            time.sleep(0.05)
+        names = [entry.name for entry in window._entries if not entry.is_dir]
+        assert "iq-demo.wav" not in names
+        assert "iq-demo-2.wav" in names
+        window.select_paths([other, keep.path])
+        assert set(window._selected_file_paths()) == {other, keep.path}
+        window._delete_selected_remote()
+        deadline = time.time() + 4
+        while time.time() < deadline and (other in browser._files or keep.path in browser._files):
+            qapp.processEvents()
+            time.sleep(0.05)
+        assert other not in browser._files
+        assert keep.path not in browser._files
+        assert any("Deleted" in item for item in logs)
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_sftp_delete_parent_removes_all_listed_parts(qapp, monkeypatch):
+    import time
+
+    from crfs_iq_recorder.connection_state import ConnectionState
+    from crfs_iq_recorder.demo_sftp import shared_demo_browser
+    from crfs_iq_recorder.sftp_window import SftpWindow
+
+    parts = shared_demo_browser().publish_capture("iq_group_delete", parts=2)
+    window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
+    monkeypatch.setattr(window.table, "hasFocus", lambda: True)
+    try:
+        _wait_listing(window, qapp, 1, timeout=4)
+        group = _group_item(window, "iq_group_delete")
+        assert group is not None
+        window.table.clearSelection()
+        group.setSelected(True)
+        window.table.setCurrentItem(group)
+        assert set(window._selected_file_paths()) == {parts[0].path, parts[1].path}
+        window._delete_selected_remote()
+        deadline = time.time() + 4
+        browser = shared_demo_browser()
+        while time.time() < deadline and any(part.path in browser._files for part in parts):
+            qapp.processEvents()
+            time.sleep(0.05)
+        assert parts[0].path not in browser._files
+        assert parts[1].path not in browser._files
     finally:
         window.close()
         qapp.processEvents()

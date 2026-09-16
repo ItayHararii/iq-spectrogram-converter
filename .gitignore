@@ -29,6 +29,12 @@ IQ Results.zip
 *.wav
 /file_*.png
 *.log
+*.xlsm
+*.xlsx
+*.crfs-backup-*
+.crfs_iq_recorder_excel_log.json
+.crfs_iq_recorder_settings.json
+.crfs_iq_recorder_recordings.json
 
 # Build outputs and shortcuts
 dist/
