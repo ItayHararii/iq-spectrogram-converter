@@ -42,7 +42,7 @@ HTTP and SFTP logins are remembered on this computer. In Sensor Files, select fi
 3. Start, end, center, bandwidth, and duration are shown when the app has them. The parent shows part count and combined size.
 4. Select the parent and click **Download this recording** for every listed part, or select individual children to download only those files. There is no save dialog. Delete is keyboard-only on the focused file list.
 
-Default local folder: `D:\CRFS IQ Recorder\Recordings` (or `%USERPROFILE%\CRFS IQ Recorder\Recordings` if drive D: is not available)
+Default local folder: `%USERPROFILE%\CRFS IQ Recorder\Recordings` on the local disk, not OneDrive. Change it in Settings.
 
 The main window shows **IQ Storage** for the sensor disk that holds `/mnt/1/remdata/`. It refreshes on connect, while connected, and after a recording or a remote delete. Under 10% free is a yellow warning; under 5% is red. A recording that would not fit, including a safety margin, is blocked. Existing files are never deleted to free space.
 

@@ -71,45 +71,20 @@ SETTINGS_NAME = ".iq_gui_settings.json"
 CONVERTER_FOLDER_NAME = "IQ Spectogram Converter"
 
 
-def data_drive_root() -> Path | None:
-    """D: when present; Collection and Results live there after the local-folder move."""
-    if sys.platform != "win32":
-        return None
-    root = Path("D:/")
-    try:
-        if root.exists():
-            return root
-    except OSError:
-        return None
-    return None
-
-
 def preferred_library_dir() -> Path:
-    root = data_drive_root()
-    if root is not None:
-        target = root / CONVERTER_FOLDER_NAME
-        try:
-            target.mkdir(parents=True, exist_ok=True)
-            return target
-        except OSError:
-            pass
     return APP_DIR
 
 
 def remap_legacy_library_path(raw: str) -> str:
-    """Point old C: Collection/Results/recordings defaults at the D: folders."""
+    """Point old C: Collection/Results defaults at folders next to this app."""
     text = (raw or "").strip()
     if not text:
-        return text
-    root = data_drive_root()
-    if root is None:
         return text
     normalized = text.replace("/", "\\")
     c_project = "C:\\" + CONVERTER_FOLDER_NAME
     if normalized.lower().startswith(c_project.lower()):
         suffix = normalized[len(c_project) :].lstrip("\\/")
-        base = root / CONVERTER_FOLDER_NAME
-        return str(base / suffix) if suffix else str(base)
+        return str(APP_DIR / suffix) if suffix else str(APP_DIR)
     low = normalized.casefold()
     marker = "\\crfs iq recorder\\recordings"
     if low.startswith("c:\\users\\") and marker in low:

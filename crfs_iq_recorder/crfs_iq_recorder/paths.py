@@ -93,31 +93,11 @@ def is_cloud_path(path: Path | str) -> bool:
     return any(marker in text for marker in _CLOUD_MARKERS)
 
 
-def preferred_data_root() -> Path | None:
-    """D: when that drive is present and writable. Recordings live there instead of C:."""
-    if sys.platform != "win32":
-        return None
-    root = Path("D:/")
-    try:
-        if not root.exists() or is_cloud_path(root):
-            return None
-        app_folder = root / DOWNLOAD_APP_FOLDER
-        app_folder.mkdir(parents=True, exist_ok=True)
-        if _dir_is_writable(app_folder):
-            return root
-    except OSError:
-        return None
-    return None
-
-
 def user_documents_dir() -> Path:
-    """Parent of CRFS IQ Recorder\\Recordings. Prefers D: on Windows.
+    """Parent of CRFS IQ Recorder\\Recordings.
 
     Cloud locations (OneDrive and similar) are never used.
     """
-    preferred = preferred_data_root()
-    if preferred is not None:
-        return preferred
     profile = _local_profile_dir()
     if _dir_is_writable(profile) and not is_cloud_path(profile):
         return profile
@@ -127,12 +107,9 @@ def user_documents_dir() -> Path:
 
 
 def remap_legacy_download_dir(stored: str | None) -> str:
-    """Move old C: default recordings folders onto D: when that drive is in use."""
+    """Point old default recordings folders at the current default download folder."""
     text = str(stored or "").strip()
     if not text:
-        return text
-    preferred = preferred_data_root()
-    if preferred is None:
         return text
     path = Path(text)
     parts = path.parts
@@ -151,7 +128,7 @@ def remap_legacy_download_dir(stored: str | None) -> str:
     under_profile = len(before) == 3 and before[1] == "users"
     if not (under_c_root or under_profile):
         return text
-    return str(preferred.joinpath(*parts[idx:]))
+    return str(default_download_dir())
 
 
 def brand_icon_path(*, prefer_png: bool = False) -> Path | None:

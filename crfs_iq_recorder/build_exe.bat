@@ -21,7 +21,7 @@ if errorlevel 1 goto :error
 
 echo.
 echo Done. Give colleagues dist\CRFS_IQ_Recorder.exe - Python is not required.
-echo Downloads default to D:\CRFS IQ Recorder\Recordings when D: is available (local disk, not OneDrive)
+echo Downloads default to %%USERPROFILE%%\CRFS IQ Recorder\Recordings on the local disk, not OneDrive. Change the folder in Settings.
 echo.
 if /I not "%CRFS_BUILD_NOPAUSE%"=="1" pause
 exit /b 0

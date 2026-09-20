@@ -1,7 +1,7 @@
 # QA report - CRFS IQ Recorder 1.8.0 and IQ Spectrogram Converter 1.3.0
 
 Date: 20 September 2026  
-Machine: Windows 10 (build 26200), Python 3.13, source trees on `C:\IQ Spectogram Converter` with local data on `D:`.
+Machine: Windows 10 (build 26200), Python 3.13.
 
 ## What was tested
 
@@ -10,7 +10,7 @@ Machine: Windows 10 (build 26200), Python 3.13, source trees on `C:\IQ Spectogra
 | CRFS IQ Recorder | **1.8.0** (this build) | Previous tagged release was 1.7.0. 1.8.0 capability-profile / compact-Excel work was reverted earlier and is **not** in this build. |
 | IQ Spectrogram Converter | **1.3.0** (this build) | Previous source version was 1.2.0. |
 
-Implemented now (keep): Excel collection logging, split-file grouping, wait between repeats, encrypted credentials, D: local folders, shared Sensorz icon, **IQ Storage**.
+Implemented now (keep): Excel collection logging, split-file grouping, wait between repeats, encrypted credentials, shared Sensorz icon, **IQ Storage**.
 
 Deliberately not present: hardware capability clamping, estimated-time strip, compact Excel window. Those are requirement choices, not bugs.
 
@@ -19,7 +19,7 @@ Deliberately not present: hardware capability clamping, estimated-time strip, co
 | Layer | Result |
 | --- | --- |
 | Automated tests (Recorder `.venv`) | Pass (storage, GUI smoke, frequency, Excel grouping, SFTP listing, downloads, preview) |
-| Automated tests (Converter `venv`) | Pass (numeric conversion, D: path remap, GUI smoke) |
+| Automated tests (Converter `venv`) | Pass (numeric conversion, local path remap, GUI smoke) |
 | Demo / simulation | Pass (no live EMP POST) |
 | Live sensor HTTP GET + identity | Pass (TCP reachable, wrong password = `authentication_error`, unreachable IP = timeout) |
 | Live SFTP storage query | Pass (`statvfs`/`df` on `/mnt/1/remdata/`, about 93% free, level ok) |
@@ -104,7 +104,7 @@ Safety margin: 15% of the empirical estimate, at least 32 MB, covering split par
 | Mono, empty, truncated header | same | Pass |
 | Hebrew + spaces in output path | same | Pass |
 | Existing PNG overwritten | same | Pass (current behaviour) |
-| D: Collection / Results defaults | `test_iq_local_paths.py`, settings on disk | Pass |
+| Converter Collection / Results defaults | `test_iq_local_paths.py`, settings on disk | Pass |
 | GUI theme smoke | `test_gui_smoke.py` | Pass |
 | Folder / drag-and-drop | code paths exist | **Not driven in this session** |
 | Cancel mid-convert / close while busy | - | **Not executed** |
@@ -119,12 +119,11 @@ Requested vs actual RBW: ENBW is wider than the requested bin target (Blackman-H
 
 1. **IQ Storage missing** (feature). Sensor free/total now on the main window; recording is blocked when it will not fit; warnings are logged, not popped repeatedly.
 2. **`format_bytes` stopped at GB**. File sizes can show TB.
-3. **Local folders still on C:** (from the D: move). Defaults and saved C: profile/project paths now prefer `D:\CRFS IQ Recorder\Recordings` and `D:\IQ Spectogram Converter\IQ Collection` / `IQ Results`.
+3. **Download and output folders.** Defaults are next to the app or under the user profile. The chosen folders are stored in local settings, not in Git.
 4. **Converter taskbar showed the Python icon.** Window icon is applied with the same Sensorz `.ico` as Recorder (`WM_SETICON`). Recorder header uses the Converter Sensorz mark.
 
 ### Remaining / not a bug
 
-- About 52 GB of older WAVE files remain in the C: profile Recordings folder. New downloads go to D:. Move those files if you want everything on D:.
 - Hardware band limits are not enforced (reverted on purpose).
 - Live capture and live remote Delete were not run in this QA pass.
 - Display scaling 125% / 150% was not checked.
@@ -137,7 +136,7 @@ Requested vs actual RBW: ENBW is wider than the requested bin target (Blackman-H
 | Medium | No on-screen free space | **Fixed** - IQ Storage |
 | Medium | Converter taskbar icon | **Fixed** |
 | Low | Byte formatter had no TB | **Fixed** |
-| Info | Old C: recordings not copied | Left in place |
+| Info | Download folder is chosen in Settings | Local only |
 
 ## Version backup
 

@@ -44,14 +44,11 @@ def test_default_download_dir_is_local_profile_recordings():
     assert not is_cloud_path(path)
 
 
-def test_legacy_c_profile_download_is_remapped(tmp_path, monkeypatch):
+def test_legacy_c_profile_download_is_remapped():
     from crfs_iq_recorder import paths
 
-    fake_d = tmp_path / "D"
-    fake_d.mkdir()
-    monkeypatch.setattr(paths, "preferred_data_root", lambda: fake_d)
+    expected = default_download_dir()
     legacy = r"C:\Users\example\CRFS IQ Recorder\Recordings"
-    expected = fake_d / DOWNLOAD_APP_FOLDER / DOWNLOAD_SUBFOLDER
     assert Path(paths.remap_legacy_download_dir(legacy)) == expected
     assert resolved_download_dir(legacy) == expected
     custom = r"C:\Collection\My IQ"
@@ -62,17 +59,13 @@ def test_legacy_c_profile_download_is_remapped(tmp_path, monkeypatch):
     assert paths.remap_legacy_download_dir(nested_temp) == nested_temp
 
 
-def test_from_settings_remaps_legacy_profile_download(tmp_path, monkeypatch):
-    from crfs_iq_recorder import paths
-
-    fake_d = tmp_path / "D"
-    fake_d.mkdir()
-    monkeypatch.setattr(paths, "preferred_data_root", lambda: fake_d)
+def test_from_settings_remaps_legacy_profile_download():
+    expected = default_download_dir()
     state = ConnectionState.from_settings(
         {"host": "192.0.2.10", "download_dir": r"C:\Users\example\CRFS IQ Recorder\Recordings"}
     )
-    assert Path(state.download_dir) == fake_d / DOWNLOAD_APP_FOLDER / DOWNLOAD_SUBFOLDER
-    assert Path(state.persistable()["download_dir"]) == fake_d / DOWNLOAD_APP_FOLDER / DOWNLOAD_SUBFOLDER
+    assert Path(state.download_dir) == expected
+    assert Path(state.persistable()["download_dir"]) == expected
 
 
 def test_cloud_download_dir_is_rejected():
@@ -82,6 +75,14 @@ def test_cloud_download_dir_is_rejected():
     state = ConnectionState.from_settings({"host": "192.0.2.10", "download_dir": cloud})
     assert state.download_dir == ""
     assert not is_cloud_path(state.persistable()["download_dir"])
+
+
+def test_custom_download_dir_is_kept():
+    from crfs_iq_recorder import paths
+
+    custom = r"E:\Field IQ\Recordings"
+    assert paths.remap_legacy_download_dir(custom) == custom
+    assert resolved_download_dir(custom) == Path(custom)
 
 
 def test_empty_stored_path_uses_default():

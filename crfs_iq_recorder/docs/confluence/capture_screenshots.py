@@ -26,7 +26,7 @@ from crfs_iq_recorder.sensor_info import SensorInfo
 from crfs_iq_recorder.sftp_window import SftpWindow
 
 EXAMPLE_HOST = "example"
-EXAMPLE_DOWNLOAD = r"D:\CRFS IQ Recorder\Recordings"
+EXAMPLE_DOWNLOAD = str(Path.home() / "CRFS IQ Recorder" / "Recordings")
 EXAMPLE_WORKBOOK = "Collection workbook.xlsm"
 
 
