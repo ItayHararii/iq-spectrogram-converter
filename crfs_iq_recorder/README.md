@@ -10,6 +10,8 @@ On a PC with Python, double-click `build_exe.bat`. Copy `dist\CRFS_IQ_Recorder.e
 
 The EXE is not stored in Git. Each version is tagged and the EXE is attached to the matching GitHub Release (keep older releases for rollback).
 
+On this PC the working copy is `D:\IQ Spectogram Converter`. Open, edit, run, and build from that folder.
+
 Downloads default to `D:\CRFS IQ Recorder\Recordings` when drive D: is available, otherwise `%USERPROFILE%\CRFS IQ Recorder\Recordings` on the local disk, not OneDrive. Change the folder in Settings. The choice is remembered.
 
 The main window shows IQ Storage for the sensor disk that holds `/mnt/1/remdata/` (today's dated folder does not need to exist yet). Under 10% free is a warning; under 5% is critical. Start Recording is blocked if the estimate plus a safety margin would not fit. Existing recordings are never deleted to free space.

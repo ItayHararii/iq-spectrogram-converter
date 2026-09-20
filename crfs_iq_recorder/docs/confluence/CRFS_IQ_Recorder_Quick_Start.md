@@ -4,10 +4,10 @@ CRFS IQ Recorder is a Windows app for CRFS sensors. It starts an IQ recording, d
 
 ## Download and run
 
-**Version:** 1.8.0
+**Version:** 1.8.1
 **File:** `CRFS_IQ_Recorder.exe` - one file, no Python, no install.
 
-> Windows EXE: [CRFS IQ Recorder 1.8.0](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.0)
+> Windows EXE: [CRFS IQ Recorder 1.8.1](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.1)
 
 1. Save the exe on this PC (Desktop or a local folder).
 2. Double-click **CRFS_IQ_Recorder.exe**. The first launch can be slower.

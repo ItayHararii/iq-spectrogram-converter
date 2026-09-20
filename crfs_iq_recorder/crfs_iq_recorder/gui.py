@@ -531,6 +531,8 @@ class MainWindow(QMainWindow):
     def _collection_section(self) -> QWidget:
         box = QFrame()
         box.setObjectName("inputWrap")
+        box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.excel_section = box
         layout = QVBoxLayout(box)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
@@ -539,6 +541,14 @@ class MainWindow(QMainWindow):
         self.excel_check.setChecked(bool(self._conn.excel_enabled))
         self.excel_check.toggled.connect(self._on_excel_toggled)
         layout.addWidget(self.excel_check)
+
+        details = QWidget()
+        details.setObjectName("excelDetails")
+        details.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.excel_details = details
+        detail_layout = QVBoxLayout(details)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(8)
 
         book_row = QHBoxLayout()
         book_row.setSpacing(8)
@@ -555,7 +565,7 @@ class MainWindow(QMainWindow):
         book_row.addWidget(book_label)
         book_row.addWidget(self.workbook_edit, 1)
         book_row.addWidget(browse)
-        layout.addLayout(book_row)
+        detail_layout.addLayout(book_row)
 
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
@@ -581,7 +591,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.class_combo, 1, 1)
         grid.addWidget(QLabel("Worksheet"), 2, 0)
         grid.addWidget(self.sheet_combo, 2, 1)
-        layout.addLayout(grid)
+        detail_layout.addLayout(grid)
 
         repeat_row = QHBoxLayout()
         repeat_row.setSpacing(12)
@@ -608,7 +618,7 @@ class MainWindow(QMainWindow):
         repeat_row.addWidget(self.repeat_spin)
         repeat_row.addWidget(self.repeat_until)
         repeat_row.addStretch(1)
-        layout.addLayout(repeat_row)
+        detail_layout.addLayout(repeat_row)
 
         wait_row = QHBoxLayout()
         wait_row.setSpacing(8)
@@ -629,12 +639,14 @@ class MainWindow(QMainWindow):
         wait_row.addWidget(self.wait_spin)
         wait_row.addWidget(self.wait_unit)
         wait_row.addStretch(1)
-        layout.addLayout(wait_row)
+        detail_layout.addLayout(wait_row)
 
         self.collection_status = QLabel("Recordings completed: 0  ·  Files found: 0  ·  Excel: Idle")
         self.collection_status.setObjectName("muted")
         self.collection_status.setWordWrap(True)
-        layout.addWidget(self.collection_status)
+        detail_layout.addWidget(self.collection_status)
+        layout.addWidget(details)
+        self._sync_excel_details()
         return box
 
     def _log_panel(self) -> QWidget:
@@ -802,8 +814,29 @@ class MainWindow(QMainWindow):
         excel = hasattr(self, "excel_check") and self.excel_check.isChecked()
         return excel or self._repeat_mode() != "off"
 
+    def _sync_excel_details(self) -> None:
+        if not hasattr(self, "excel_details"):
+            return
+        visible = bool(self.excel_check.isChecked())
+        self.excel_details.setVisible(visible)
+        section = getattr(self, "excel_section", None)
+        if section is None:
+            return
+        layout = section.layout()
+        if layout is not None:
+            layout.activate()
+        section.updateGeometry()
+        section.adjustSize()
+        card = section.parentWidget()
+        if card is not None:
+            if card.layout() is not None:
+                card.layout().activate()
+            card.updateGeometry()
+            card.adjustSize()
+
     def _on_excel_toggled(self, checked: bool) -> None:
-        if checked and self.workbook_edit.text().strip():
+        self._sync_excel_details()
+        if checked and self._catalog is None and self.workbook_edit.text().strip():
             self._load_workbook(self.workbook_edit.text().strip(), quiet=True)
         self._update_collection_status()
 

@@ -1,0 +1,17 @@
+---
+description: Work only from the D: copies of these projects
+alwaysApply: true
+---
+
+# Work on D:
+
+D: is the main working location for these projects. Do not open, edit, run, or build the old C: copies.
+
+- IQ Spectrogram Converter and CRFS IQ Recorder: `D:\IQ Spectogram Converter`
+- Recorder downloads: `D:\CRFS IQ Recorder\Recordings`
+- Converter WAVs: `D:\IQ Spectogram Converter\IQ Collection`
+- Converter PNGs: `D:\IQ Spectogram Converter\IQ Results`
+
+Use those paths in shortcuts, settings, default folders, and build scripts. GitHub remotes stay as they are; D: is a local working copy only.
+
+If a C: project folder reappears, copy any newer files onto D: and keep working on D:. Do not treat C: as the source of truth.

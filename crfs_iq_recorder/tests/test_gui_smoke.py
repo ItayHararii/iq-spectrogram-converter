@@ -1046,6 +1046,51 @@ def test_gui_wait_minutes_and_stop_during_countdown(qapp, tmp_path):
         qapp.processEvents()
 
 
+def test_excel_section_collapses_without_losing_values(qapp, tmp_path):
+    from PySide6.QtCore import QPoint
+
+    from crfs_iq_recorder.gui import MainWindow
+    from test_collection_excel import build_sample_workbook
+
+    path = build_sample_workbook(tmp_path / "collection.xlsm")
+    window = MainWindow(demo=True)
+    try:
+        window.show()
+        qapp.processEvents()
+        assert window.excel_check.isHidden() is False
+        assert window.excel_details.isHidden()
+        window.excel_check.setChecked(True)
+        assert window._load_workbook(str(path), quiet=True)
+        window.event_combo.setEditText("Haifa Port")
+        window.class_combo.setEditText("Iridium")
+        window.repeat_n.setChecked(True)
+        window.repeat_spin.setValue(7)
+        window.wait_spin.setValue(12)
+        window.wait_unit.setCurrentText("Seconds")
+        qapp.processEvents()
+        assert not window.excel_details.isHidden()
+        expanded = window.excel_section.height()
+        start_y = window.start_btn.mapTo(window, QPoint(0, 0)).y()
+        window.excel_check.setChecked(False)
+        qapp.processEvents()
+        assert window.excel_check.isHidden() is False
+        assert window.excel_details.isHidden()
+        assert window.excel_section.height() < expanded
+        assert window.start_btn.mapTo(window, QPoint(0, 0)).y() < start_y
+        window.excel_check.setChecked(True)
+        qapp.processEvents()
+        assert not window.excel_details.isHidden()
+        assert window.workbook_edit.text() == str(path)
+        assert window.event_combo.currentText() == "Haifa Port"
+        assert window.class_combo.currentText() == "Iridium"
+        assert window.repeat_n.isChecked()
+        assert window.repeat_spin.value() == 7
+        assert window.wait_spin.value() == 12
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
 def test_gui_remembers_wait_and_credentials(qapp):
     from crfs_iq_recorder.gui import MainWindow
 
