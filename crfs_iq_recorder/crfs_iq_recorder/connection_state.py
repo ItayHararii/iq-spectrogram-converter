@@ -23,11 +23,14 @@ from .constants import (
     FREQ_UNITS,
 )
 from .frequency import FrequencyError, FrequencyPlan, from_center_bandwidth, from_start_end
-from .paths import default_download_dir, is_cloud_path
+from .paths import default_download_dir, is_cloud_path, remap_legacy_download_dir
 
 
 def _persisted_download_dir(stored: str) -> str:
-    folder = (stored or "").strip() or str(default_download_dir())
+    folder = (stored or "").strip()
+    if folder and is_cloud_path(folder):
+        return str(default_download_dir())
+    folder = remap_legacy_download_dir(folder) or str(default_download_dir())
     if is_cloud_path(folder):
         return str(default_download_dir())
     return folder
@@ -177,6 +180,8 @@ class ConnectionState:
         stored = str(data.get("download_dir") or "").strip()
         if stored and is_cloud_path(stored):
             stored = ""
+        elif stored:
+            stored = remap_legacy_download_dir(stored)
         state.download_dir = stored
         unit = str(data.get("freq_unit") or DEFAULT_FREQ_UNIT)
         state.freq_unit = unit if unit in FREQ_UNITS else DEFAULT_FREQ_UNIT

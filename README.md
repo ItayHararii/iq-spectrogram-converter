@@ -33,7 +33,7 @@ You need Python 3 on PATH.
 
 `Run_IQ_GUI.bat` starts the app without checking packages.
 
-The launcher creates `IQ Collection` (WAVs) and `IQ Results` (PNGs). Folders, RBW, theme, and display options are saved in `.iq_gui_settings.json` next to the app. That file is not committed.
+The launcher uses `D:\IQ Spectogram Converter\IQ Collection` (WAVs) and `D:\IQ Spectogram Converter\IQ Results` (PNGs) when drive D: is available. Folders, RBW, theme, and display options are saved in `.iq_gui_settings.json` next to the app. That file is not committed.
 
 ### Command line
 

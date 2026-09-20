@@ -53,8 +53,13 @@ if errorlevel 1 (
     "venv\Scripts\python.exe" -m pip install tkinterdnd2 >nul 2>&1
 )
 
-if not exist "IQ Results" mkdir "IQ Results"
-if not exist "IQ Collection" mkdir "IQ Collection"
+if exist "D:\IQ Spectogram Converter\" (
+    if not exist "D:\IQ Spectogram Converter\IQ Results" mkdir "D:\IQ Spectogram Converter\IQ Results"
+    if not exist "D:\IQ Spectogram Converter\IQ Collection" mkdir "D:\IQ Spectogram Converter\IQ Collection"
+) else (
+    if not exist "IQ Results" mkdir "IQ Results"
+    if not exist "IQ Collection" mkdir "IQ Collection"
+)
 
 if not exist "assets\sensorz_icon.ico" (
     echo WARNING: assets\sensorz_icon.ico missing — taskbar may show the Python icon.

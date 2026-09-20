@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -23,7 +24,7 @@ from PySide6.QtWidgets import (
 
 from .connection_state import ConnectionState
 from .constants import DEFAULT_SFTP_PORT, DEFAULT_SFTP_USERNAME
-from .paths import default_download_dir
+from .paths import brand_icon_path, default_download_dir
 from .theme import apply_combo_popup_palette, fit_window_to_screen
 
 __all__ = ["ConnectionDialog", "apply_combo_popup_palette"]
@@ -35,6 +36,9 @@ class ConnectionDialog(QDialog):
     def __init__(self, state: ConnectionState, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
+        icon = brand_icon_path()
+        if icon is not None:
+            self.setWindowIcon(QIcon(str(icon)))
         self.setSizeGripEnabled(True)
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
         self._state = state

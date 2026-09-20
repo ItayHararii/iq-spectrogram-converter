@@ -93,11 +93,31 @@ def is_cloud_path(path: Path | str) -> bool:
     return any(marker in text for marker in _CLOUD_MARKERS)
 
 
+def preferred_data_root() -> Path | None:
+    """D: when that drive is present and writable. Recordings live there instead of C:."""
+    if sys.platform != "win32":
+        return None
+    root = Path("D:/")
+    try:
+        if not root.exists() or is_cloud_path(root):
+            return None
+        app_folder = root / DOWNLOAD_APP_FOLDER
+        app_folder.mkdir(parents=True, exist_ok=True)
+        if _dir_is_writable(app_folder):
+            return root
+    except OSError:
+        return None
+    return None
+
+
 def user_documents_dir() -> Path:
-    """Local user folder used as the parent of CRFS IQ Recorder\\Recordings.
+    """Parent of CRFS IQ Recorder\\Recordings. Prefers D: on Windows.
 
     Cloud locations (OneDrive and similar) are never used.
     """
+    preferred = preferred_data_root()
+    if preferred is not None:
+        return preferred
     profile = _local_profile_dir()
     if _dir_is_writable(profile) and not is_cloud_path(profile):
         return profile
@@ -106,12 +126,60 @@ def user_documents_dir() -> Path:
     return fallback
 
 
+def remap_legacy_download_dir(stored: str | None) -> str:
+    """Move old C: default recordings folders onto D: when that drive is in use."""
+    text = str(stored or "").strip()
+    if not text:
+        return text
+    preferred = preferred_data_root()
+    if preferred is None:
+        return text
+    path = Path(text)
+    parts = path.parts
+    if len(parts) < 2:
+        return text
+    drive = parts[0]
+    if not (len(drive) >= 2 and drive[1] == ":" and drive[0].upper() == "C"):
+        return text
+    names = [part.casefold() for part in parts]
+    app = DOWNLOAD_APP_FOLDER.casefold()
+    if app not in names:
+        return text
+    idx = names.index(app)
+    before = names[:idx]
+    under_c_root = len(before) == 1
+    under_profile = len(before) == 3 and before[1] == "users"
+    if not (under_c_root or under_profile):
+        return text
+    return str(preferred.joinpath(*parts[idx:]))
+
+
+def brand_icon_path(*, prefer_png: bool = False) -> Path | None:
+    """Shared Sensorz mark used by Converter and Recorder (window, taskbar, header)."""
+    names = ("sensorz_icon.png", "sensorz_icon.ico") if prefer_png else ("sensorz_icon.ico", "sensorz_icon.png")
+    here = Path(__file__).resolve()
+    roots = (
+        resource_dir() / "assets",
+        here.parents[1] / "assets",
+        here.parents[2] / "assets",
+    )
+    for root in roots:
+        for name in names:
+            path = root / name
+            if path.is_file():
+                return path
+    return None
+
+
 def default_download_dir() -> Path:
     return user_documents_dir() / DOWNLOAD_APP_FOLDER / DOWNLOAD_SUBFOLDER
 
 
 def resolved_download_dir(stored: str | None = None) -> Path:
     text = str(stored or "").strip()
+    if text and is_cloud_path(text):
+        return default_download_dir()
+    text = remap_legacy_download_dir(text)
     if not text:
         return default_download_dir()
     path = Path(text).expanduser()

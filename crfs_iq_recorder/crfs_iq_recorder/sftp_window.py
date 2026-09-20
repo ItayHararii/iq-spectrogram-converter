@@ -19,7 +19,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -53,7 +53,7 @@ from .listing_sort import (
     header_label,
     sort_listing_nodes,
 )
-from .paths import ensure_download_dir, resolved_download_dir
+from .paths import brand_icon_path, ensure_download_dir, resolved_download_dir
 from .recording_history import (
     format_columns,
     group_part_counts,
@@ -385,6 +385,7 @@ class PreviewWorker(QObject):
 
 class SftpWindow(QWidget):
     activity = Signal(str)
+    remote_changed = Signal()
     _cmd_open = Signal()
     _cmd_try_today = Signal()
     _cmd_list = Signal(str)
@@ -396,6 +397,9 @@ class SftpWindow(QWidget):
         self.setObjectName("sftpRoot")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setWindowTitle("Sensor files (SFTP)")
+        icon = brand_icon_path()
+        if icon is not None:
+            self.setWindowIcon(QIcon(str(icon)))
         self.setWindowFlag(Qt.WindowType.Window, True)
         flags = self.windowFlags()
         self.setWindowFlags(
@@ -889,6 +893,8 @@ class SftpWindow(QWidget):
             self.status.setText(f"Deleted {len(deleted)}; {len(failed)} failed.")
         elif failed:
             self.status.setText(f"Could not delete {len(failed)} file(s).")
+        if deleted:
+            self.remote_changed.emit()
         self._set_busy(False)
         self.refresh()
 

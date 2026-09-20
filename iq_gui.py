@@ -49,7 +49,7 @@ except Exception:
     _HAS_DND = False
 
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 APP_NAME = "SENSORZ IQ Spectrogram Converter"
 
 
@@ -67,9 +67,58 @@ def resource_dir() -> Path:
 
 
 APP_DIR = app_dir()
-DEFAULT_OUTPUT = APP_DIR / "IQ Results"
-DEFAULT_INPUT_DIR = APP_DIR / "IQ Collection"
 SETTINGS_NAME = ".iq_gui_settings.json"
+CONVERTER_FOLDER_NAME = "IQ Spectogram Converter"
+
+
+def data_drive_root() -> Path | None:
+    """D: when present; Collection and Results live there after the local-folder move."""
+    if sys.platform != "win32":
+        return None
+    root = Path("D:/")
+    try:
+        if root.exists():
+            return root
+    except OSError:
+        return None
+    return None
+
+
+def preferred_library_dir() -> Path:
+    root = data_drive_root()
+    if root is not None:
+        target = root / CONVERTER_FOLDER_NAME
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            return target
+        except OSError:
+            pass
+    return APP_DIR
+
+
+def remap_legacy_library_path(raw: str) -> str:
+    """Point old C: Collection/Results/recordings defaults at the D: folders."""
+    text = (raw or "").strip()
+    if not text:
+        return text
+    root = data_drive_root()
+    if root is None:
+        return text
+    normalized = text.replace("/", "\\")
+    c_project = "C:\\" + CONVERTER_FOLDER_NAME
+    if normalized.lower().startswith(c_project.lower()):
+        suffix = normalized[len(c_project) :].lstrip("\\/")
+        base = root / CONVERTER_FOLDER_NAME
+        return str(base / suffix) if suffix else str(base)
+    low = normalized.casefold()
+    marker = "\\crfs iq recorder\\recordings"
+    if low.startswith("c:\\users\\") and marker in low:
+        return str(preferred_library_dir() / "IQ Collection")
+    return text
+
+
+DEFAULT_OUTPUT = preferred_library_dir() / "IQ Results"
+DEFAULT_INPUT_DIR = preferred_library_dir() / "IQ Collection"
 
 
 def _brand_icon_path(name: str) -> Path:
@@ -209,6 +258,7 @@ class IQConverterGUI(_TkBase):
 
         self._logo_photo = None
         self._window_icon_photo = None
+        self._win_hicon = None
         self._preview_photo = None
         self._last_png_path = None
         self._converting = False
@@ -239,6 +289,7 @@ class IQConverterGUI(_TkBase):
         self._set_window_icon()
         # Re-apply after the window is mapped — Windows often locks taskbar icon then.
         self.after_idle(self._set_window_icon)
+        self.bind("<Map>", self._on_window_mapped)
         self._configure_styles()
         self._build_ui()
         self.apply_theme(current_mode())
@@ -378,8 +429,61 @@ class IQConverterGUI(_TkBase):
         self._cards.append(card)
         return card
 
+    def _on_window_mapped(self, event):
+        if event.widget is self:
+            self._set_window_icon()
+
+    def _apply_windows_hwnd_icon(self):
+        """Same ICO as CRFS IQ Recorder: set the Win32 window icon, not pythonw.exe."""
+        if sys.platform != "win32" or not ICON_ICO_PATH.is_file():
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            hwnd = int(self.winfo_id())
+            if not hwnd:
+                return
+            user32 = ctypes.windll.user32
+            GA_ROOT = 2
+            WM_SETICON = 0x0080
+            ICON_SMALL = 0
+            ICON_BIG = 1
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x0010
+            LR_DEFAULTSIZE = 0x0040
+            root = user32.GetAncestor(wintypes.HWND(hwnd), GA_ROOT) or user32.GetParent(
+                wintypes.HWND(hwnd)
+            )
+            if not root:
+                root = hwnd
+            user32.LoadImageW.argtypes = [
+                wintypes.HINSTANCE,
+                wintypes.LPCWSTR,
+                wintypes.UINT,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            ]
+            user32.LoadImageW.restype = wintypes.HANDLE
+            hicon = user32.LoadImageW(
+                None,
+                str(ICON_ICO_PATH.resolve()),
+                IMAGE_ICON,
+                0,
+                0,
+                LR_LOADFROMFILE | LR_DEFAULTSIZE,
+            )
+            if not hicon:
+                return
+            self._win_hicon = hicon
+            user32.SendMessageW(wintypes.HWND(root), WM_SETICON, ICON_SMALL, hicon)
+            user32.SendMessageW(wintypes.HWND(root), WM_SETICON, ICON_BIG, hicon)
+        except Exception:
+            pass
+
     def _set_window_icon(self):
-        """Set taskbar/window icon (Windows prefers .ico via iconbitmap)."""
+        """Set taskbar/window icon (Windows prefers .ico via iconbitmap + WM_SETICON)."""
         if not self._alive():
             return
         try:
@@ -406,6 +510,7 @@ class IQConverterGUI(_TkBase):
                 self.iconphoto(True, self._window_icon_photo)
         except Exception:
             pass
+        self._apply_windows_hwnd_icon()
 
     def _load_logo(self, max_height=32):
         """Load Sensorz icon mark for the header (top-left brand)."""
@@ -441,7 +546,7 @@ class IQConverterGUI(_TkBase):
             return
         out = data.get("output_dir")
         if isinstance(out, str) and out.strip():
-            self.output_var.set(out.strip())
+            self.output_var.set(remap_legacy_library_path(out.strip()))
         rbw = data.get("rbw")
         if rbw is not None:
             try:
@@ -450,8 +555,12 @@ class IQConverterGUI(_TkBase):
             except (TypeError, ValueError):
                 pass
         indir = data.get("input_dir")
-        if isinstance(indir, str) and Path(indir).is_dir():
-            self._last_input_dir = indir
+        if isinstance(indir, str) and indir.strip():
+            mapped = remap_legacy_library_path(indir.strip())
+            if Path(mapped).is_dir():
+                self._last_input_dir = mapped
+            elif DEFAULT_INPUT_DIR.is_dir():
+                self._last_input_dir = str(DEFAULT_INPUT_DIR)
         open_done = data.get("open_when_done")
         if isinstance(open_done, bool):
             self.open_when_done_var.set(open_done)
@@ -477,6 +586,13 @@ class IQConverterGUI(_TkBase):
         theme = data.get("ui_theme")
         if isinstance(theme, str):
             self._ui_theme = normalize_theme(theme)
+        remapped = False
+        if isinstance(out, str) and out.strip() and self.output_var.get().strip() != out.strip():
+            remapped = True
+        if isinstance(indir, str) and indir.strip() and self._last_input_dir != indir.strip():
+            remapped = True
+        if remapped:
+            self._save_settings()
 
     def _save_settings(self):
         payload = {
@@ -1488,6 +1604,7 @@ if __name__ == "__main__":
     enable_dpi_awareness()
     try:
         DEFAULT_OUTPUT.mkdir(parents=True, exist_ok=True)
+        DEFAULT_INPUT_DIR.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
     app = IQConverterGUI()

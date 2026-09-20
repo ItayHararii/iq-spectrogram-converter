@@ -11,6 +11,7 @@ from typing import Callable
 
 from .download_util import DownloadError, cleanup_part, finalize_download, part_path
 from .iq_wav import stereo_iq_tone_wav_bytes
+from .sensor_storage import DEMO_FREE_BYTES, DEMO_TOTAL_BYTES, StorageSnapshot
 from .sftp_paths import join_remote, today_remdata_directory
 
 
@@ -69,6 +70,12 @@ class SftpBrowser:
 
     def remove_file(self, remote_path: str) -> None:
         raise NotImplementedError
+
+    def storage_usage(self, path: str):
+        """Free/total bytes for the filesystem that contains `path`."""
+        from .sensor_storage import StorageSnapshot
+
+        return StorageSnapshot.unavailable("Storage query is not implemented.")
 
 
 def _raise_if_cancelled(cancel: threading.Event | None) -> None:
@@ -177,6 +184,29 @@ class ParamikoSftpBrowser(SftpBrowser):
         except Exception as exc:
             raise SftpError(f"Could not delete {remote_path}: {exc}") from exc
 
+    def storage_usage(self, path: str):
+        from .sensor_storage import snapshot_from_df_text, snapshot_from_statvfs
+
+        try:
+            attr = self._sftp.statvfs(path)
+            snap = snapshot_from_statvfs(path, attr)
+            if snap is not None:
+                return snap
+        except Exception:
+            pass
+        try:
+            import shlex
+
+            quoted = shlex.quote(path or "/")
+            _stdin, stdout, _stderr = self._client.exec_command(f"df -kP {quoted}", timeout=12)
+            text = stdout.read().decode("utf-8", errors="replace")
+            snap = snapshot_from_df_text(text, path)
+            if snap is not None:
+                return snap
+        except Exception as exc:
+            raise SftpError(f"Could not read storage for {path}: {exc}") from exc
+        raise SftpError(f"Could not read storage for {path}.")
+
 
 def connect_sftp(
     host: str,
@@ -266,6 +296,9 @@ class DemoSftpBrowser(SftpBrowser):
         now = datetime.now()
         wav = stereo_iq_tone_wav_bytes()
         self._files: dict[str, bytes] = {}
+        self._storage_total = DEMO_TOTAL_BYTES
+        self._storage_free = DEMO_FREE_BYTES
+        self._storage_fail = False
         self._dirs: dict[str, list[RemoteEntry]] = {
             "/": [RemoteEntry("mnt", "/mnt", True, 0, now)],
             "/mnt/": [RemoteEntry("1", "/mnt/1", True, 0, now)],
@@ -336,7 +369,10 @@ class DemoSftpBrowser(SftpBrowser):
         if size is not None and size != len(data):
             data = (data + b"\x00" * max(0, size - len(data)))[:size] if size else data
             data = data[:nbytes] if nbytes <= len(data) else data + bytes(nbytes - len(data))
+        previous = len(self._files.get(path, b""))
         self._files[path] = data[:nbytes] if nbytes <= len(data) else data + bytes(nbytes - len(data))
+        delta = nbytes - previous
+        self._storage_free = max(0, min(self._storage_total, self._storage_free - delta))
         entry = RemoteEntry(name, path, False, nbytes, modified or datetime.now())
         current = [item for item in self._dirs[folder] if item.path != path]
         current.append(entry)
@@ -346,7 +382,9 @@ class DemoSftpBrowser(SftpBrowser):
     def set_file_size(self, remote_path: str, size: int, *, modified: datetime | None = None) -> None:
         payload = self._files.get(remote_path, stereo_iq_tone_wav_bytes())
         nbytes = max(0, int(size))
+        previous = len(self._files.get(remote_path, b""))
         self._files[remote_path] = payload[:nbytes] if nbytes <= len(payload) else payload + bytes(nbytes - len(payload))
+        self._storage_free = max(0, min(self._storage_total, self._storage_free - (nbytes - previous)))
         when = modified or datetime.now()
         for folder, entries in list(self._dirs.items()):
             updated: list[RemoteEntry] = []
@@ -431,10 +469,30 @@ class DemoSftpBrowser(SftpBrowser):
             cleanup_part(tmp)
             raise SftpError(str(exc)) from exc
 
+    def set_storage(self, *, total: int | None = None, free: int | None = None, fail: bool | None = None) -> None:
+        if total is not None:
+            self._storage_total = max(int(total), 0)
+        if free is not None:
+            self._storage_free = max(0, min(int(free), self._storage_total))
+        if fail is not None:
+            self._storage_fail = bool(fail)
+
+    def storage_usage(self, path: str) -> StorageSnapshot:
+        if self._storage_fail:
+            raise SftpError("Could not read storage.")
+        return StorageSnapshot(
+            path=path,
+            total_bytes=int(self._storage_total),
+            free_bytes=min(int(self._storage_free), int(self._storage_total)),
+            ok=True,
+        )
+
     def remove_file(self, remote_path: str) -> None:
         path = (remote_path or "").replace("\\", "/")
         if path not in self._files:
             raise SftpError(f"File not found: {path}")
+        size = len(self._files[path])
         del self._files[path]
+        self._storage_free = min(self._storage_total, self._storage_free + size)
         for folder, entries in list(self._dirs.items()):
             self._dirs[folder] = [item for item in entries if item.path != path]

@@ -17,6 +17,8 @@ if str(ROOT) not in sys.path:
 
 from PySide6.QtWidgets import QApplication
 
+from openpyxl import Workbook
+
 from crfs_iq_recorder.connection_state import ConnectionState
 from crfs_iq_recorder.gui import MainWindow, configure_appearance
 from crfs_iq_recorder.recording_history import add_recording, new_recording
@@ -24,7 +26,8 @@ from crfs_iq_recorder.sensor_info import SensorInfo
 from crfs_iq_recorder.sftp_window import SftpWindow
 
 EXAMPLE_HOST = "example"
-EXAMPLE_DOWNLOAD = r"C:\CRFS IQ Recorder\Recordings"
+EXAMPLE_DOWNLOAD = r"D:\CRFS IQ Recorder\Recordings"
+EXAMPLE_WORKBOOK = "Collection workbook.xlsm"
 
 
 def _wait(app: QApplication, pred, timeout: float = 8.0) -> bool:
@@ -43,6 +46,36 @@ def _save(widget, path: Path) -> None:
     if not pix.save(str(path), "PNG"):
         raise SystemExit(f"Could not save {path}")
     print(f"Wrote {path} ({path.stat().st_size} bytes)")
+
+
+def _sample_workbook(path: Path) -> Path:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "SATCOM"
+    headers = [
+        "Collection Event",
+        "Class",
+        "Freq Start",
+        "Freq Stop",
+        "RBW",
+        "Scan Rate",
+        "Sensor",
+        "Snapshot ID",
+        "IQ Recording",
+        "IQ Image",
+        "Playback Start",
+        "Playback End",
+        "Playback Time (UTC-3)",
+    ]
+    for col, header in enumerate(headers, start=1):
+        ws.cell(1, col, header)
+    ws.cell(2, 1, "Haifa Port")
+    ws.cell(2, 2, "Iridium")
+    ws.cell(2, 3, "1616 MHz")
+    ws.cell(2, 4, "1626 MHz")
+    ws.cell(2, 7, "CRFS 100-18")
+    wb.save(path)
+    return path
 
 
 def main() -> int:
@@ -86,12 +119,20 @@ def main() -> int:
             connected=True,
         )
     )
-    window.mode_center.setChecked(True)
-    window.field_a.setText("800")
-    window.field_b.setText("12.5")
-    window.time_edit.setText("0.1")
+    window._refresh_storage()
+    window.mode_start.setChecked(True)
+    window.field_a.setText("1616")
+    window.field_b.setText("1626")
+    window.time_edit.setText("2")
+    window.excel_check.setChecked(True)
+    book = tmp / EXAMPLE_WORKBOOK
+    _sample_workbook(book)
+    window._load_workbook(str(book), quiet=True)
+    window.workbook_edit.setText(r"C:\Collection\Collection workbook.xlsm")
+    window._refresh_class_suggestion()
     window._refresh_size()
-    window.resize(1100, 720)
+    window._update_collection_status()
+    window.resize(1100, 1180)
     window.show()
     window.raise_()
     window.activateWindow()
@@ -124,6 +165,7 @@ def main() -> int:
     )
     if group is not None:
         sftp.table.clearSelection()
+        group.setExpanded(True)
         group.setSelected(True)
         sftp.table.setCurrentItem(group)
         sftp._on_selection_changed()

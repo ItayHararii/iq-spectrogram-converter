@@ -103,6 +103,10 @@ def test_gui_default_payload(qapp):
         assert window.wait_spin.value() == 5
         assert window.wait_unit.currentText() == "Seconds"
         assert window._repeat_wait_s() == 5
+        from PySide6.QtWidgets import QLabel
+
+        logos = window.findChildren(QLabel, "headerLogo")
+        assert logos and not logos[0].pixmap().isNull()
     finally:
         window.close()
 

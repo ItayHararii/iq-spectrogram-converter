@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QSize, QThread, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QGuiApplication, QIcon, QTextCursor
+from PySide6.QtGui import QGuiApplication, QIcon, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -71,7 +71,14 @@ from .frequency import (
     from_start_end,
     parse_to_integer_hz,
 )
-from .paths import ensure_download_dir, load_settings, save_settings, user_config_dir, resolved_download_dir
+from .paths import (
+    brand_icon_path,
+    ensure_download_dir,
+    load_settings,
+    resolved_download_dir,
+    save_settings,
+    user_config_dir,
+)
 from .recording_history import (
     add_recording,
     iq_group_key,
@@ -97,6 +104,19 @@ from .request_builder import RequestBuildError, build_payload_for_recording_time
 from .sanitizer import redact_text
 from .sensor_info import SensorInfo, blank_info, checking_info
 from .sensor_label import workbook_sensor_name
+from .sensor_storage import (
+    LEVEL_CRITICAL,
+    LEVEL_UNAVAILABLE,
+    LEVEL_WARN,
+    STORAGE_POLL_MS,
+    StorageSnapshot,
+    estimated_recording_bytes,
+    query_iq_storage,
+    recording_blocked_reason,
+    storage_line,
+    storage_note,
+    warning_level,
+)
 from .size_estimate import SizeEstimateError, empirical_size_mb, format_estimate
 from .sftp_window import SftpWindow, _open_browser
 from .theme import (
@@ -147,21 +167,8 @@ def set_app_user_model_id(app_id: str = APP_ID) -> None:
         pass
 
 
-def _icon_path() -> Path | None:
-    from .paths import resource_dir
-
-    names = ("sensorz_icon.ico", "sensorz_icon.png")
-    roots = (
-        resource_dir() / "assets",
-        Path(__file__).resolve().parents[1] / "assets",
-        Path(__file__).resolve().parents[2] / "assets",
-    )
-    for root in roots:
-        for name in names:
-            path = root / name
-            if path.is_file():
-                return path
-    return None
+def _icon_path(*, prefer_png: bool = False) -> Path | None:
+    return brand_icon_path(prefer_png=prefer_png)
 
 
 class MainWindow(QMainWindow):
@@ -221,6 +228,12 @@ class MainWindow(QMainWindow):
         self._wait_timer = QTimer(self)
         self._wait_timer.setInterval(200)
         self._wait_timer.timeout.connect(self._tick_wait)
+        self._storage = StorageSnapshot.unavailable()
+        self._storage_token = 0
+        self._storage_level = ""
+        self._storage_timer = QTimer(self)
+        self._storage_timer.setInterval(STORAGE_POLL_MS)
+        self._storage_timer.timeout.connect(self._refresh_storage)
         self._conn = ConnectionState.from_settings(load_settings(), demo=demo)
         self._plan = self._conn.frequency_plan()
 
@@ -266,6 +279,7 @@ class MainWindow(QMainWindow):
             polish_combo(self.format_combo)
         self.log("Ready.")
         self._refresh_sensor_info()
+        self._refresh_storage()
         self._sync_theme_button()
         self.statusBar().setSizeGripEnabled(True)
         fit_window_to_screen(self, 1100, 720, min_width=640, min_height=420)
@@ -276,6 +290,21 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(20, 10, 16, 10)
         layout.setSpacing(12)
+        mark = _icon_path(prefer_png=True)
+        if mark is not None:
+            pix = QPixmap(str(mark))
+            if not pix.isNull():
+                logo = QLabel()
+                logo.setObjectName("headerLogo")
+                logo.setPixmap(
+                    pix.scaled(
+                        32,
+                        32,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+                layout.addWidget(logo)
         title = QLabel(APP_NAME)
         title.setObjectName("headerTitle")
         layout.addWidget(title)
@@ -304,10 +333,10 @@ class MainWindow(QMainWindow):
         return bar
 
     def _sensor_strip(self) -> QWidget:
-        wrap = QWidget()
-        outer = QHBoxLayout(wrap)
-        outer.setContentsMargins(16, 12, 16, 0)
-        outer.setSpacing(0)
+        host = QWidget()
+        column = QVBoxLayout(host)
+        column.setContentsMargins(16, 12, 16, 0)
+        column.setSpacing(4)
         card = QFrame()
         card.setObjectName("sensorStrip")
         layout = QHBoxLayout(card)
@@ -319,12 +348,18 @@ class MainWindow(QMainWindow):
         self.model_value = self._sensor_fact(facts, "Model")
         self.firmware_value = self._sensor_fact(facts, "Firmware")
         self.serial_value = self._sensor_fact(facts, "Serial")
+        self.storage_value = self._sensor_fact(facts, "IQ Storage")
         layout.addLayout(facts, 1)
         self.status_value = QLabel("No sensor IP")
         self.status_value.setObjectName("badgeIdle")
         layout.addWidget(self.status_value, 0, Qt.AlignmentFlag.AlignVCenter)
-        outer.addWidget(card)
-        return wrap
+        column.addWidget(card)
+        self.storage_note = QLabel("")
+        self.storage_note.setObjectName("storageNoteMuted")
+        self.storage_note.setWordWrap(True)
+        self.storage_note.setVisible(False)
+        column.addWidget(self.storage_note)
+        return host
 
     def _sensor_fact(self, row: QHBoxLayout, label: str) -> QLabel:
         box = QVBoxLayout()
@@ -949,6 +984,104 @@ class MainWindow(QMainWindow):
             self._set_status_style("idle")
         else:
             self._set_status_style("bad")
+        if info.connected or lowered in {"connected", "online", "demo"}:
+            self._refresh_storage()
+
+    def _refresh_storage(self) -> None:
+        if not self._alive:
+            return
+        if not self._conn.host.strip() and not self._conn.demo:
+            self._storage_timer.stop()
+            self._apply_storage(StorageSnapshot.unavailable())
+            return
+        self._storage_timer.start()
+        if self._conn.demo:
+            try:
+                snap = query_iq_storage(shared_demo_browser())
+            except Exception as exc:
+                snap = StorageSnapshot.unavailable(str(exc))
+            if not snap.ok:
+                snap = self._failed_storage(snap.detail)
+            self._apply_storage(snap)
+            return
+        from .sftp_window import _open_browser
+
+        self._storage_token += 1
+        token = self._storage_token
+        state = self._conn
+
+        def work() -> tuple[int, StorageSnapshot]:
+            browser = None
+            try:
+                browser = _open_browser(state)
+                return token, query_iq_storage(browser)
+            except Exception as exc:
+                return token, StorageSnapshot.unavailable(str(exc))
+            finally:
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+
+        self._start_job(work, self._show_storage_result)
+
+    def _failed_storage(self, detail: str = "") -> StorageSnapshot:
+        if self._storage.ok and self._storage.total_bytes > 0:
+            return self._storage.as_stale(detail)
+        return StorageSnapshot.unavailable(detail)
+
+    def _show_storage_result(self, result: Any) -> None:
+        if not self._alive:
+            return
+        snap: StorageSnapshot
+        if isinstance(result, tuple) and len(result) == 2:
+            token, snap = result
+            if token != self._storage_token:
+                return
+        elif isinstance(result, StorageSnapshot):
+            snap = result
+        else:
+            snap = StorageSnapshot.unavailable(str(result))
+        if not snap.ok:
+            snap = self._failed_storage(snap.detail)
+        self._apply_storage(snap)
+
+    def _apply_storage(self, snap: StorageSnapshot) -> None:
+        self._storage = snap
+        if not hasattr(self, "storage_value"):
+            return
+        self.storage_value.setText(storage_line(snap))
+        level = warning_level(snap)
+        if snap.stale:
+            name = "muted"
+        elif level == LEVEL_CRITICAL:
+            name = "storageValueCritical"
+        elif level == LEVEL_WARN:
+            name = "storageValueWarn"
+        else:
+            name = "sensorFactValue"
+        self.storage_value.setObjectName(name)
+        restyle(self.storage_value)
+        note = storage_note(snap)
+        self.storage_note.setText(note)
+        self.storage_note.setVisible(bool(note))
+        if note and level == LEVEL_CRITICAL:
+            self.storage_note.setObjectName("storageNoteCritical")
+        elif note and level == LEVEL_WARN:
+            self.storage_note.setObjectName("storageNoteWarn")
+        else:
+            self.storage_note.setObjectName("storageNoteMuted")
+        restyle(self.storage_note)
+        key = f"{level}|stale={snap.stale}"
+        if key != self._storage_level:
+            self._storage_level = key
+            if level == LEVEL_CRITICAL:
+                self.log(note or "Critical IQ storage: under 5% free.", level="error")
+            elif level == LEVEL_WARN:
+                self.log(note or "Low IQ storage: under 10% free.")
+            elif level == LEVEL_UNAVAILABLE or snap.stale:
+                self.log(note or "Storage unavailable.")
 
     def _refresh_sensor_info(self) -> None:
         host = self._conn.host.strip()
@@ -1033,6 +1166,7 @@ class MainWindow(QMainWindow):
                 self._sftp_win.set_connection_state(self._conn)
             self._sync_connection_label()
             self._refresh_sensor_info()
+            self._refresh_storage()
             self.log(f"Saved settings for {self._conn.host or '(no host)'}.")
 
     def _on_mode_changed(self) -> None:
@@ -1283,6 +1417,19 @@ class MainWindow(QMainWindow):
                 self._end_series()
             QMessageBox.warning(self, "Cannot start", error or "Check frequency and time.")
             return
+        scan = payload["remote_recording_scans"][0]
+        try:
+            estimated = estimated_recording_bytes(int(scan["bandwidth"]), scan["duration"])
+        except Exception:
+            estimated = 0
+        blocked = recording_blocked_reason(self._storage, estimated)
+        if blocked:
+            self._submit_lock = False
+            if self._series_active:
+                self._end_series()
+            self.log(blocked, level="error")
+            QMessageBox.warning(self, "Not enough IQ storage", blocked)
+            return
         mapping = None
         if hasattr(self, "excel_check") and self.excel_check.isChecked():
             workbook = self.workbook_edit.text().strip()
@@ -1440,6 +1587,7 @@ class MainWindow(QMainWindow):
         else:
             self._schedule_sftp_part_refresh()
             self._schedule_file_confirm()
+        self._refresh_storage()
 
     def _refresh_open_sftp(self) -> None:
         if not self._alive or self._sftp_win is None:
@@ -1603,6 +1751,7 @@ class MainWindow(QMainWindow):
             self._set_phase(UNKNOWN)
             self._set_msg("Time elapsed. No matching recording file yet.")
             self.log("File not confirmed.")
+        self._refresh_storage()
         self._recordings_completed += 1
         self._update_collection_status()
         if self._series_active:
@@ -1790,6 +1939,7 @@ class MainWindow(QMainWindow):
                 self._sftp_win.close()
             self._sftp_win = SftpWindow(self._conn, None)
             self._sftp_win.activity.connect(self.log)
+            self._sftp_win.remote_changed.connect(self._refresh_storage)
             self._sftp_win.set_recent_record_id(self._open_record_id)
             self._sftp_win.show()
             self._sftp_win.raise_()

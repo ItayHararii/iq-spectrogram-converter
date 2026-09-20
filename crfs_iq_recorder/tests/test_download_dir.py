@@ -16,8 +16,9 @@ from crfs_iq_recorder.paths import (
 
 def test_user_documents_dir_is_writable():
     docs = user_documents_dir()
-    assert docs.is_dir()
-    probe = docs / f".crfs_test_probe_{os.getpid()}"
+    folder = docs / DOWNLOAD_APP_FOLDER
+    folder.mkdir(parents=True, exist_ok=True)
+    probe = folder / f".crfs_test_probe_{os.getpid()}"
     probe.mkdir()
     probe.rmdir()
 
@@ -41,6 +42,37 @@ def test_default_download_dir_is_local_profile_recordings():
     assert path.parent.name == DOWNLOAD_APP_FOLDER
     assert path.parent.parent == user_documents_dir()
     assert not is_cloud_path(path)
+
+
+def test_legacy_c_profile_download_is_remapped(tmp_path, monkeypatch):
+    from crfs_iq_recorder import paths
+
+    fake_d = tmp_path / "D"
+    fake_d.mkdir()
+    monkeypatch.setattr(paths, "preferred_data_root", lambda: fake_d)
+    legacy = r"C:\Users\example\CRFS IQ Recorder\Recordings"
+    expected = fake_d / DOWNLOAD_APP_FOLDER / DOWNLOAD_SUBFOLDER
+    assert Path(paths.remap_legacy_download_dir(legacy)) == expected
+    assert resolved_download_dir(legacy) == expected
+    custom = r"C:\Collection\My IQ"
+    assert paths.remap_legacy_download_dir(custom) == custom
+    root_legacy = r"C:\CRFS IQ Recorder\Recordings"
+    assert Path(paths.remap_legacy_download_dir(root_legacy)) == expected
+    nested_temp = r"C:\Users\example\AppData\Local\Temp\work\CRFS IQ Recorder\Recordings"
+    assert paths.remap_legacy_download_dir(nested_temp) == nested_temp
+
+
+def test_from_settings_remaps_legacy_profile_download(tmp_path, monkeypatch):
+    from crfs_iq_recorder import paths
+
+    fake_d = tmp_path / "D"
+    fake_d.mkdir()
+    monkeypatch.setattr(paths, "preferred_data_root", lambda: fake_d)
+    state = ConnectionState.from_settings(
+        {"host": "192.0.2.10", "download_dir": r"C:\Users\example\CRFS IQ Recorder\Recordings"}
+    )
+    assert Path(state.download_dir) == fake_d / DOWNLOAD_APP_FOLDER / DOWNLOAD_SUBFOLDER
+    assert Path(state.persistable()["download_dir"]) == fake_d / DOWNLOAD_APP_FOLDER / DOWNLOAD_SUBFOLDER
 
 
 def test_cloud_download_dir_is_rejected():

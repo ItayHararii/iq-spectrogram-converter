@@ -197,6 +197,9 @@ QLabel#error {{
     color: {p.danger};
     font-weight: 500;
 }}
+QLabel#headerLogo {{
+    background: transparent;
+}}
 QLabel#headerTitle {{
     color: {p.text};
     font-size: 18px;
@@ -223,6 +226,33 @@ QLabel#sensorFactValue {{
     color: {p.text};
     font-size: 14px;
     font-weight: 600;
+}}
+QLabel#storageValueWarn {{
+    color: {p.wait_fg};
+    font-size: 14px;
+    font-weight: 600;
+}}
+QLabel#storageValueCritical {{
+    color: {p.danger};
+    font-size: 14px;
+    font-weight: 600;
+}}
+QLabel#storageNoteWarn {{
+    color: {p.wait_fg};
+    font-size: 12px;
+    font-weight: 600;
+    background: transparent;
+}}
+QLabel#storageNoteCritical {{
+    color: {p.danger};
+    font-size: 12px;
+    font-weight: 600;
+    background: transparent;
+}}
+QLabel#storageNoteMuted {{
+    color: {p.muted};
+    font-size: 12px;
+    background: transparent;
 }}
 QLabel#badgeOk, QLabel#badgeWait, QLabel#badgeBad, QLabel#badgeIdle {{
     font-size: 12px;
@@ -696,8 +726,11 @@ def format_bytes(size: int) -> str:
     if value < 1024 * 1024 * 1024:
         text = f"{value / (1024 * 1024):.1f}"
         return f"{text.rstrip('0').rstrip('.')} MB"
-    text = f"{value / (1024 * 1024 * 1024):.2f}"
-    return f"{text.rstrip('0').rstrip('.')} GB"
+    if value < 1024 * 1024 * 1024 * 1024:
+        text = f"{value / (1024 * 1024 * 1024):.2f}"
+        return f"{text.rstrip('0').rstrip('.')} GB"
+    text = f"{value / (1024 * 1024 * 1024 * 1024):.2f}"
+    return f"{text.rstrip('0').rstrip('.')} TB"
 
 
 def format_display_date(value: datetime) -> str:
