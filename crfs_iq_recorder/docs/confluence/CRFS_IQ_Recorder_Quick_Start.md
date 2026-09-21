@@ -4,10 +4,10 @@ CRFS IQ Recorder is a Windows app for CRFS sensors. It starts an IQ recording, d
 
 ## Download and run
 
-**Version:** 1.8.1
+**Version:** 1.8.2
 **File:** `CRFS_IQ_Recorder.exe` - one file, no Python, no install.
 
-> Windows EXE: [CRFS IQ Recorder 1.8.1](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.1)
+> Windows EXE: [CRFS IQ Recorder 1.8.2](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.2)
 
 1. Save the exe on this PC (Desktop or a local folder).
 2. Double-click **CRFS_IQ_Recorder.exe**. The first launch can be slower.
@@ -40,7 +40,7 @@ HTTP and SFTP logins are remembered on this computer. In Sensor Files, select fi
 1. Click **Sensor Files**.
 2. Today's folder on the sensor opens (`/mnt/1/remdata/YYYYMMDD/`). New files show **NEW**. A split capture appears as a collapsible parent such as `iq_20260915_142718`, with `_0001.wav` and `_0002.wav` underneath. Single files stay as normal rows.
 3. Start, end, center, bandwidth, and duration are shown when the app has them. The parent shows part count and combined size.
-4. Select the parent and click **Download this recording** for every listed part, or select individual children to download only those files. There is no save dialog. Delete is keyboard-only on the focused file list.
+4. Select the parent and click **Download this recording** for every listed part, or select individual children to download only those files. There is no save dialog. Delete is keyboard-only on the focused file list. Connecting and waterfall stay in the background, so you can still move, resize, or close the window, and **Open recordings folder** works while a sensor connection is pending.
 
 Default local folder: `%USERPROFILE%\CRFS IQ Recorder\Recordings` on the local disk, not OneDrive. Change it in Settings.
 

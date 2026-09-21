@@ -48,6 +48,9 @@ class SftpBrowser:
     def close(self) -> None:
         return None
 
+    def abort(self) -> None:
+        self.close()
+
     def directory_exists(self, path: str) -> bool:
         raise NotImplementedError
 
@@ -83,20 +86,53 @@ def _raise_if_cancelled(cancel: threading.Event | None) -> None:
         raise SftpError("Download cancelled.")
 
 
+SFTP_CONNECT_TIMEOUT_S = 8.0
+SFTP_READ_TIMEOUT_S = 20.0
+
+
+def _close_ssh_client(client) -> None:
+    if client is None:
+        return
+    try:
+        transport = client.get_transport()
+    except Exception:
+        transport = None
+    if transport is not None:
+        try:
+            sock = getattr(transport, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(2)
+                except Exception:
+                    pass
+            transport.close()
+        except Exception:
+            pass
+    try:
+        client.close()
+    except Exception:
+        pass
+
+
 class ParamikoSftpBrowser(SftpBrowser):
     def __init__(self, client) -> None:
         self._client = client
         self._sftp = client.open_sftp()
+        try:
+            channel = self._sftp.get_channel()
+            channel.settimeout(SFTP_READ_TIMEOUT_S)
+        except Exception:
+            pass
+
+    def abort(self) -> None:
+        _close_ssh_client(self._client)
 
     def close(self) -> None:
         try:
             self._sftp.close()
         except Exception:
             pass
-        try:
-            self._client.close()
-        except Exception:
-            pass
+        _close_ssh_client(self._client)
 
     def directory_exists(self, path: str) -> bool:
         try:
@@ -214,14 +250,46 @@ def connect_sftp(
     username: str,
     password: str,
     *,
-    timeout_s: float = 20.0,
+    timeout_s: float = SFTP_CONNECT_TIMEOUT_S,
+    cancel: threading.Event | None = None,
+    on_client: Callable | None = None,
 ) -> ParamikoSftpBrowser:
     try:
         import paramiko
     except ImportError as exc:
         raise SftpError("paramiko is required for SFTP. Install requirements.txt.") from exc
 
+    timeout_s = float(timeout_s or SFTP_CONNECT_TIMEOUT_S)
+    holder: dict[str, object] = {"client": None}
+
+    def _cancelled() -> bool:
+        return cancel is not None and cancel.is_set()
+
+    def _raise_if_cancelled() -> None:
+        if _cancelled():
+            _close_ssh_client(holder.get("client"))
+            raise SftpError("SFTP cancelled.")
+
+    done = threading.Event()
+
+    def _watch_cancel() -> None:
+        if cancel is None:
+            return
+        while not done.is_set():
+            if cancel.wait(0.2):
+                _close_ssh_client(holder.get("client"))
+                return
+
+    def _new_client():
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        holder["client"] = client
+        if on_client is not None:
+            on_client(client)
+        return client
+
     def _connect(client, extra: dict | None = None) -> None:
+        _raise_if_cancelled()
         kwargs = {
             "hostname": host,
             "port": int(port),
@@ -236,17 +304,23 @@ def connect_sftp(
         if extra:
             kwargs.update(extra)
         client.connect(**kwargs)
+        _raise_if_cancelled()
+        try:
+            transport = client.get_transport()
+            if transport is not None and getattr(transport, "sock", None) is not None:
+                transport.sock.settimeout(SFTP_READ_TIMEOUT_S)
+        except Exception:
+            pass
 
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    if cancel is not None:
+        threading.Thread(target=_watch_cancel, name="sftp-cancel", daemon=True).start()
+    client = _new_client()
     try:
+        _raise_if_cancelled()
         try:
             _connect(client)
         except paramiko.AuthenticationException as exc:
-            try:
-                client.close()
-            except Exception:
-                pass
+            _close_ssh_client(client)
             raise SftpError(
                 "SFTP login failed. CRFS SSH uses a different account from HTTP. "
                 "Open Settings and check the SFTP username and password."
@@ -256,29 +330,20 @@ def connect_sftp(
             retryable = any(token in message for token in ("algorithm", "kex", "no matching", "banner"))
             if not retryable:
                 raise
-            try:
-                client.close()
-            except Exception:
-                pass
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            _close_ssh_client(client)
+            client = _new_client()
             _connect(client, {"disabled_algorithms": {"pubkeys": ["rsa-sha2-256", "rsa-sha2-512"]}})
+        _raise_if_cancelled()
+        return ParamikoSftpBrowser(client)
     except SftpError:
         raise
     except Exception as exc:
-        try:
-            client.close()
-        except Exception:
-            pass
+        _close_ssh_client(holder.get("client"))
+        if _cancelled():
+            raise SftpError("SFTP cancelled.") from exc
         raise SftpError(f"SFTP connection failed: {exc}") from exc
-    try:
-        return ParamikoSftpBrowser(client)
-    except Exception as exc:
-        try:
-            client.close()
-        except Exception:
-            pass
-        raise SftpError(f"SFTP session failed: {exc}") from exc
+    finally:
+        done.set()
 
 
 def _demo_dir_key(path: str) -> str:
@@ -295,6 +360,7 @@ class DemoSftpBrowser(SftpBrowser):
         today = today_remdata_directory()
         now = datetime.now()
         wav = stereo_iq_tone_wav_bytes()
+        self._lock = threading.RLock()
         self._files: dict[str, bytes] = {}
         self._storage_total = DEMO_TOTAL_BYTES
         self._storage_free = DEMO_FREE_BYTES
@@ -353,6 +419,24 @@ class DemoSftpBrowser(SftpBrowser):
         size: int | None = None,
         modified: datetime | None = None,
     ) -> RemoteEntry:
+        with self._lock:
+            return self._add_file_locked(
+                name,
+                directory,
+                payload=payload,
+                size=size,
+                modified=modified,
+            )
+
+    def _add_file_locked(
+        self,
+        name: str,
+        directory: str,
+        *,
+        payload: bytes | None = None,
+        size: int | None = None,
+        modified: datetime | None = None,
+    ) -> RemoteEntry:
         folder = _demo_dir_key(directory)
         if folder not in self._dirs:
             parent = folder.rsplit("/", 2)[0] + "/" if folder.count("/") > 2 else "/mnt/1/remdata/"
@@ -380,6 +464,10 @@ class DemoSftpBrowser(SftpBrowser):
         return entry
 
     def set_file_size(self, remote_path: str, size: int, *, modified: datetime | None = None) -> None:
+        with self._lock:
+            self._set_file_size_locked(remote_path, size, modified=modified)
+
+    def _set_file_size_locked(self, remote_path: str, size: int, *, modified: datetime | None = None) -> None:
         payload = self._files.get(remote_path, stereo_iq_tone_wav_bytes())
         nbytes = max(0, int(size))
         previous = len(self._files.get(remote_path, b""))
@@ -407,6 +495,18 @@ class DemoSftpBrowser(SftpBrowser):
         when: datetime | None = None,
         size: int | None = None,
     ) -> list[RemoteEntry]:
+        with self._lock:
+            return self._publish_capture_locked(stem, parts=parts, directory=directory, when=when, size=size)
+
+    def _publish_capture_locked(
+        self,
+        stem: str,
+        *,
+        parts: int = 1,
+        directory: str | None = None,
+        when: datetime | None = None,
+        size: int | None = None,
+    ) -> list[RemoteEntry]:
         folder = directory or today_remdata_directory()
         stamp = when or datetime.now()
         wav = stereo_iq_tone_wav_bytes()
@@ -416,7 +516,7 @@ class DemoSftpBrowser(SftpBrowser):
         for index in range(1, count + 1):
             name = f"{stem}_{index:04d}.wav"
             out.append(
-                self.add_file(
+                self._add_file_locked(
                     name,
                     folder,
                     payload=wav,
@@ -427,18 +527,21 @@ class DemoSftpBrowser(SftpBrowser):
         return out
 
     def directory_exists(self, path: str) -> bool:
-        key = _demo_dir_key(path)
-        return key in self._dirs
+        with self._lock:
+            key = _demo_dir_key(path)
+            return key in self._dirs
 
     def listdir(self, path: str) -> list[RemoteEntry]:
-        key = _demo_dir_key(path)
-        if key not in self._dirs:
-            raise SftpError(f"Folder not found: {path}")
-        return sort_remote_entries(list(self._dirs[key]))
+        with self._lock:
+            key = _demo_dir_key(path)
+            if key not in self._dirs:
+                raise SftpError(f"Folder not found: {path}")
+            return sort_remote_entries(list(self._dirs[key]))
 
     def read_prefix(self, remote_path: str, local_path: Path, max_bytes: int) -> int:
-        payload = self._files.get(remote_path, stereo_iq_tone_wav_bytes())
-        data = payload[: int(max(0, max_bytes))]
+        with self._lock:
+            payload = self._files.get(remote_path, stereo_iq_tone_wav_bytes())
+            data = payload[: int(max(0, max_bytes))]
         Path(local_path).parent.mkdir(parents=True, exist_ok=True)
         Path(local_path).write_bytes(data)
         return len(data)
@@ -453,7 +556,8 @@ class DemoSftpBrowser(SftpBrowser):
         expected_size: int = 0,
     ) -> None:
         _raise_if_cancelled(cancel)
-        payload = self._files.get(remote_path, stereo_iq_tone_wav_bytes())
+        with self._lock:
+            payload = self._files.get(remote_path, stereo_iq_tone_wav_bytes())
         total = len(payload)
         if progress:
             progress(0, total)
@@ -470,24 +574,30 @@ class DemoSftpBrowser(SftpBrowser):
             raise SftpError(str(exc)) from exc
 
     def set_storage(self, *, total: int | None = None, free: int | None = None, fail: bool | None = None) -> None:
-        if total is not None:
-            self._storage_total = max(int(total), 0)
-        if free is not None:
-            self._storage_free = max(0, min(int(free), self._storage_total))
-        if fail is not None:
-            self._storage_fail = bool(fail)
+        with self._lock:
+            if total is not None:
+                self._storage_total = max(int(total), 0)
+            if free is not None:
+                self._storage_free = max(0, min(int(free), self._storage_total))
+            if fail is not None:
+                self._storage_fail = bool(fail)
 
     def storage_usage(self, path: str) -> StorageSnapshot:
-        if self._storage_fail:
-            raise SftpError("Could not read storage.")
-        return StorageSnapshot(
-            path=path,
-            total_bytes=int(self._storage_total),
-            free_bytes=min(int(self._storage_free), int(self._storage_total)),
-            ok=True,
-        )
+        with self._lock:
+            if self._storage_fail:
+                raise SftpError("Could not read storage.")
+            return StorageSnapshot(
+                path=path,
+                total_bytes=int(self._storage_total),
+                free_bytes=min(int(self._storage_free), int(self._storage_total)),
+                ok=True,
+            )
 
     def remove_file(self, remote_path: str) -> None:
+        with self._lock:
+            self._remove_file_locked(remote_path)
+
+    def _remove_file_locked(self, remote_path: str) -> None:
         path = (remote_path or "").replace("\\", "/")
         if path not in self._files:
             raise SftpError(f"File not found: {path}")

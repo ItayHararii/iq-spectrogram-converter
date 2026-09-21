@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -212,6 +213,9 @@ class MainWindow(QMainWindow):
         self._watch_state = FileWatchState()
         self._elapsed_at: datetime | None = None
         self._watch_browser = None
+        self._watch_cancel = threading.Event()
+        self._watch_token = 0
+        self._watch_in_flight = False
         self._demo_parts = 1
         self._settle_s = 8.0
         self._stable_needed = 2
@@ -234,6 +238,7 @@ class MainWindow(QMainWindow):
         self._storage_timer = QTimer(self)
         self._storage_timer.setInterval(STORAGE_POLL_MS)
         self._storage_timer.timeout.connect(self._refresh_storage)
+        self._storage_cancel = threading.Event()
         self._conn = ConnectionState.from_settings(load_settings(), demo=demo)
         self._plan = self._conn.frequency_plan()
 
@@ -732,14 +737,18 @@ class MainWindow(QMainWindow):
         self._watch_timer.stop()
         self._wait_timer.stop()
         self._excel_timer.stop()
+        if getattr(self, "_watch_cancel", None) is not None:
+            self._watch_cancel.set()
+        if getattr(self, "_storage_cancel", None) is not None:
+            self._storage_cancel.set()
         self._close_watch_browser()
         if self._record_client is not None:
             self._record_client.close()
-        for thread, _worker in list(self._jobs):
-            thread.quit()
-            thread.wait(2000)
         if self._sftp_win:
             self._sftp_win.close()
+            self._sftp_win = None
+        for thread, _worker in list(self._jobs):
+            thread.quit()
         super().closeEvent(event)
 
     def _freq_unit(self) -> str:
@@ -975,10 +984,10 @@ class MainWindow(QMainWindow):
     def _close_watch_browser(self) -> None:
         browser = self._watch_browser
         self._watch_browser = None
-        if browser is None or self._conn.demo:
+        if browser is None:
             return
         try:
-            browser.close()
+            browser.abort()
         except Exception:
             pass
 
@@ -1042,11 +1051,15 @@ class MainWindow(QMainWindow):
         self._storage_token += 1
         token = self._storage_token
         state = self._conn
+        if getattr(self, "_storage_cancel", None) is not None:
+            self._storage_cancel.set()
+        cancel = threading.Event()
+        self._storage_cancel = cancel
 
         def work() -> tuple[int, StorageSnapshot]:
             browser = None
             try:
-                browser = _open_browser(state)
+                browser = _open_browser(state, cancel=cancel)
                 return token, query_iq_storage(browser)
             except Exception as exc:
                 return token, StorageSnapshot.unavailable(str(exc))
@@ -1683,13 +1696,63 @@ class MainWindow(QMainWindow):
         if record is None:
             return
         folders = folders_for_recording(record.started_at)
-        try:
-            if self._watch_browser is None:
-                self._watch_browser = _open_browser(self._conn)
-            entries = list_watch_entries(self._watch_browser, folders)
-        except Exception as exc:
-            self.log(f"Could not list sensor files: {exc}", level="error")
+        if self._conn.demo:
+            try:
+                if self._watch_browser is None:
+                    self._watch_browser = _open_browser(self._conn)
+                entries = list_watch_entries(self._watch_browser, folders)
+            except Exception as exc:
+                self.log(f"Could not list sensor files: {exc}", level="error")
+                return
+            self._apply_watch_listing(record, entries)
             return
+        if self._watch_in_flight:
+            return
+        self._watch_in_flight = True
+        self._watch_token += 1
+        token = self._watch_token
+        state = self._conn
+        if getattr(self, "_watch_cancel", None) is not None:
+            self._watch_cancel.set()
+        cancel = threading.Event()
+        self._watch_cancel = cancel
+
+        def work() -> tuple[int, object, str]:
+            browser = None
+            try:
+                browser = _open_browser(state, cancel=cancel)
+                return token, list_watch_entries(browser, folders), ""
+            except Exception as exc:
+                return token, [], str(exc)
+            finally:
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+
+        self._start_job(work, self._show_watch_listing)
+
+    def _show_watch_listing(self, result: object) -> None:
+        self._watch_in_flight = False
+        if not self._alive or not isinstance(result, tuple) or len(result) != 3:
+            return
+        token, entries, error = result
+        if token != self._watch_token:
+            return
+        if error:
+            self.log(f"Could not list sensor files: {error}", level="error")
+            return
+        record_id = self._open_record_id
+        if not record_id:
+            return
+        record = next((item for item in load_recordings() if item.id == record_id), None)
+        if record is None:
+            return
+        self._apply_watch_listing(record, list(entries or []))
+
+    def _apply_watch_listing(self, record, entries) -> None:
+        record_id = getattr(record, "id", "")
         matched = match_recordings_to_entries(entries, [record], host=self._conn.host)
         persist_matched_stems(matched)
         mine = [entry for entry in entries if matched.get(entry.path) and matched[entry.path].id == record_id]
@@ -1799,6 +1862,8 @@ class MainWindow(QMainWindow):
         self._stop_after_current = False
         self._watching = False
         self._watch_timer.stop()
+        if getattr(self, "_watch_cancel", None) is not None:
+            self._watch_cancel.set()
         self._close_watch_browser()
         if hasattr(self, "stop_btn"):
             self.stop_btn.setEnabled(False)

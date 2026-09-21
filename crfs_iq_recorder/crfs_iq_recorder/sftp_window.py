@@ -148,7 +148,14 @@ class NewBadgeDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-def _open_browser(state: ConnectionState) -> SftpBrowser:
+def _open_browser(
+    state: ConnectionState,
+    *,
+    cancel: threading.Event | None = None,
+    on_client=None,
+) -> SftpBrowser:
+    if cancel is not None and cancel.is_set():
+        raise SftpError("SFTP cancelled.")
     if state.demo:
         from .demo_sftp import shared_demo_browser
 
@@ -159,7 +166,79 @@ def _open_browser(state: ConnectionState) -> SftpBrowser:
     host = state.host.strip()
     if not host:
         raise SftpError("Set the sensor IP in Settings.")
-    return connect_sftp(host, port, state.sftp_user(), state.sftp_pass())
+    return connect_sftp(
+        host,
+        port,
+        state.sftp_user(),
+        state.sftp_pass(),
+        cancel=cancel,
+        on_client=on_client,
+    )
+
+
+_RETAINED_THREADS: list[object] = []
+_RETAINED_WINDOWS: list[object] = []
+_PREVIEW_COMPUTE = threading.Semaphore(1)
+
+
+def _retain_until_finished(thread: QThread, *objects: QObject) -> None:
+    """Keep worker objects alive after the window closes, without blocking the UI."""
+    bag: list[object] = [thread, *objects]
+    _RETAINED_THREADS.append(bag)
+
+    def _drop() -> None:
+        try:
+            _RETAINED_THREADS.remove(bag)
+        except ValueError:
+            pass
+        for obj in objects:
+            try:
+                obj.deleteLater()
+            except RuntimeError:
+                pass
+        try:
+            thread.deleteLater()
+        except RuntimeError:
+            pass
+
+    if thread.isFinished():
+        QTimer.singleShot(0, _drop)
+    else:
+        thread.finished.connect(_drop)
+
+
+def _hold_closed_window(window: QWidget, threads: list[QThread]) -> None:
+    """Keep a closed Sensor Files window alive until its workers finish."""
+    bag: dict[str, object] = {"window": window, "left": 0}
+    _RETAINED_WINDOWS.append(bag)
+
+    def _one_done() -> None:
+        bag["left"] = int(bag["left"]) - 1
+        if int(bag["left"]) <= 0:
+            try:
+                _RETAINED_WINDOWS.remove(bag)
+            except ValueError:
+                pass
+
+    pending = False
+    for thread in threads:
+        if thread is None:
+            continue
+        bag["left"] = int(bag["left"]) + 1
+        pending = True
+        if thread.isFinished():
+            QTimer.singleShot(0, _one_done)
+        else:
+            thread.finished.connect(_one_done)
+    if not pending:
+        QTimer.singleShot(0, _one_done)
+
+
+def _disconnect_signal(signal, slot) -> None:
+    try:
+        signal.disconnect(slot)
+    except (RuntimeError, TypeError):
+        pass
 
 
 class SftpBackend(QObject):
@@ -174,6 +253,25 @@ class SftpBackend(QObject):
         self._state = state
         self._browser: SftpBrowser | None = None
         self._closing = False
+        self._cancel = threading.Event()
+        self._connecting = None
+        self._lock = threading.Lock()
+
+    def abort(self) -> None:
+        self._closing = True
+        self._cancel.set()
+        from .sftp_client import _close_ssh_client
+
+        with self._lock:
+            client = self._connecting
+            browser = self._browser
+        if client is not None:
+            _close_ssh_client(client)
+        if browser is not None:
+            try:
+                browser.abort()
+            except Exception:
+                pass
 
     def _list_today(self, browser: SftpBrowser) -> tuple[str, object, object]:
         path, warning = resolve_today_directory(browser.directory_exists)
@@ -183,7 +281,13 @@ class SftpBackend(QObject):
     @Slot()
     def open_today(self) -> None:
         try:
-            browser = _open_browser(self._state)
+            def on_client(client) -> None:
+                with self._lock:
+                    self._connecting = client
+
+            browser = _open_browser(self._state, cancel=self._cancel, on_client=on_client)
+            with self._lock:
+                self._connecting = None
             if self._closing:
                 browser.close()
                 return
@@ -263,10 +367,10 @@ class SftpBackend(QObject):
 
     @Slot()
     def shutdown(self) -> None:
-        self._closing = True
-        if self._browser:
-            self._browser.close()
+        self.abort()
+        with self._lock:
             self._browser = None
+            self._connecting = None
 
 
 class FileDownloadWorker(QObject):
@@ -293,17 +397,27 @@ class FileDownloadWorker(QObject):
         self._name = name
         self._expected_size = int(expected_size or 0)
         self._cancel = cancel
+        self._browser: SftpBrowser | None = None
+
+    def abort(self) -> None:
+        if self._cancel is not None:
+            self._cancel.set()
+        browser = self._browser
+        if browser is not None:
+            try:
+                browser.abort()
+            except Exception:
+                pass
 
     @Slot()
     def run(self) -> None:
-        browser = None
         try:
-            browser = _open_browser(self._state)
+            self._browser = _open_browser(self._state, cancel=self._cancel)
 
             def cb(done: int, total: int) -> None:
                 self.progress.emit(self._name, int(done), int(total or 0))
 
-            browser.download(
+            self._browser.download(
                 self._remote,
                 Path(self._local),
                 progress=cb,
@@ -316,8 +430,9 @@ class FileDownloadWorker(QObject):
         except Exception:
             self.failed.emit(self._name, traceback.format_exc(limit=3))
         finally:
-            if browser is not None:
-                browser.close()
+            if self._browser is not None:
+                self._browser.close()
+                self._browser = None
             thread = self.thread()
             if thread is not None:
                 thread.quit()
@@ -342,12 +457,24 @@ class PreviewWorker(QObject):
         self._entry = entry
         self._center_hz = center_hz
         self._bandwidth_hz = bandwidth_hz
+        self._cancel = threading.Event()
+        self._browser: SftpBrowser | None = None
+
+    def abort(self) -> None:
+        self._cancel.set()
+        browser = self._browser
+        if browser is not None:
+            try:
+                browser.abort()
+            except Exception:
+                pass
 
     @Slot()
     def run(self) -> None:
         tmp = None
-        browser = None
         try:
+            if self._cancel.is_set():
+                raise PreviewError("Preview cancelled.")
             ok, reason = preview_dependencies()
             if not ok:
                 raise PreviewError(reason)
@@ -356,23 +483,31 @@ class PreviewWorker(QObject):
 
             os.close(fd)
             tmp = Path(name)
-            browser = _open_browser(self._state)
-            browser.read_prefix(self._entry.path, tmp, PREVIEW_MAX_BYTES)
+            self._browser = _open_browser(self._state, cancel=self._cancel)
+            self._browser.read_prefix(self._entry.path, tmp, PREVIEW_MAX_BYTES)
+            if self._cancel.is_set():
+                raise PreviewError("Preview cancelled.")
             mtime_ts = self._entry.modified.timestamp() if self._entry.modified else 0
-            result = build_preview_from_path(
-                tmp,
-                cache_id=cache_key(self._entry.path, self._entry.size, mtime_ts),
-                center_hz=self._center_hz,
-                bandwidth_hz=self._bandwidth_hz,
-            )
+            with _PREVIEW_COMPUTE:
+                if self._cancel.is_set():
+                    raise PreviewError("Preview cancelled.")
+                result = build_preview_from_path(
+                    tmp,
+                    cache_id=cache_key(self._entry.path, self._entry.size, mtime_ts),
+                    center_hz=self._center_hz,
+                    bandwidth_hz=self._bandwidth_hz,
+                )
+            if self._cancel.is_set():
+                raise PreviewError("Preview cancelled.")
             self.finished.emit(self._token, result)
         except (SftpError, PreviewError) as exc:
             self.failed.emit(self._token, str(exc))
         except Exception:
             self.failed.emit(self._token, traceback.format_exc(limit=3))
         finally:
-            if browser is not None:
-                browser.close()
+            if self._browser is not None:
+                self._browser.close()
+                self._browser = None
             if tmp is not None:
                 try:
                     tmp.unlink(missing_ok=True)
@@ -472,6 +607,15 @@ class SftpWindow(QWidget):
         self.download_btn.clicked.connect(self._download_selected)
         self.open_folder_btn.clicked.connect(self._open_recordings_folder)
         self.cancel_btn.clicked.connect(self._cancel_downloads)
+        for btn in (
+            self.refresh_btn,
+            self.up_btn,
+            self.download_btn,
+            self.open_folder_btn,
+            self.cancel_btn,
+        ):
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
         tools.addWidget(self.refresh_btn)
         tools.addWidget(self.up_btn)
         tools.addWidget(self.download_btn)
@@ -640,32 +784,46 @@ class SftpWindow(QWidget):
         self._cmd_try_today.emit()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self._closing:
+            event.accept()
+            return
         self._closing = True
         self._dl_pending.clear()
-        self._dl_cancel.set()
         self._preview_token += 1
         self._preview_pending = None
-        for signal, slot in (
-            (self._worker.listed, self._on_listed),
-            (self._worker.failed, self._on_failed),
-            (self._worker.removed, self._on_removed),
-        ):
-            try:
-                signal.disconnect(slot)
-            except (RuntimeError, TypeError):
-                pass
+        _disconnect_signal(self._worker.listed, self._on_listed)
+        _disconnect_signal(self._worker.failed, self._on_failed)
+        _disconnect_signal(self._worker.removed, self._on_removed)
+        try:
+            self._worker.abort()
+        except Exception:
+            pass
         self._cmd_close.emit()
         self._thread.quit()
-        finished = self._thread.wait(15000)
-        for thread, _worker in list(self._dl_active):
+        keep = [self._thread]
+        _retain_until_finished(self._thread, self._worker)
+        for thread, worker in list(self._dl_active):
+            _disconnect_signal(worker.finished, self._on_file_downloaded)
+            _disconnect_signal(worker.failed, self._on_file_download_failed)
+            _disconnect_signal(worker.progress, self._on_file_progress)
+            _disconnect_signal(thread.finished, self._on_download_thread_finished)
+            _retain_until_finished(thread, worker)
+            keep.append(thread)
+        self._dl_active.clear()
+        for thread, worker in list(self._preview_jobs):
+            try:
+                worker.abort()
+            except Exception:
+                pass
+            _disconnect_signal(worker.finished, self._on_preview_ready)
+            _disconnect_signal(worker.failed, self._on_preview_failed)
+            _disconnect_signal(thread.finished, self._on_preview_thread_finished)
             thread.quit()
-            thread.wait(5000)
-        for thread, _worker in list(self._preview_jobs):
-            thread.quit()
-            thread.wait(5000)
+            _retain_until_finished(thread, worker)
+            keep.append(thread)
+        self._preview_jobs.clear()
+        _hold_closed_window(self, keep)
         QCoreApplication.removePostedEvents(self)
-        if finished:
-            self._thread.deleteLater()
         super().closeEvent(event)
 
     def _show_list_state(self, kind: str, message: str = "") -> None:
@@ -691,6 +849,7 @@ class SftpWindow(QWidget):
         self.refresh_btn.setEnabled(not locked)
         self.download_btn.setEnabled(not locked)
         self.cancel_btn.setEnabled(downloading)
+        self.open_folder_btn.setEnabled(True)
         self._sync_up_button()
         self._update_download_button()
 
@@ -728,6 +887,10 @@ class SftpWindow(QWidget):
         self.progress.setVisible(False)
         self._set_busy(False)
         detail = (text or "SFTP failed.").splitlines()[-1]
+        if "cancel" in detail.casefold():
+            self._show_list_state("error", "Connection cancelled.")
+            self.status.setText("SFTP cancelled.")
+            return
         if not self._state.host.strip():
             self._show_list_state("disconnected")
         else:
@@ -1025,6 +1188,11 @@ class SftpWindow(QWidget):
         skipped = len(self._dl_pending)
         self._dl_pending.clear()
         self._dl_cancel_count += skipped
+        for _thread, worker in list(self._dl_active):
+            try:
+                worker.abort()
+            except Exception:
+                pass
         self.status.setText("Cancelling…")
 
     def _pump_downloads(self) -> None:
@@ -1371,7 +1539,12 @@ class SftpWindow(QWidget):
         self._preview_scaled_key = None
         self.preview_image.setPixmap(QPixmap())
         self.preview_image.setText("Preparing waterfall…")
-        if self._preview_active:
+        if self._preview_jobs:
+            for thread, worker in list(self._preview_jobs):
+                try:
+                    worker.abort()
+                except Exception:
+                    pass
             self._preview_pending = (token, entry)
             return
         self._start_preview(token, entry)
@@ -1436,11 +1609,14 @@ class SftpWindow(QWidget):
     def _on_preview_failed(self, token: int, text: str) -> None:
         if self._closing or token != self._preview_token:
             return
+        detail = text.splitlines()[-1] if text else "Preview failed."
+        if "cancel" in detail.casefold():
+            return
         self._set_preview_busy(False)
         self._preview_source = None
         self.preview_image.setPixmap(QPixmap())
         self.preview_image.setText("")
-        self.preview_caption.setText(text.splitlines()[-1] if text else "Preview failed.")
+        self.preview_caption.setText(detail)
 
     def _show_preview(self, result: PreviewResult, token: int) -> None:
         if token != self._preview_token:
