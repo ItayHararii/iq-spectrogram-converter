@@ -9,7 +9,7 @@ The PNG has two plots that share a frequency axis, centered at 0 Hz:
 
 Large files are read in chunks, so the whole capture does not have to sit in RAM.
 
-The CRFS IQ Recorder lives in [`crfs_iq_recorder/`](crfs_iq_recorder/). Use that app to start a recording on a sensor and download WAVE files.
+The CRFS IQ Recorder lives in [`crfs_iq_recorder/`](crfs_iq_recorder/). Use that app to start a recording on a sensor and download WAVE files. System layout, recording flow, and how the two apps hand off WAVE files are in [CRFS IQ Recorder architecture](crfs_iq_recorder/docs/ARCHITECTURE.md).
 
 ![Example spectrum and spectrogram](assets/examples/example_spectrum_spectrogram_081608.png)
 

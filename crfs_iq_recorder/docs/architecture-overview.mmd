@@ -1,0 +1,39 @@
+%% CRFS IQ Recorder - system overview (v1.8.3)
+%% No sensor addresses or credentials in this diagram.
+flowchart LR
+  operator[Operator]
+  subgraph recorder["CRFS IQ Recorder (Qt process)"]
+    gui[MainWindow / recording controller]
+    api[EmpClient HTTP]
+    sftpWin[Sensor Files window]
+    backend[SFTP backend - one SSH session]
+    dl[Download workers - max 4]
+    preview[Waterfall preview]
+    excel[Excel log queue]
+    settings[Protected settings]
+    hist[Recording history]
+  end
+  subgraph node["CRFS RFeye Node"]
+    emp[HTTP EMP POST /emp/]
+    disk["Sensor disk /mnt/1/remdata/"]
+  end
+  local[Local WAVE files]
+  xls[Collection workbook]
+  conv[IQ Spectrogram Converter]
+  png[PNG spectrogram]
+
+  operator --> gui
+  gui --> api
+  gui --> sftpWin
+  gui --> excel
+  gui --> settings
+  gui --> hist
+  api --> emp
+  sftpWin --> backend
+  sftpWin --> dl
+  sftpWin --> preview
+  backend --> disk
+  dl --> local
+  excel --> xls
+  local --> conv
+  conv --> png

@@ -2,6 +2,8 @@
 
 Starts an IQ recording on a CRFS RFeye sensor, lists files over SFTP, and downloads WAVE files to this PC.
 
+How the Recorder, Node, local files, Excel, and Converter fit together is in [Architecture](docs/ARCHITECTURE.md).
+
 ![Main window](docs/confluence/01-main-window.png)
 
 ## Share the EXE
@@ -95,6 +97,11 @@ Each Start Recording click stores start/end, center, bandwidth, and total durati
 New files show a NEW badge. Shift/Ctrl-select several files and Download them in parallel (up to four at a time). Downloads go to a `.part` file first. After a download finishes, the recordings folder opens.
 
 Click a WAVE file for a short spectrogram preview of the start of the file (I left, Q right). A quiet preview does not mean the whole recording is empty.
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md) - components, recording flow, threads, persistence, and Converter hand-off
+- [Quick Start](docs/confluence/CRFS_IQ_Recorder_Quick_Start.md)
 
 ## Tests
 
