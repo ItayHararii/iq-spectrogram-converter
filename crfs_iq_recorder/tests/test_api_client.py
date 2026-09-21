@@ -224,3 +224,36 @@ def test_fetch_sensor_info_401():
     assert info.status == "Authentication failed"
     assert not info.connected
     assert len(transport.calls) == 1
+
+
+def test_probe_sensor_uses_authenticated_node_json_and_short_timeout():
+    transport = FakeTransport(
+        RawResponse(200, '{"name":"rfeyeTEST"}', {"Content-Type": "application/json"}, 0.01, "http://192.0.2.10/api/node.json")
+    )
+    client = EmpClient(transport=transport, demo=False, tcp_probe_fn=lambda *a, **k: (True, "ok"))
+    ok, detail = client.probe_sensor(_target(), "pass", timeout_s=4.0)
+    assert ok is True
+    assert detail == "ok"
+    assert len(transport.calls) == 1
+    method, url, kwargs = transport.calls[0]
+    assert method == "GET"
+    assert url.endswith("/api/node.json")
+    assert kwargs["timeout"] == 4.0
+    assert "/emp" not in url
+
+
+def test_probe_sensor_timeout_and_auth_failure():
+    timeout_transport = FakeTransport(error=ReadTimeout("late"))
+    client = EmpClient(transport=timeout_transport, demo=False, tcp_probe_fn=lambda *a, **k: (True, "ok"))
+    ok, detail = client.probe_sensor(_target(), "pass", timeout_s=4.0)
+    assert ok is False
+    assert "timeout" in detail.casefold()
+    auth_transport = FakeTransport(
+        RawResponse(401, "unauthorized", {}, 0.01, "http://192.0.2.10/api/node.json")
+    )
+    client = EmpClient(transport=auth_transport, demo=False, tcp_probe_fn=lambda *a, **k: (True, "ok"))
+    ok, detail = client.probe_sensor(_target(), "bad", timeout_s=4.0)
+    assert ok is False
+    assert "authentication" in detail.casefold()
+    assert all(call[0] == "GET" for call in auth_transport.calls)
+

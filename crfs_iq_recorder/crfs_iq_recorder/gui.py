@@ -45,6 +45,16 @@ from .api_client import EmpClient, HttpOutcome
 from .class_match import suggest_class
 from .collection_catalog import preferred_event, load_workbook_catalog
 from .connection_dialog import ConnectionDialog
+from .connection_monitor import (
+    CHECKING,
+    CONNECTED,
+    DISCONNECTED,
+    LINK_CHECK_INTERVAL_MS,
+    LINK_CHECK_TIMEOUT_S,
+    RECONNECTING,
+    LinkMonitor,
+    connection_identity,
+)
 from .connection_state import ConnectionState
 from .constants import (
     APP_ID,
@@ -103,7 +113,7 @@ from .recording_status import (
 )
 from .request_builder import RequestBuildError, build_payload_for_recording_time, unique_task_id
 from .sanitizer import redact_text
-from .sensor_info import SensorInfo, blank_info, checking_info
+from .sensor_info import SensorInfo, blank_info
 from .sensor_label import workbook_sensor_name
 from .sensor_storage import (
     LEVEL_CRITICAL,
@@ -185,6 +195,9 @@ class MainWindow(QMainWindow):
         self._alive = True
         self._sensor_info = blank_info(demo=demo)
         self._info_token = 0
+        self._link = LinkMonitor()
+        self._link_token = 0
+        self._link_in_flight = False
         self._http_in_flight = False
         self._recording_active = False
         self._submit_lock = False
@@ -239,6 +252,9 @@ class MainWindow(QMainWindow):
         self._storage_timer.setInterval(STORAGE_POLL_MS)
         self._storage_timer.timeout.connect(self._refresh_storage)
         self._storage_cancel = threading.Event()
+        self._link_timer = QTimer(self)
+        self._link_timer.setInterval(LINK_CHECK_INTERVAL_MS)
+        self._link_timer.timeout.connect(self._poll_link)
         self._conn = ConnectionState.from_settings(load_settings(), demo=demo)
         self._plan = self._conn.frequency_plan()
 
@@ -268,6 +284,10 @@ class MainWindow(QMainWindow):
         root.addWidget(body, 1)
 
         self.setStatusBar(QStatusBar())
+        self.link_status = QLabel("No sensor IP")
+        self.link_status.setObjectName("linkStatusIdle")
+        self.statusBar().addWidget(self.link_status, 1)
+        self.statusBar().setSizeGripEnabled(True)
         self._restore_session_widgets()
         self._apply_mode_fields()
         self._refresh_size()
@@ -285,8 +305,8 @@ class MainWindow(QMainWindow):
         self.log("Ready.")
         self._refresh_sensor_info()
         self._refresh_storage()
+        self._restart_link_monitor()
         self._sync_theme_button()
-        self.statusBar().setSizeGripEnabled(True)
         fit_window_to_screen(self, 1100, 720, min_width=640, min_height=420)
 
     def _header(self) -> QWidget:
@@ -737,6 +757,10 @@ class MainWindow(QMainWindow):
         self._watch_timer.stop()
         self._wait_timer.stop()
         self._excel_timer.stop()
+        self._storage_timer.stop()
+        self._link_timer.stop()
+        self._link_token += 1
+        self._link_in_flight = False
         if getattr(self, "_watch_cancel", None) is not None:
             self._watch_cancel.set()
         if getattr(self, "_storage_cancel", None) is not None:
@@ -1016,17 +1040,119 @@ class MainWindow(QMainWindow):
         self.model_value.setText(info.display_model())
         self.firmware_value.setText(info.display_firmware())
         self.serial_value.setText(info.display_serial())
-        self.status_value.setText(info.status)
         lowered = info.status.casefold()
-        if info.connected or lowered in {"connected", "online"}:
-            self._set_status_style("ok")
-        elif lowered in {"checking…", "checking...", "demo", "no sensor ip"}:
-            self._set_status_style("wait")
+        if info.demo:
+            self._link.demo = True
+            self._link.note_success()
+            self._sync_link_indicators()
+        elif info.connected or lowered in {"connected", "online"}:
+            if self._link.note_success():
+                self._log_link_change()
+            self._sync_link_indicators()
+        elif lowered in {"checking…", "checking...", "checking"}:
+            if self._link.state in {IDLE, CHECKING}:
+                self._link.state = CHECKING
+                self._sync_link_indicators()
         elif not self._conn.host.strip():
-            self._set_status_style("idle")
-        else:
-            self._set_status_style("bad")
+            self._link.reset(self._link_identity(), demo=False, has_host=False)
+            self._sync_link_indicators()
         if info.connected or lowered in {"connected", "online", "demo"}:
+            self._refresh_storage()
+
+    def _link_identity(self) -> tuple:
+        return connection_identity(
+            self._conn.host,
+            self._conn.http_port,
+            self._conn.use_https,
+            self._conn.username,
+            self._conn.http_password,
+            self._conn.demo,
+        )
+
+    def _sync_link_indicators(self) -> None:
+        text = self._link.label()
+        self.status_value.setText(text)
+        self._set_status_style(self._link.style())
+        if not hasattr(self, "link_status"):
+            return
+        names = {"ok": "linkStatusOk", "wait": "linkStatusWait", "bad": "linkStatusBad", "idle": "linkStatusIdle"}
+        self.link_status.setText(text)
+        self.link_status.setObjectName(names.get(self._link.style(), "linkStatusIdle"))
+        restyle(self.link_status)
+
+    def _log_link_change(self) -> None:
+        state = self._link.state
+        if state == CONNECTED:
+            self.log("Sensor connected." if not self._link.demo else "Demo sensor ready.")
+        elif state == RECONNECTING:
+            self.log("Sensor reconnecting...")
+        elif state == DISCONNECTED:
+            self.log("Sensor disconnected.", level="error")
+
+    def _restart_link_monitor(self) -> None:
+        self._link_token += 1
+        self._link_in_flight = False
+        has_host = bool(self._conn.host.strip()) or self._conn.demo
+        self._link.reset(self._link_identity(), demo=self._conn.demo, has_host=has_host)
+        self._sync_link_indicators()
+        if not has_host:
+            self._link_timer.stop()
+            return
+        self._link_timer.start()
+        self._start_link_check(force=True)
+
+    def _poll_link(self) -> None:
+        self._start_link_check(force=False)
+
+    def _start_link_check(self, *, force: bool = False) -> None:
+        if not self._alive:
+            return
+        if self._link_in_flight and not force:
+            return
+        host = self._conn.host.strip()
+        if not host and not self._conn.demo:
+            return
+        try:
+            target = self._target()
+        except ValidationError:
+            self._apply_link_result(self._link_token, False, "Invalid sensor address")
+            return
+        self._link_in_flight = True
+        token = self._link_token
+        client = self._client()
+        password = self._conn.http_password
+
+        def work() -> tuple[int, bool, str]:
+            try:
+                ok, detail = client.probe_sensor(target, password, timeout_s=LINK_CHECK_TIMEOUT_S)
+                return token, ok, detail
+            except Exception as exc:
+                return token, False, str(exc) or "Sensor check failed"
+
+        self._start_job(work, self._show_link_result, link=True, link_token=token)
+
+    def _show_link_result(self, result: Any) -> None:
+        token = None
+        ok = False
+        detail = "Sensor check failed"
+        if isinstance(result, tuple) and len(result) == 3:
+            token, ok, detail = result
+        self._apply_link_result(token, bool(ok), str(detail or ""))
+
+    def _apply_link_result(self, token: int | None, ok: bool, detail: str = "") -> None:
+        if not self._alive:
+            return
+        if token is not None and token != self._link_token:
+            return
+        self._link_in_flight = False
+        previous = self._link.state
+        changed = self._link.note_success() if ok else self._link.note_failure()
+        self._sync_link_indicators()
+        if not changed:
+            return
+        self._log_link_change()
+        if ok and previous != CONNECTED:
+            self._refresh_sensor_info()
             self._refresh_storage()
 
     def _refresh_storage(self) -> None:
@@ -1143,7 +1269,6 @@ class MainWindow(QMainWindow):
             info = self._client().fetch_sensor_info(target, self._conn.http_password)
             self._apply_sensor_info(info)
             return
-        self._apply_sensor_info(checking_info(host))
         self._info_token += 1
         token = self._info_token
         try:
@@ -1211,6 +1336,7 @@ class MainWindow(QMainWindow):
             if self._sftp_win is not None:
                 self._sftp_win.set_connection_state(self._conn)
             self._sync_connection_label()
+            self._restart_link_monitor()
             self._refresh_sensor_info()
             self._refresh_storage()
             self.log(f"Saved settings for {self._conn.host or '(no host)'}.")
@@ -1358,7 +1484,6 @@ class MainWindow(QMainWindow):
             self.start_btn.setText(f"Recording… {label}".strip())
             self._set_phase(RECORDING)
             self._set_msg(f"Recording {label}.")
-            self.statusBar().showMessage(f"Recording {label}")
             return
         hold = self._series_active or self._watching or self._waiting
         self.start_btn.setEnabled(not hold)
@@ -1373,16 +1498,20 @@ class MainWindow(QMainWindow):
         *,
         record: bool = False,
         info: bool = False,
+        link: bool = False,
         record_gen: int | None = None,
         info_token: int | None = None,
+        link_token: int | None = None,
     ) -> None:
         thread = QThread()
         worker = Worker(fn)
         worker._on_ok = on_ok  # noqa: SLF001
         worker._is_record = record  # noqa: SLF001
         worker._is_info = info  # noqa: SLF001
+        worker._is_link = link  # noqa: SLF001
         worker._record_gen = record_gen  # noqa: SLF001
         worker._info_token = info_token  # noqa: SLF001
+        worker._link_token = link_token  # noqa: SLF001
         worker.moveToThread(thread)
         queued = Qt.ConnectionType.QueuedConnection
         worker.finished.connect(self._job_finished, queued)
@@ -1419,11 +1548,18 @@ class MainWindow(QMainWindow):
                 return
             self.log(text, level="error")
             return
+        if getattr(worker, "_is_link", False):
+            token = getattr(worker, "_link_token", None)
+            if token is not None and token != self._link_token:
+                return
+            self._apply_link_result(token, False, "Sensor check failed")
+            return
         if getattr(worker, "_is_info", False) and self._alive:
             token = getattr(worker, "_info_token", None)
             if token is not None and token != self._info_token:
                 return
-            self._apply_sensor_info(blank_info(host=self._conn.host, status="Unavailable"))
+            self.log("Could not read sensor details.", level="error")
+            return
         self.log(text, level="error")
 
     @Slot()
@@ -1619,11 +1755,9 @@ class MainWindow(QMainWindow):
                     add_recording(keyed)
         if self._sftp_win is None and not self._uses_collection_watch():
             self._set_msg("Time elapsed. Open Sensor Files to check the recording.")
-            self.statusBar().showMessage("Time elapsed")
             self.log("Time elapsed. Open Sensor Files to confirm the file.")
         else:
             self._set_msg("Time elapsed. Waiting for files…")
-            self.statusBar().showMessage("Waiting for files")
             self.log("Time elapsed. Looking for recording files.")
             if self._sftp_win is not None:
                 self._sftp_win.retry_today()
@@ -1679,7 +1813,6 @@ class MainWindow(QMainWindow):
         if sizes == self._last_match_sizes and self._last_match_sizes:
             self._set_phase(CONFIRMED)
             self._set_msg(f"Recording file found ({len(entries)} part(s)).")
-            self.statusBar().showMessage("Files confirmed")
             self.log(f"Confirmed {len(entries)} recording part(s).")
             return
         self._last_match_sizes = sizes
@@ -2020,8 +2153,6 @@ class MainWindow(QMainWindow):
             snippet = outcome.body_text.strip().replace("\n", " ")
             if snippet:
                 self.log(snippet[:400])
-        if not (recording and self._recording_active):
-            self.statusBar().showMessage(outcome.title)
 
     def _open_sftp(self) -> None:
         if not self._conn.host.strip() and not self._conn.demo:

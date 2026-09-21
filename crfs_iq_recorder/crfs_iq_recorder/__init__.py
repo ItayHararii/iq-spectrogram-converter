@@ -1,4 +1,4 @@
 """CRFS IQ Recorder - desktop client for EMP remote IQ recording."""
 
-__version__ = "1.8.2"
+__version__ = "1.8.3"
 APP_NAME = "CRFS IQ Recorder"

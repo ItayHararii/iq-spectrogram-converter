@@ -100,6 +100,7 @@ def test_gui_default_payload(qapp):
         assert window.firmware_value.text() == "2.25-325"
         assert window.serial_value.text() == "rfeyeDEMO"
         assert window.status_value.text() == "Demo"
+        assert window.link_status.text() == "Demo"
         assert window.wait_spin.value() == 5
         assert window.wait_unit.currentText() == "Seconds"
         assert window._repeat_wait_s() == 5
@@ -512,6 +513,80 @@ def test_stale_sensor_info_does_not_overwrite(qapp):
             )
         )
         assert window.model_value.text() != "WrongHost"
+    finally:
+        window.close()
+
+
+def test_link_indicators_follow_failures_and_restore(qapp):
+    from crfs_iq_recorder.gui import MainWindow
+
+    window = MainWindow(demo=True)
+    logged: list[str] = []
+    original_log = window.log
+
+    def capture(message: str, *, level: str = "info") -> None:
+        logged.append(message)
+        original_log(message, level=level)
+
+    try:
+        window._link_timer.stop()
+        window.log = capture  # type: ignore[method-assign]
+        window._refresh_sensor_info = lambda: None  # type: ignore[method-assign]
+        window._refresh_storage = lambda: None  # type: ignore[method-assign]
+        window._link.demo = False
+        window._link.state = "connected"
+        window._link.failures = 0
+        window._sync_link_indicators()
+        token = window._link_token
+        window._apply_link_result(token, True, "ok")
+        assert window.status_value.text() == "Connected"
+        assert window.link_status.text() == "Connected"
+        window._apply_link_result(token, False, "timeout")
+        assert window.status_value.text() == "Reconnecting..."
+        assert window.link_status.text() == "Reconnecting..."
+        window._apply_link_result(token, False, "timeout")
+        assert window.status_value.text() == "Disconnected"
+        assert window.link_status.text() == "Disconnected"
+        window._apply_link_result(token, False, "timeout")
+        assert window.status_value.text() == "Disconnected"
+        window._apply_link_result(token, True, "ok")
+        assert window.status_value.text() == "Connected"
+        assert window.link_status.text() == "Connected"
+        assert logged.count("Sensor reconnecting...") == 1
+        assert logged.count("Sensor disconnected.") == 1
+        assert logged.count("Sensor connected.") == 1
+        stale = token
+        window._restart_link_monitor()
+        window._link.demo = False
+        window._link.state = "checking"
+        window._sync_link_indicators()
+        assert window._link_token != stale
+        window._apply_link_result(stale, True, "ok")
+        assert window.status_value.text() == "Checking…"
+        assert window.link_status.text() == "Checking…"
+        jobs = len(window._jobs)
+        window._link_in_flight = True
+        window._poll_link()
+        assert len(window._jobs) == jobs
+    finally:
+        window.close()
+
+
+def test_storage_failure_does_not_change_api_link(qapp):
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.sensor_storage import StorageSnapshot
+
+    window = MainWindow(demo=True)
+    try:
+        window._link_timer.stop()
+        window._link.demo = False
+        window._link.state = "connected"
+        window._link.failures = 0
+        window._sync_link_indicators()
+        token = window._storage_token
+        window._show_storage_result((token, StorageSnapshot.unavailable("SFTP failed")))
+        assert window.status_value.text() == "Connected"
+        assert window.link_status.text() == "Connected"
     finally:
         window.close()
 

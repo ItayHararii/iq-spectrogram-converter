@@ -265,6 +265,30 @@ QLabel#badgeOk {{ background: {p.ok_bg}; color: {p.ok_fg}; }}
 QLabel#badgeWait {{ background: {p.wait_bg}; color: {p.wait_fg}; }}
 QLabel#badgeBad {{ background: {p.bad_bg}; color: {p.bad_fg}; }}
 QLabel#badgeIdle {{ background: {p.border}; color: {p.muted}; }}
+QLabel#linkStatusOk {{
+    color: {p.ok_fg};
+    font-size: 12px;
+    font-weight: 600;
+    background: transparent;
+}}
+QLabel#linkStatusWait {{
+    color: {p.wait_fg};
+    font-size: 12px;
+    font-weight: 600;
+    background: transparent;
+}}
+QLabel#linkStatusBad {{
+    color: {p.danger};
+    font-size: 12px;
+    font-weight: 600;
+    background: transparent;
+}}
+QLabel#linkStatusIdle {{
+    color: {p.muted};
+    font-size: 12px;
+    font-weight: 600;
+    background: transparent;
+}}
 QLabel#unitSuffix {{
     color: {p.muted};
     font-weight: 600;

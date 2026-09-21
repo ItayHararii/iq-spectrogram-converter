@@ -340,6 +340,33 @@ class EmpClient:
             status = f"HTTP {raw.status_code}"
         return blank_info(host=host, status=status, demo=self.demo)
 
+    def probe_sensor(
+        self,
+        target: ConnectionTarget,
+        password: str,
+        *,
+        timeout_s: float = 4.0,
+    ) -> tuple[bool, str]:
+        """Authenticated GET /api/node.json. Read-only; never POSTs."""
+        timeout_s = float(timeout_s or 4.0)
+        try:
+            raw = self._get(target, password, NODE_JSON_PATH, timeout=timeout_s)
+        except ConnectTimeout:
+            return False, "HTTP connect timeout"
+        except (ReadTimeout, Timeout):
+            return False, "HTTP read timeout"
+        except SSLError:
+            return False, "TLS error"
+        except RequestsConnectionError:
+            return False, "HTTP connection failed"
+        except Exception as exc:
+            return False, str(exc) or "Sensor check failed"
+        if raw.status_code < 400:
+            return True, "ok"
+        if raw.status_code in (401, 403):
+            return False, "Authentication failed"
+        return False, f"HTTP {raw.status_code}"
+
     def fetch_sensor_info(self, target: ConnectionTarget, password: str) -> SensorInfo:
         """Read model, firmware, serial, and reachability from the Node webpage APIs."""
         host = target.host

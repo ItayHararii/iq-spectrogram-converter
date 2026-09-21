@@ -4,10 +4,10 @@ CRFS IQ Recorder is a Windows app for CRFS sensors. It starts an IQ recording, d
 
 ## Download and run
 
-**Version:** 1.8.2
+**Version:** 1.8.3
 **File:** `CRFS_IQ_Recorder.exe` - one file, no Python, no install.
 
-> Windows EXE: [CRFS IQ Recorder 1.8.2](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.2)
+> Windows EXE: [CRFS IQ Recorder 1.8.3](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.3)
 
 1. Save the exe on this PC (Desktop or a local folder).
 2. Double-click **CRFS_IQ_Recorder.exe**. The first launch can be slower.
@@ -20,7 +20,7 @@ Do not put real sensor IPs, logins, or passwords on this page or in screenshots.
 ## Record IQ
 
 1. Open **Settings** and enter the sensor IP, HTTP login, and SFTP login.
-2. Check **Model**, **Firmware**, **Serial**, and **Status** in the header. Status should read **Connected**.
+2. Check **Model**, **Firmware**, **Serial**, and **Status** in the header. Status should read **Connected**. The same text is shown at the bottom left. The app checks the sensor every 10 seconds. After one missed check the badge turns amber **Reconnecting...**; after two it turns red **Disconnected**. It returns to green **Connected** on its own when the sensor answers. SFTP problems stay in Sensor Files and are not treated as an API disconnect.
 3. Choose **Start / End** or **Center / Bandwidth** (values in MHz).
 4. Enter **Recording time (s)** and check **Estimate**.
 5. Click **Start Recording**. Status goes **Sending request...**, then **Recording...**, then **WAVE file found** when files appear.
@@ -63,6 +63,7 @@ Click a WAVE file. A short waterfall of the first portion appears under the list
 ## Useful notes
 
 - Recordings are saved on the sensor first. **Download** copies them to this computer.
+- Status in the header and at the bottom left is the sensor API link. SFTP errors are shown in Sensor Files.
 - Today's sensor folder is created after the first recording task is submitted.
 - Large recordings may be split into numbered files. The parent row represents the whole capture; download or delete that parent if you need every listed part.
 - With Excel logging on, each finished recording is added to the workbook automatically.
