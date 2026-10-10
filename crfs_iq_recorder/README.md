@@ -12,6 +12,15 @@ On a PC with Python, double-click `build_exe.bat`. Copy `dist\CRFS_IQ_Recorder.e
 
 The EXE is not stored in Git. Each version is tagged and the EXE is attached to the matching GitHub Release (keep older releases for rollback).
 
+### Windows warnings, signing, and the icon
+
+- **"Windows protected your PC"** on first run is Microsoft Defender SmartScreen. The cause is reputation: the EXE is not signed with a trusted code-signing certificate, so Windows shows "Unknown publisher", and every new build is a new file hash with no download history. Browsers show a similar "not commonly downloaded" notice for the same reason. Defender itself reports no threat for the build (checked with `MpCmdRun -Scan` before each release).
+- **What fixes the publisher part:** Authenticode-sign every release with a certificate from a trusted CA (OV or EV) and a timestamp. `build_exe.bat` does this when `CRFS_SIGN_THUMBPRINT` (certificate in the Windows store) or `CRFS_SIGN_PFX` + `CRFS_SIGN_PFX_PASSWORD` (file outside the repo) is set; see `sign_exe.ps1`. Signing names the publisher and lets later releases inherit trust, but per Microsoft it does not give a brand-new file instant SmartScreen reputation, and EV no longer bypasses SmartScreen. Self-signed certificates behave like no signature and are refused by the script.
+- **If Defender ever flags the EXE** (it does not today), submit the file as a software developer at https://www.microsoft.com/wdsi/filesubmission instead of adding exclusions.
+- The EXE carries a Windows version resource (product name, company, version), which is what Explorer, Task Manager, and the SmartScreen dialog display.
+- **Icon:** the EXE embeds the Sensorz `.ico` (16-256 px), the window sets the same icon, and the process registers the AppUserModelID `Sensorz.CRFSIQRecorder` so the taskbar groups it on its own. If a pinned shortcut keeps an old icon after an update, unpin and pin again; Windows caches shortcut icons per file.
+- **Startup:** the bundle contains only the Qt modules the app uses, and sensor checks, SFTP storage, the saved workbook, and the Excel queue start after the window is on screen. A sensor that is off or unreachable does not delay the window.
+
 Downloads default to `%USERPROFILE%\CRFS IQ Recorder\Recordings` on the local disk, not OneDrive. Change the folder in Settings. The choice is remembered.
 
 The main window shows IQ Storage for the sensor disk that holds `/mnt/1/remdata/` (today's dated folder does not need to exist yet). Under 10% free is a warning; under 5% is critical. Start Recording is blocked if the estimate plus a safety margin would not fit. Existing recordings are never deleted to free space.

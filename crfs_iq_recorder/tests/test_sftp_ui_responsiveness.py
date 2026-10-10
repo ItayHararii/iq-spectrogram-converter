@@ -275,3 +275,26 @@ def test_main_window_close_does_not_wait_on_sftp(qapp, monkeypatch):
     finally:
         window.close()
         qapp.processEvents()
+
+
+def test_list_failure_does_not_open_a_popup(qapp, monkeypatch):
+    from crfs_iq_recorder.connection_state import ConnectionState
+    from crfs_iq_recorder.sftp_window import SftpWindow
+
+    shown: list[object] = []
+    monkeypatch.setattr(
+        "crfs_iq_recorder.sftp_window.QMessageBox.warning",
+        lambda *args, **kwargs: shown.append(args),
+    )
+    window = SftpWindow(ConnectionState(demo=False, host="192.0.2.1"))
+    try:
+        window._on_failed("SFTP connection failed: timed out")
+        qapp.processEvents()
+        assert shown == []
+        text = window.empty_page.text()
+        assert "Could not list files" in text
+        assert "timed out" in text
+        assert window.status.text() == "SFTP error."
+    finally:
+        window.close()
+        qapp.processEvents()

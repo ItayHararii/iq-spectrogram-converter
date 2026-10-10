@@ -9,17 +9,11 @@ from __future__ import annotations
 
 import socket
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-import requests
-from requests.auth import HTTPBasicAuth
-from requests.exceptions import (
-    ConnectionError as RequestsConnectionError,
-    ConnectTimeout,
-    ReadTimeout,
-    SSLError,
-    Timeout,
-)
+if TYPE_CHECKING:
+    import requests
+    from requests.auth import HTTPBasicAuth
 
 from .constants import (
     CONNECTION_TEST_PATH,
@@ -34,6 +28,38 @@ from .validation import ConnectionTarget
 
 # Bound how much of a non-JSON / error body we keep in the GUI.
 _MAX_BODY_CHARS = 16_384
+
+# `requests` costs ~0.3 s to import and is only needed once the first HTTP call
+# runs on a worker thread. Importing it here at module load would delay the
+# main window. _ensure_requests() fills these names on first use.
+requests: Any = None
+HTTPBasicAuth: Any = None
+RequestsConnectionError: Any = None
+ConnectTimeout: Any = None
+ReadTimeout: Any = None
+SSLError: Any = None
+Timeout: Any = None
+
+
+def _ensure_requests() -> None:
+    global requests, HTTPBasicAuth, RequestsConnectionError, ConnectTimeout, ReadTimeout, SSLError, Timeout
+    if requests is not None:
+        return
+    import requests as _requests
+    from requests.auth import HTTPBasicAuth as _HTTPBasicAuth
+    from requests.exceptions import ConnectionError as _ConnectionError
+    from requests.exceptions import ConnectTimeout as _ConnectTimeout
+    from requests.exceptions import ReadTimeout as _ReadTimeout
+    from requests.exceptions import SSLError as _SSLError
+    from requests.exceptions import Timeout as _Timeout
+
+    HTTPBasicAuth = _HTTPBasicAuth
+    RequestsConnectionError = _ConnectionError
+    ConnectTimeout = _ConnectTimeout
+    ReadTimeout = _ReadTimeout
+    SSLError = _SSLError
+    Timeout = _Timeout
+    requests = _requests
 
 
 class Transport(Protocol):
@@ -88,11 +114,22 @@ class RequestsTransport:
     """One-shot requests calls. No retries (a timed-out POST must not be replayed)."""
 
     def __init__(self, session: requests.Session | None = None) -> None:
-        self._session = session or requests.Session()
+        # The session is created on first request so that `requests` is
+        # imported on the worker thread, not while the window is opening.
+        self._session = session
+
+    def _get_session(self) -> requests.Session:
+        if self._session is None:
+            _ensure_requests()
+            self._session = requests.Session()
+        return self._session
 
     def close(self) -> None:
+        session = self._session
+        if session is None:
+            return
         try:
-            self._session.close()
+            session.close()
         except Exception:
             pass
 
@@ -106,7 +143,7 @@ class RequestsTransport:
         auth: HTTPBasicAuth | None = None,
         timeout: float = 30.0,
     ) -> RawResponse:
-        response = self._session.request(
+        response = self._get_session().request(
             method=method,
             url=url,
             headers=headers,
@@ -205,6 +242,7 @@ class EmpClient:
 
     def test_connection(self, target: ConnectionTarget, password: str) -> HttpOutcome:
         """Reachability + GET /. Never POSTs a recording body."""
+        _ensure_requests()
         if self.demo:
             tcp_ok, tcp_msg = True, "Demo mode: TCP probe skipped; no sensor was contacted."
         else:
@@ -314,6 +352,7 @@ class EmpClient:
         *,
         timeout: float | None = None,
     ) -> RawResponse:
+        _ensure_requests()
         url = f"{target.origin}{path}"
         auth = HTTPBasicAuth(target.username, password)
         return self.transport.request(
@@ -348,6 +387,7 @@ class EmpClient:
         timeout_s: float = 4.0,
     ) -> tuple[bool, str]:
         """Authenticated GET /api/node.json. Read-only; never POSTs."""
+        _ensure_requests()
         timeout_s = float(timeout_s or 4.0)
         try:
             raw = self._get(target, password, NODE_JSON_PATH, timeout=timeout_s)
@@ -369,6 +409,7 @@ class EmpClient:
 
     def fetch_sensor_info(self, target: ConnectionTarget, password: str) -> SensorInfo:
         """Read model, firmware, serial, and reachability from the Node webpage APIs."""
+        _ensure_requests()
         host = target.host
         if self.demo:
             tcp_ok = True
@@ -427,6 +468,7 @@ class EmpClient:
         password: str,
         payload: dict[str, Any],
     ) -> HttpOutcome:
+        _ensure_requests()
         url = emp_url(target)
         auth = HTTPBasicAuth(target.username, password)
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/plain;q=0.8"}

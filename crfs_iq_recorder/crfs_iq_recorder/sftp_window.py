@@ -897,7 +897,6 @@ class SftpWindow(QWidget):
             self._show_list_state("error", f"Could not list files.\n{detail}")
         self.status.setText("SFTP error.")
         self.activity.emit(f"SFTP: {detail}")
-        QMessageBox.warning(self, "SFTP", detail)
 
     def refresh(self) -> None:
         self._request_list(self._path)

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QSize, QThread, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QGuiApplication, QIcon, QPixmap, QTextCursor
+from PySide6.QtGui import QGuiApplication, QIcon, QImageReader, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -182,13 +182,36 @@ def _icon_path(*, prefer_png: bool = False) -> Path | None:
     return brand_icon_path(prefer_png=prefer_png)
 
 
+def app_icon() -> QIcon:
+    """Sensorz mark for the window, taskbar, and Alt+Tab.
+
+    Prefers the multi-size .ico (16-256 px, so Windows picks a crisp taskbar
+    glyph at any DPI). Qt needs its ICO image plugin for that; if the plugin
+    is missing from a build, fall back to the PNG so the app never shows the
+    generic window icon.
+
+    The returned QIcon stays file-based (lazy). Loading pixmaps eagerly here
+    would leave QPixmaps alive past QApplication teardown in tests and crash
+    at interpreter exit.
+    """
+    ico = _icon_path()
+    if ico is not None and QImageReader(str(ico)).canRead():
+        return QIcon(str(ico))
+    png = _icon_path(prefer_png=True)
+    icon = QIcon()
+    if png is not None and QImageReader(str(png)).canRead():
+        for side in (16, 20, 24, 32, 40, 48, 64, 128, 256):
+            icon.addFile(str(png), QSize(side, side))
+    return icon
+
+
 class MainWindow(QMainWindow):
     def __init__(self, *, demo: bool = False) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        icon = _icon_path()
-        if icon:
-            self.setWindowIcon(QIcon(str(icon)))
+        icon = app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
 
         self._demo_forced = demo
         self._jobs: list[tuple[QThread, Worker]] = []
@@ -292,9 +315,7 @@ class MainWindow(QMainWindow):
         self._apply_mode_fields()
         self._refresh_size()
         self._sync_connection_label()
-        if self._conn.excel_workbook:
-            self._load_workbook(self._conn.excel_workbook, quiet=True)
-        self._flush_excel()
+        self._catalog_token = 0
         self._update_collection_status()
         if current_mode() != self._conn.ui_theme:
             app = QApplication.instance()
@@ -303,11 +324,35 @@ class MainWindow(QMainWindow):
             polish_combo(self.unit_combo)
             polish_combo(self.format_combo)
         self.log("Ready.")
+        self._sync_theme_button()
+        fit_window_to_screen(self, 1100, 720, min_width=640, min_height=420)
+        if demo:
+            # Demo is in-process and instant; keep it synchronous so the
+            # window is complete as soon as it is constructed.
+            self._start_background_init()
+        else:
+            # Sensor HTTP, SFTP storage, the link monitor, the saved workbook,
+            # and the Excel queue all wait until the first frame is on screen.
+            # A slow or unreachable sensor must not delay the window.
+            QTimer.singleShot(0, self._start_background_init)
+
+    def _start_background_init(self) -> None:
+        if not self._alive:
+            return
+        if self._conn.excel_workbook:
+            if self._conn.demo:
+                self._load_workbook(self._conn.excel_workbook, quiet=True)
+            else:
+                self._load_workbook_in_background(self._conn.excel_workbook)
         self._refresh_sensor_info()
         self._refresh_storage()
         self._restart_link_monitor()
-        self._sync_theme_button()
-        fit_window_to_screen(self, 1100, 720, min_width=640, min_height=420)
+        if self._conn.demo:
+            self._flush_excel()
+        else:
+            # Excel COM checks run on the UI thread; give the window a moment
+            # to paint and settle before the first queue flush.
+            QTimer.singleShot(1500, self._flush_excel)
 
     def _header(self) -> QWidget:
         bar = QFrame()
@@ -898,6 +943,34 @@ class MainWindow(QMainWindow):
             if not quiet:
                 QMessageBox.warning(self, "Workbook", f"Could not read the workbook: {exc}")
             return False
+        self._catalog_token += 1
+        self._apply_catalog(file, catalog, quiet=quiet)
+        return True
+
+    def _load_workbook_in_background(self, path: str) -> None:
+        """Read the saved workbook on a worker so a large .xlsm never blocks startup."""
+        file = Path(path)
+        if not file.is_file():
+            return
+        self._catalog_token += 1
+        token = self._catalog_token
+
+        def work() -> tuple[int, Path, Any]:
+            return token, file, load_workbook_catalog(file)
+
+        def done(result: Any) -> None:
+            if not self._alive or not isinstance(result, tuple) or len(result) != 3:
+                return
+            got_token, got_file, catalog = result
+            if got_token != self._catalog_token:
+                return
+            if str(got_file) != str(self._conn.excel_workbook or ""):
+                return
+            self._apply_catalog(got_file, catalog, quiet=True)
+
+        self._start_job(work, done)
+
+    def _apply_catalog(self, file: Path, catalog: Any, *, quiet: bool) -> None:
         self._catalog = catalog
         self.workbook_edit.setText(str(file))
         self._conn.excel_workbook = str(file)
@@ -928,7 +1001,6 @@ class MainWindow(QMainWindow):
         if not quiet:
             self.log(f"Workbook: {file.name} ({len(catalog.mappings)} class ranges).")
         self._update_collection_status()
-        return True
 
     def _on_class_edited(self, _text: str = "") -> None:
         if self.class_combo.signalsBlocked():
@@ -2207,9 +2279,9 @@ def run(*, demo: bool = False) -> int:
     app.setApplicationName(APP_NAME)
     saved = load_settings()
     configure_appearance(app, saved.get("ui_theme") if isinstance(saved, dict) else None)
-    icon = _icon_path()
-    if icon:
-        app.setWindowIcon(QIcon(str(icon)))
+    icon = app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     window = MainWindow(demo=demo)
     try:
         folder = ensure_download_dir(window._conn.download_dir)

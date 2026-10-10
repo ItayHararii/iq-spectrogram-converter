@@ -298,9 +298,11 @@ Typical field path: Recorder download folder → copy or save into the Converter
 **Recorder**
 
 1. `build_exe.bat` creates `.venv`, installs `requirements.txt` and PyInstaller, runs `CRFS_IQ_Recorder.spec`.
-2. One-file windowed EXE: `crfs_iq_recorder/dist/CRFS_IQ_Recorder.exe`. Entry `run.py`. Runtime hook `pyi_rth_crfs.py`.
-3. Git does not store the EXE. Tag `vX.Y.Z` must match `__version__` in `crfs_iq_recorder/__init__.py` and Quick Start **Version**.
-4. GitHub Release on `ItayHararii/iq-spectrogram-converter` holds the EXE. Older tags stay for rollback. This branch publishes with remote `personal`. Do not force-push `main` or tags.
+2. One-file windowed EXE: `crfs_iq_recorder/dist/CRFS_IQ_Recorder.exe`. Entry `run.py`. Runtime hook `pyi_rth_crfs.py`. The spec bundles only QtCore/QtGui/QtWidgets and their plugins, matplotlib Agg, numpy, paramiko, requests, openpyxl, and pywin32; it embeds the Sensorz icon and a Windows version resource built from `__version__`.
+3. Startup cost of a one-file EXE is mostly unpacking to `%TEMP%`; keeping the bundle small is the main lever. In code, `requests` and `openpyxl` import on first use, and sensor, storage, link, workbook, and Excel work starts after the first frame (`MainWindow._start_background_init`).
+4. Optional Authenticode signing: `sign_exe.ps1` runs from `build_exe.bat` when `CRFS_SIGN_THUMBPRINT` or `CRFS_SIGN_PFX` is set. Certificates and passwords stay outside the repository.
+5. Git does not store the EXE. Tag `vX.Y.Z` must match `__version__` in `crfs_iq_recorder/__init__.py` and Quick Start **Version**.
+6. GitHub Release on `ItayHararii/iq-spectrogram-converter` holds the EXE. Older tags stay for rollback. This branch publishes with remote `personal`. Do not force-push `main` or tags.
 
 **Converter**
 

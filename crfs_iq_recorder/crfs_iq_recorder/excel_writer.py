@@ -5,12 +5,10 @@ from __future__ import annotations
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from openpyxl import load_workbook
-from openpyxl.styles import Alignment
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.worksheet import Worksheet
+if TYPE_CHECKING:
+    from openpyxl.worksheet.worksheet import Worksheet
 
 from .collection_catalog import (
     HEADER_CLASS,
@@ -30,6 +28,14 @@ from .recording_history import join_iq_filenames, sort_iq_filenames, split_iq_fi
 
 class ExcelBusyError(Exception):
     """Workbook is locked, Excel is busy, or the file cannot be saved now."""
+
+
+def _load_workbook(path: Path, **kwargs):
+    # openpyxl (plus numpy, which it imports) takes ~0.7 s to load. Import it
+    # only when a workbook is actually read so the main window opens first.
+    from openpyxl import load_workbook
+
+    return load_workbook(path, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -108,6 +114,8 @@ def _copy_row_style(ws: Worksheet, src_row: int, dest_row: int, columns: int) ->
 
 
 def _set_iq_cell(cell, filename: str, local_path: str) -> None:
+    from openpyxl.styles import Alignment
+
     names = split_iq_filenames(filename)
     cell.value = join_iq_filenames(names) if names else filename
     align = copy(cell.alignment) if cell.has_style else Alignment()
@@ -167,6 +175,8 @@ def find_row_with_iq_names(ws: Worksheet, names: list[str]) -> int | None:
 
 
 def append_iq_row(ws: Worksheet, row_data: ExcelRow) -> int:
+    from openpyxl.utils import get_column_letter
+
     headers = _header_map(ws)
     missing = [name for name in REQUIRED_HEADERS if name not in headers]
     if missing:
@@ -208,7 +218,7 @@ def append_iq_row(ws: Worksheet, row_data: ExcelRow) -> int:
 
 
 def workbook_has_iq_filename(path: Path, sheet: str, filename: str) -> bool:
-    workbook = load_workbook(path, read_only=True, data_only=True, keep_vba=False)
+    workbook = _load_workbook(path, read_only=True, data_only=True, keep_vba=False)
     try:
         if sheet not in workbook.sheetnames:
             return False
@@ -240,7 +250,7 @@ def append_rows_openpyxl(path: Path, rows: list[ExcelRow]) -> list[int]:
     if not rows:
         return []
     try:
-        workbook = load_workbook(path, keep_vba=True)
+        workbook = _load_workbook(path, keep_vba=True)
     except PermissionError as exc:
         raise ExcelBusyError(f"Could not open {path.name}. It may be open in Excel.") from exc
     try:

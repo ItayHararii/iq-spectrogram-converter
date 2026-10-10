@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from requests.auth import HTTPBasicAuth
-
 from .api_client import RawResponse
+
+if TYPE_CHECKING:
+    from requests.auth import HTTPBasicAuth
 
 _DEMO_NODE = {
     "name": "rfeyeDEMO",

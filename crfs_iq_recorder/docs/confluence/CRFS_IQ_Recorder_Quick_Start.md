@@ -4,16 +4,18 @@ CRFS IQ Recorder is a Windows app for CRFS sensors. It starts an IQ recording, d
 
 ## Download and run
 
-**Version:** 1.8.3
+**Version:** 1.8.5
 **File:** `CRFS_IQ_Recorder.exe` - one file, no Python, no install.
 
-> Windows EXE: [CRFS IQ Recorder 1.8.3](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.3)
+> Windows EXE: [CRFS IQ Recorder 1.8.5](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.5)
 
 1. Save the exe on this PC (Desktop or a local folder).
-2. Double-click **CRFS_IQ_Recorder.exe**. The first launch can be slower.
+2. Double-click **CRFS_IQ_Recorder.exe**. The window opens in a few seconds; sensor details fill in afterwards.
 3. This computer must be able to reach the sensor on the network.
 
-If Windows SmartScreen appears, choose **More info -> Run anyway** for this internal build.
+**"Windows protected your PC"** can appear the first time you run a new version. That is Microsoft Defender SmartScreen saying the file is new to it and is not signed by a publisher it knows; it is not a virus detection. Check that you downloaded the file from the GitHub Release link above, then choose **More info -> Run anyway**. Do not turn off SmartScreen or Defender for this.
+
+**Taskbar icon:** the app uses the Sensorz icon. If a pinned shortcut still shows an old or blank icon after an update, unpin it and pin the running app again (Windows caches shortcut icons).
 
 Do not put real sensor IPs, logins, or passwords on this page or in screenshots.
 
