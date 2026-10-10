@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title Build IQ Spectrogram Converter EXE
+title Build CRFS IQ Spectrogram Converter EXE
 
 echo ============================================
 echo   Build standalone EXE
@@ -11,56 +11,42 @@ echo This creates dist\IQ_Spectrogram_Converter.exe
 echo First build can take several minutes.
 echo.
 
-where python >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Python was not found on PATH.
-    pause
-    exit /b 1
-)
-
 if not exist "venv\Scripts\python.exe" (
+    where python >nul 2>&1
+    if errorlevel 1 (
+        echo ERROR: Python was not found on PATH and venv\ does not exist.
+        if /I not "%IQ_BUILD_NOPAUSE%"=="1" pause
+        exit /b 1
+    )
     echo Creating virtual environment...
     python -m venv venv
     if errorlevel 1 goto :error
 )
 
-echo Installing app requirements...
+echo Installing app requirements and PyInstaller...
 "venv\Scripts\python.exe" -m pip install --upgrade pip
 if errorlevel 1 goto :error
-"venv\Scripts\python.exe" -m pip install -r requirements.txt
-if errorlevel 1 goto :error
-
-echo Installing PyInstaller...
-"venv\Scripts\python.exe" -m pip install pyinstaller
+"venv\Scripts\python.exe" -m pip install -r requirements.txt pyinstaller
 if errorlevel 1 goto :error
 
 echo.
-echo Building executable...
-"venv\Scripts\pyinstaller.exe" ^
-    --noconfirm ^
-    --clean ^
-    --windowed ^
-    --onefile ^
-    --name "IQ_Spectrogram_Converter" ^
-    --icon "assets\sensorz_icon.ico" ^
-    --add-data "assets;assets" ^
-    --hidden-import=iq_data ^
-    --hidden-import=iq_theme ^
-    --hidden-import=PIL ^
-    --hidden-import=PIL.ImageTk ^
-    --hidden-import=numpy ^
-    --hidden-import=matplotlib ^
-    --hidden-import=seaborn ^
-    --hidden-import=scipy ^
-    --hidden-import=soundfile ^
-    --hidden-import=tkinterdnd2 ^
-    --collect-all matplotlib ^
-    --collect-all seaborn ^
-    --collect-all tkinterdnd2 ^
-    iq_gui.py
-
+echo Building executable (IQ_Spectrogram_Converter.spec)...
+"venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean IQ_Spectrogram_Converter.spec
 if errorlevel 1 goto :error
 
+if defined CRFS_SIGN_THUMBPRINT goto :sign
+if defined CRFS_SIGN_PFX goto :sign
+echo.
+echo Not signed: set CRFS_SIGN_THUMBPRINT or CRFS_SIGN_PFX to sign with a trusted code-signing certificate.
+echo Unsigned builds show "Unknown publisher" in SmartScreen. See sign_exe.ps1 and SECURITY_NOTES.md.
+goto :done
+
+:sign
+echo Signing exe...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sign_exe.ps1"
+if errorlevel 1 goto :error
+
+:done
 echo.
 echo ============================================
 echo   Build complete
@@ -69,14 +55,14 @@ echo.
 echo EXE location:
 echo   %cd%\dist\IQ_Spectrogram_Converter.exe
 echo.
-echo You can copy that single file anywhere and double-click to run.
-echo Keep WAV files handy; output defaults to an "IQ Results" folder next to the EXE.
+echo Copy that single file anywhere and double-click to run. Python is not required.
+echo Output defaults to an "IQ Results" folder next to the EXE.
 echo.
-pause
+if /I not "%IQ_BUILD_NOPAUSE%"=="1" pause
 exit /b 0
 
 :error
 echo.
 echo Build failed. Review the error shown above.
-pause
+if /I not "%IQ_BUILD_NOPAUSE%"=="1" pause
 exit /b 1

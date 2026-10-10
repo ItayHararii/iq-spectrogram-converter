@@ -1,5 +1,5 @@
-SENSORZ IQ Spectrogram Converter
-================================
+CRFS IQ Spectrogram Converter
+=============================
 
 Turns a stereo IQ WAV (I left, Q right) into a PNG. Spectrum on top
 (dBFS/bin, average + peak-hold) and spectrogram underneath.
@@ -29,7 +29,7 @@ USE
 - Set RBW in Hz, or use 5 / 15 / 30 / 50 kHz
 - Click Convert
 
-Also: Convert folder (WAVs in that folder only), dark/light theme,
+Also: Convert folder (WAVs in that folder only), Cancel, dark/light theme,
 drag-and-drop, Open image / Open output folder, Open when done.
 Display options: colormap, frequency smooth (off by default), auto dB.
 
@@ -41,8 +41,11 @@ venv\Scripts\python.exe iq_data.py --folder wav_folder --output "IQ Results" --r
 
 Optional: --cmap, --freq-smooth, --db-min, --db-max
 
+The EXE converts without a window when --input is given:
+dist\IQ_Spectrogram_Converter.exe --input file.wav --output "IQ Results" --rbw 15000 --log run.txt
+
 
 REQUIREMENTS
 ------------
-Python 3, plus: numpy, matplotlib, seaborn, scipy, soundfile, Pillow,
+Python 3, plus: numpy, matplotlib, scipy, soundfile, Pillow,
 tkinterdnd2 (see requirements.txt).

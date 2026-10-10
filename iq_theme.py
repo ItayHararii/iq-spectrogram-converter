@@ -1,8 +1,11 @@
-"""SENSORZ visual system for the IQ Spectrogram Converter.
+"""Visual system for the CRFS IQ Spectrogram Converter.
 
-Colour tokens, spacing, and control language match CRFS IQ Recorder
-(`crfs_iq_recorder/crfs_iq_recorder/theme.py`): slate surfaces, teal accent,
-Segoe UI, 8px controls / 12px cards, sun/moon theme toggle.
+Colour tokens, type sizes, spacing, and control language are copied from
+CRFS IQ Recorder (`crfs_iq_recorder/crfs_iq_recorder/theme.py`, PySide6):
+slate surfaces, teal accent, Segoe UI 13px body / 18px header, 36px theme
+toggle with the same sun/moon glyph, dark log panel, surface status bar.
+The Recorder is Qt; this app is Tk, so pixel sizes are expressed in points
+(13px = 10pt at 96 DPI) and scale with the monitor DPI.
 """
 
 from __future__ import annotations
@@ -115,13 +118,106 @@ def theme_toggle_tooltip(mode: str | None = None) -> str:
     return "Switch to Dark Mode"
 
 
+def ui_scale(root: tk.Misc) -> float:
+    """Pixels per CSS pixel: 1.0 at 96 DPI, 1.5 at 150 % display scaling."""
+    try:
+        return max(0.75, min(4.0, float(root.winfo_fpixels("1i")) / 96.0))
+    except tk.TclError:
+        return 1.0
+
+
+def px(root: tk.Misc, value: float) -> int:
+    """Scale a 96-DPI pixel size (as used in the Recorder stylesheet) to this screen."""
+    return max(1, int(round(value * ui_scale(root))))
+
+
+# Recorder stylesheet sizes (px at 96 DPI) expressed as Tk points.
+PT_BODY = 10          # 13px body text
+PT_SMALL = 9          # 12px headerSub / status bar / log
+PT_HINT = 8           # 11px captions
+PT_SECTION = 11       # 14px sectionTitle (bold)
+PT_HEADER = 13        # 18px headerTitle (bold)
+PT_PRIMARY = 11       # 14px primary button (bold)
+
+
+_checkbox_elements: dict[tuple, str] = {}
+_checkbox_images: list = []  # keep PhotoImage references alive
+
+
+def _checkbox_indicator_element(style: ttk.Style, p: Palette, box: str, size: int, gap: int) -> str | None:
+    """Create (once per palette/size) an image-based check indicator like Qt Fusion's.
+
+    ttk cannot restyle an existing element, so each palette gets its own
+    element name and apply_ttk_styles swaps the layout between them.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageTk
+    except ImportError:
+        return None
+    # One Tcl interpreter per Tk root: images from a destroyed root must not be reused.
+    try:
+        interp = style.master.tk.interpaddr()
+    except Exception:
+        interp = id(style.master)
+    key = (interp, p.accent, p.border, box, size)
+    if key in _checkbox_elements:
+        return _checkbox_elements[key]
+
+    def make(fill, outline, tick, tick_color="#FFFFFF"):
+        ss = 4
+        r = size * ss
+        img = Image.new("RGBA", (r, r), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle((0, 0, r - 1, r - 1), radius=int(r * 0.18), fill=fill, outline=outline, width=ss)
+        if tick:
+            pts = [(r * 0.26, r * 0.53), (r * 0.44, r * 0.71), (r * 0.76, r * 0.33)]
+            d.line(pts, fill=tick_color, width=max(ss, int(r * 0.11)), joint="curve")
+        photo = ImageTk.PhotoImage(img.resize((size, size), Image.Resampling.LANCZOS), master=style.master)
+        _checkbox_images.append(photo)
+        return photo
+
+    unchecked = make(box, p.border, False)
+    hover = make(box, p.accent, False)
+    checked = make(p.accent, p.accent, True)
+    checked_hover = make(p.accent_hover, p.accent_hover, True)
+    disabled = make(box, p.border, False)
+    disabled_checked = make(p.border, p.border, True, p.muted)
+    name = f"IQCheck.{len(_checkbox_elements)}.{abs(hash(key)) % 100000}.indicator"
+    try:
+        style.element_create(
+            name,
+            "image",
+            unchecked,
+            ("disabled", "selected", disabled_checked),
+            ("disabled", disabled),
+            ("selected", "active", checked_hover),
+            ("selected", checked),
+            ("active", hover),
+            sticky="",
+            padding=(0, 0, gap, 0),
+        )
+    except tk.TclError:
+        return None
+    _checkbox_elements[key] = name
+    return name
+
+
 def apply_ttk_styles(style: ttk.Style, p: Palette) -> None:
     try:
         style.theme_use("clam")
     except tk.TclError:
         pass
 
-    style.configure(".", font=(FONT_UI, 10))
+    # ttk paddings are device pixels; scale them like the Recorder's px values.
+    try:
+        k = ui_scale(style.master)
+    except Exception:
+        k = 1.0
+
+    def sp(value: float) -> int:
+        return max(1, int(round(value * k)))
+
+    style.configure(".", font=(FONT_UI, PT_BODY))
 
     style.configure("App.TFrame", background=p.bg)
     style.configure("Surface.TFrame", background=p.surface)
@@ -131,57 +227,99 @@ def apply_ttk_styles(style: ttk.Style, p: Palette) -> None:
         "HeaderTitle.TLabel",
         background=p.surface,
         foreground=p.text,
-        font=(FONT_UI_SEMIBOLD, 14),
+        font=(FONT_UI, PT_HEADER, "bold"),
     )
     style.configure(
         "HeaderSub.TLabel",
         background=p.surface,
         foreground=p.muted,
-        font=(FONT_UI, 9),
+        font=(FONT_UI, PT_SMALL),
+    )
+    style.configure(
+        "SectionTitle.TLabel",
+        background=p.surface,
+        foreground=p.text,
+        font=(FONT_UI, PT_SECTION, "bold"),
+    )
+    style.configure(
+        "Muted.TLabel",
+        background=p.surface,
+        foreground=p.muted,
+        font=(FONT_UI, PT_BODY),
     )
     style.configure(
         "Field.TLabel",
         background=p.surface,
-        foreground=p.muted,
-        font=(FONT_UI, 9),
+        foreground=p.text,
+        font=(FONT_UI, PT_BODY),
     )
     style.configure(
         "Hint.TLabel",
         background=p.surface,
         foreground=p.muted,
-        font=(FONT_UI, 8),
+        font=(FONT_UI, PT_HINT),
+    )
+    style.configure(
+        "StatusBar.TLabel",
+        background=p.surface,
+        foreground=p.muted,
+        font=(FONT_UI, PT_SMALL, "bold"),
+    )
+    style.configure(
+        "StatusBarOk.TLabel",
+        background=p.surface,
+        foreground=p.ok_fg,
+        font=(FONT_UI, PT_SMALL, "bold"),
+    )
+    style.configure(
+        "StatusBarBusy.TLabel",
+        background=p.surface,
+        foreground=p.accent,
+        font=(FONT_UI, PT_SMALL, "bold"),
+    )
+    style.configure(
+        "StatusBarBad.TLabel",
+        background=p.surface,
+        foreground=p.danger,
+        font=(FONT_UI, PT_SMALL, "bold"),
+    )
+    style.configure("StatusBar.TFrame", background=p.surface)
+    style.configure(
+        "App.TSizegrip",
+        background=p.surface,
     )
     style.configure(
         "Info.TLabel",
         background=p.surface,
         foreground=p.info,
-        font=(FONT_UI, 8),
+        font=(FONT_UI, PT_HINT),
     )
     style.configure(
         "Warn.TLabel",
         background=p.surface,
         foreground=p.danger,
-        font=(FONT_UI, 8),
+        font=(FONT_UI, PT_HINT),
     )
     style.configure(
         "Status.TLabel",
         background=p.bg,
         foreground=p.text,
-        font=(FONT_UI, 9),
+        font=(FONT_UI, PT_SMALL),
     )
     style.configure(
         "Time.TLabel",
         background=p.bg,
         foreground=p.muted,
-        font=(FONT_UI_SEMIBOLD, 9),
+        font=(FONT_UI_SEMIBOLD, PT_SMALL),
     )
     style.configure(
         "DisplayToggle.TLabel",
         background=p.surface,
         foreground=p.text,
-        font=(FONT_UI_SEMIBOLD, 10),
+        font=(FONT_UI_SEMIBOLD, PT_BODY),
     )
 
+    # Recorder QLineEdit: 1px border, 8px radius (not available in Tk), 7px 10px padding.
     entry_kw = dict(
         fieldbackground=p.surface,
         background=p.surface,
@@ -190,7 +328,7 @@ def apply_ttk_styles(style: ttk.Style, p: Palette) -> None:
         lightcolor=p.border,
         darkcolor=p.border,
         insertcolor=p.text,
-        padding=6,
+        padding=(sp(10), sp(7)),
         relief="flat",
         borderwidth=1,
     )
@@ -214,10 +352,10 @@ def apply_ttk_styles(style: ttk.Style, p: Palette) -> None:
         lightcolor=p.border,
         darkcolor=p.border,
         insertcolor=p.text,
-        padding=5,
+        padding=(sp(10), sp(6)),
         relief="flat",
         borderwidth=1,
-        arrowsize=13,
+        arrowsize=sp(14),
     )
     style.map(
         "App.TCombobox",
@@ -251,13 +389,15 @@ def apply_ttk_styles(style: ttk.Style, p: Palette) -> None:
         relief="flat",
         borderwidth=1,
     )
-    style.configure("Browse.TButton", font=(FONT_UI, 9), padding=(12, 6), **btn_common)
-    style.configure("Secondary.TButton", font=(FONT_UI, 9, "bold"), padding=(12, 6), **btn_common)
-    style.configure("Preset.TButton", font=(FONT_UI, 8), padding=(8, 4), **btn_common)
+    # Recorder QPushButton: 13px weight 600, 8px 14px padding, 32px tall.
+    btn_pad = (sp(14), sp(7))
+    style.configure("Browse.TButton", font=(FONT_UI_SEMIBOLD, PT_BODY), padding=btn_pad, **btn_common)
+    style.configure("Secondary.TButton", font=(FONT_UI_SEMIBOLD, PT_BODY), padding=btn_pad, **btn_common)
+    style.configure("Preset.TButton", font=(FONT_UI, PT_SMALL), padding=(sp(10), sp(5)), **btn_common)
     style.configure(
         "PresetSelected.TButton",
-        font=(FONT_UI, 8, "bold"),
-        padding=(8, 4),
+        font=(FONT_UI_SEMIBOLD, PT_SMALL),
+        padding=(sp(10), sp(5)),
         background=p.accent,
         foreground="#FFFFFF",
         bordercolor=p.accent,
@@ -268,11 +408,12 @@ def apply_ttk_styles(style: ttk.Style, p: Palette) -> None:
         relief="flat",
         borderwidth=1,
     )
+    # Recorder QPushButton#ghost: transparent face, 1px border.
     style.configure(
         "Ghost.TButton",
-        font=(FONT_UI, 9, "bold"),
-        padding=(8, 4),
-        background=p.surface,
+        font=(FONT_UI_SEMIBOLD, PT_BODY),
+        padding=btn_pad,
+        background=p.bg,
         foreground=p.text,
         bordercolor=p.border,
         lightcolor=p.border,
@@ -296,6 +437,11 @@ def apply_ttk_styles(style: ttk.Style, p: Palette) -> None:
             darkcolor=[("focus", p.focus), ("active", p.border)],
         )
     style.map(
+        "Ghost.TButton",
+        background=[("disabled", p.bg), ("pressed", p.border), ("active", p.button_hover)],
+        foreground=[("disabled", p.muted)],
+    )
+    style.map(
         "PresetSelected.TButton",
         background=[
             ("disabled", p.primary_disabled_bg),
@@ -306,59 +452,73 @@ def apply_ttk_styles(style: ttk.Style, p: Palette) -> None:
         bordercolor=[("focus", p.focus), ("active", p.accent_hover)],
     )
 
-    style.configure(
-        "App.TCheckbutton",
-        background=p.bg,
-        foreground=p.text,
-        font=(FONT_UI, 9),
-        focuscolor=p.bg,
-        indicatorcolor=p.surface,
-        indicatorrelief="flat",
-        indicatormargin=4,
-        padding=2,
-    )
-    style.map(
-        "App.TCheckbutton",
-        background=[("active", p.bg)],
-        foreground=[("disabled", p.muted)],
-        indicatorcolor=[
-            ("disabled", p.border),
-            ("pressed", p.accent_pressed),
-            ("selected", p.accent),
-            ("!selected", p.surface),
-        ],
-    )
-    style.configure(
-        "Surface.TCheckbutton",
-        background=p.surface,
-        foreground=p.text,
-        font=(FONT_UI, 9),
-        focuscolor=p.surface,
-        indicatorcolor=p.surface,
-        indicatorrelief="flat",
-        indicatormargin=4,
-        padding=2,
-    )
-    style.map(
-        "Surface.TCheckbutton",
-        background=[("active", p.surface)],
-        foreground=[("disabled", p.muted)],
-        indicatorcolor=[
-            ("disabled", p.border),
-            ("pressed", p.accent_pressed),
-            ("selected", p.accent),
-            ("!selected", p.bg),
-        ],
-    )
+    # Recorder QCheckBox (Fusion): 16px box, 8px gap; teal fill + white tick when checked.
+    for name, face, box in (
+        ("App.TCheckbutton", p.bg, p.surface),
+        ("Surface.TCheckbutton", p.surface, p.bg),
+    ):
+        style.configure(
+            name,
+            background=face,
+            foreground=p.text,
+            font=(FONT_UI, PT_BODY),
+            focuscolor=face,
+            indicatorsize=sp(16),
+            indicatormargin=(0, 0, sp(8), 0),
+            indicatorbackground=box,
+            indicatorforeground="#FFFFFF",
+            upperbordercolor=p.border,
+            lowerbordercolor=p.border,
+            padding=sp(2),
+        )
+        style.map(
+            name,
+            background=[("active", face)],
+            foreground=[("disabled", p.muted)],
+            indicatorbackground=[
+                ("disabled", p.border),
+                ("pressed", p.accent_pressed),
+                ("selected", p.accent),
+                ("!selected", box),
+            ],
+            indicatorforeground=[("disabled", p.muted), ("selected", "#FFFFFF")],
+            upperbordercolor=[("selected", p.accent), ("active", p.accent)],
+            lowerbordercolor=[("selected", p.accent), ("active", p.accent)],
+        )
+        element = _checkbox_indicator_element(style, p, box, sp(16), sp(8))
+        if element:
+            style.layout(
+                name,
+                [
+                    (
+                        "Checkbutton.padding",
+                        {
+                            "sticky": "nswe",
+                            "children": [
+                                (element, {"side": "left", "sticky": ""}),
+                                (
+                                    "Checkbutton.focus",
+                                    {
+                                        "side": "left",
+                                        "sticky": "w",
+                                        "children": [("Checkbutton.label", {"sticky": "nswe"})],
+                                    },
+                                ),
+                            ],
+                        },
+                    )
+                ],
+            )
 
+    # Recorder QProgressBar: bg trough, 1px border, accent chunk, 12px tall.
     style.configure(
         "App.Horizontal.TProgressbar",
-        troughcolor=p.border,
+        troughcolor=p.bg,
         background=p.accent,
         bordercolor=p.border,
         lightcolor=p.accent,
         darkcolor=p.accent,
-        thickness=10,
+        thickness=sp(12),
     )
 
     style.configure(
@@ -648,11 +808,18 @@ class Tooltip:
 
 
 class ThemeToggle(tk.Canvas):
-    """Moon in light mode (go Dark); sun in dark mode (go Light)."""
+    """Moon in light mode (go Dark); sun in dark mode (go Light).
+
+    Same geometry as the Recorder's `themeToggle` button: a 36x36 bordered
+    square with a 20px glyph, hover = button_hover fill + accent border.
+    """
 
     def __init__(self, master, command, **kwargs):
-        kwargs.setdefault("width", 36)
-        kwargs.setdefault("height", 36)
+        scale = ui_scale(master)
+        self._side = int(round(36 * scale))
+        self._glyph = 20.0 * scale
+        kwargs.setdefault("width", self._side)
+        kwargs.setdefault("height", self._side)
         kwargs.setdefault("highlightthickness", 1)
         kwargs.setdefault("bd", 0)
         kwargs.setdefault("cursor", "hand2")
@@ -702,10 +869,14 @@ class ThemeToggle(tk.Canvas):
             self._draw_moon(color, bg)
 
     def _draw_sun(self, color: str) -> None:
-        cx, cy, pixel = 18.0, 18.0, 18.0
-        radius = pixel * 0.18
-        inner = pixel * 0.28
-        outer = pixel * 0.42
+        # Recorder _paint_theme_glyph("sun"): rays 0.30-0.44, disc 0.16 of the glyph size.
+        side = float(self.winfo_reqwidth() or self._side)
+        cx = cy = side / 2.0
+        pixel = self._glyph
+        radius = pixel * 0.16
+        inner = pixel * 0.30
+        outer = pixel * 0.44
+        width = max(1.5, pixel * 0.09)
         for index in range(8):
             angle = math.radians(index * 45.0)
             self.create_line(
@@ -714,29 +885,35 @@ class ThemeToggle(tk.Canvas):
                 cx + outer * math.cos(angle),
                 cy + outer * math.sin(angle),
                 fill=color,
-                width=2,
+                width=width,
                 capstyle=tk.ROUND,
             )
         self.create_oval(cx - radius, cy - radius, cx + radius, cy + radius, fill=color, outline="")
 
     def _draw_moon(self, color: str, bg: str) -> None:
-        cx, cy, pixel = 18.0, 18.0, 18.0
-        radius = pixel * 0.32
+        # Recorder _paint_theme_glyph("moon"): body 0.28 at (-0.04, 0), cut 0.24 at (+0.12, -0.06).
+        side = float(self.winfo_reqwidth() or self._side)
+        cx = cy = side / 2.0
+        pixel = self._glyph
+        radius = pixel * 0.28
         x, y = cx - pixel * 0.04, cy
         self.create_oval(x - radius, y - radius, x + radius, y + radius, fill=color, outline="")
-        cr = radius * 0.88
-        x2, y2 = cx + pixel * 0.14, cy - pixel * 0.08
+        cr = pixel * 0.24
+        x2, y2 = cx + pixel * 0.12, cy - pixel * 0.06
         self.create_oval(x2 - cr, y2 - cr, x2 + cr, y2 + cr, fill=bg, outline="")
 
 
 class PrimaryButton(tk.Button):
+    """Recorder QPushButton#primary: accent fill, white bold 14px text, 38px tall."""
+
     def __init__(self, master, **kwargs):
         kwargs.setdefault("relief", "flat")
         kwargs.setdefault("bd", 0)
         kwargs.setdefault("cursor", "hand2")
-        kwargs.setdefault("font", (FONT_UI_SEMIBOLD, 11))
-        kwargs.setdefault("padx", 20)
-        kwargs.setdefault("pady", 8)
+        kwargs.setdefault("font", (FONT_UI, PT_PRIMARY, "bold"))
+        kwargs.setdefault("padx", px(master, 18))
+        # tk.Button adds its own internal padding; 3px here lands at ~38px tall.
+        kwargs.setdefault("pady", px(master, 3))
         kwargs.setdefault("highlightthickness", 1)
         super().__init__(master, **kwargs)
         self._p = LIGHT
@@ -778,3 +955,186 @@ class PrimaryButton(tk.Button):
             )
         except tk.TclError:
             pass
+
+
+class ThemedDialog(tk.Toplevel):
+    """Modal message box drawn with the app palette (the Recorder's QDialog look).
+
+    kind: "info" | "warning" | "error" | "question". buttons: labels left to
+    right; the last one is the default (Enter). Escape picks `cancel_label`
+    when given, else the first button. `result` holds the pressed label.
+    """
+
+    _GLYPH = {"info": "i", "warning": "!", "error": "!", "question": "?"}
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        message: str,
+        *,
+        kind: str = "info",
+        buttons: tuple[str, ...] = ("OK",),
+        cancel_label: str | None = None,
+        palette_getter=current_palette,
+    ):
+        super().__init__(parent)
+        p = palette_getter()
+        self.result: str | None = None
+        self._cancel_label = cancel_label or buttons[0]
+        self.withdraw()
+        self.title(title)
+        self.configure(bg=p.surface, highlightthickness=1, highlightbackground=p.border)
+        self.resizable(False, False)
+        try:
+            self.transient(parent.winfo_toplevel())
+        except tk.TclError:
+            pass
+
+        s = ui_scale(self)
+        body = tk.Frame(self, bg=p.surface, bd=0, highlightthickness=0)
+        body.pack(fill="both", expand=True, padx=int(20 * s), pady=(int(18 * s), int(12 * s)))
+
+        glyph_color = {"error": p.danger, "warning": p.danger, "question": p.accent}.get(kind, p.accent)
+        size = int(30 * s)
+        glyph = tk.Canvas(body, width=size, height=size, bg=p.surface, bd=0, highlightthickness=0)
+        glyph.grid(row=0, column=0, rowspan=2, sticky="n", padx=(0, int(14 * s)))
+        glyph.create_oval(1, 1, size - 1, size - 1, fill=glyph_color, outline="")
+        glyph.create_text(
+            size / 2,
+            size / 2,
+            text=self._GLYPH.get(kind, "i"),
+            fill="#FFFFFF",
+            font=(FONT_UI, PT_SECTION, "bold"),
+        )
+
+        tk.Label(
+            body,
+            text=title,
+            bg=p.surface,
+            fg=p.text,
+            font=(FONT_UI, PT_SECTION, "bold"),
+            anchor="w",
+            justify="left",
+        ).grid(row=0, column=1, sticky="w")
+        tk.Label(
+            body,
+            text=message,
+            bg=p.surface,
+            fg=p.text,
+            font=(FONT_UI, PT_BODY),
+            anchor="w",
+            justify="left",
+            wraplength=int(440 * s),
+        ).grid(row=1, column=1, sticky="w", pady=(int(6 * s), 0))
+
+        row = tk.Frame(self, bg=p.surface, bd=0, highlightthickness=0)
+        row.pack(fill="x", padx=int(20 * s), pady=(0, int(16 * s)))
+        self._buttons: list[tk.Widget] = []
+        for index, label in enumerate(buttons):
+            is_default = index == len(buttons) - 1
+            if is_default:
+                btn = PrimaryButton(
+                    row,
+                    text=label,
+                    command=lambda l=label: self._choose(l),
+                    padx=int(18 * s),
+                    pady=int(2 * s),
+                    font=(FONT_UI, PT_BODY, "bold"),
+                )
+                btn.apply_palette(p)
+            else:
+                btn = ttk.Button(
+                    row,
+                    text=label,
+                    style="Secondary.TButton",
+                    command=lambda l=label: self._choose(l),
+                )
+            btn.pack(side="right", padx=(int(8 * s), 0))
+            self._buttons.append(btn)
+
+        self.bind("<Return>", lambda e: self._choose(buttons[-1]))
+        self.bind("<KP_Enter>", lambda e: self._choose(buttons[-1]))
+        self.bind("<Escape>", lambda e: self._choose(self._cancel_label))
+        self.protocol("WM_DELETE_WINDOW", lambda: self._choose(self._cancel_label))
+
+        self.update_idletasks()
+        self._center_over(parent)
+        apply_windows_titlebar(self, dark=(current_mode() == DARK_MODE))
+        self.deiconify()
+        try:
+            self._buttons[0].focus_set()
+        except (tk.TclError, IndexError):
+            pass
+
+    def _center_over(self, parent: tk.Misc) -> None:
+        try:
+            top = parent.winfo_toplevel()
+            px_, py_ = top.winfo_rootx(), top.winfo_rooty()
+            pw, ph = top.winfo_width(), top.winfo_height()
+            if pw < 50 or ph < 50:
+                raise tk.TclError
+        except tk.TclError:
+            left, top_, aw, ah = available_workarea(self)
+            px_, py_, pw, ph = left, top_, aw, ah
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        left, top_, aw, ah = available_workarea(self)
+        x = min(max(left, px_ + (pw - w) // 2), left + aw - w)
+        y = min(max(top_, py_ + (ph - h) // 2), top_ + ah - h)
+        self.geometry(f"+{x}+{y}")
+
+    def _choose(self, label: str) -> None:
+        self.result = label
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+
+    def run(self) -> str | None:
+        """Block (modal) until a button is pressed; return its label."""
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.wait_window(self)
+        return self.result
+
+
+def _parent_alive(parent) -> bool:
+    try:
+        return parent is not None and bool(parent.winfo_exists())
+    except tk.TclError:
+        return False
+
+
+def _message(parent, title, message, kind, buttons=("OK",), cancel_label=None):
+    if not _parent_alive(parent):
+        from tkinter import messagebox
+
+        if kind == "question":
+            return "Yes" if messagebox.askyesno(title, message) else "No"
+        {"error": messagebox.showerror, "warning": messagebox.showwarning}.get(
+            kind, messagebox.showinfo
+        )(title, message)
+        return "OK"
+    dialog = ThemedDialog(
+        parent, title, message, kind=kind, buttons=buttons, cancel_label=cancel_label
+    )
+    return dialog.run()
+
+
+def show_info(parent, title: str, message: str) -> None:
+    _message(parent, title, message, "info")
+
+
+def show_warning(parent, title: str, message: str) -> None:
+    _message(parent, title, message, "warning")
+
+
+def show_error(parent, title: str, message: str) -> None:
+    _message(parent, title, message, "error")
+
+
+def ask_yes_no(parent, title: str, message: str) -> bool:
+    return _message(parent, title, message, "question", buttons=("No", "Yes"), cancel_label="No") == "Yes"

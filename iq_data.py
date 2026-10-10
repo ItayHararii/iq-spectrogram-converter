@@ -1,19 +1,61 @@
 import argparse
 import gc
 import json
+import math
 import os
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from scipy.fft import fft
-from scipy.signal import get_window
 import soundfile as sf
+
+# matplotlib and scipy are imported on first use (see _plt / _fft / _get_window).
+# Importing them here costs about a second before the GUI window can appear.
+_plt_mod = None
+_fft_fn = None
+_get_window_fn = None
+
+
+def _plt():
+    global _plt_mod
+    if _plt_mod is None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        _plt_mod = plt
+    return _plt_mod
+
+
+def _fft():
+    global _fft_fn
+    if _fft_fn is None:
+        from scipy.fft import fft
+
+        _fft_fn = fft
+    return _fft_fn
+
+
+def _get_window():
+    global _get_window_fn
+    if _get_window_fn is None:
+        from scipy.signal.windows import get_window
+
+        _get_window_fn = get_window
+    return _get_window_fn
+
+
+def preload_engine():
+    """Import the heavy numeric and plotting modules (safe from a worker thread)."""
+    _fft()
+    _get_window()
+    _plt()
+
+
+class ConversionCancelled(Exception):
+    """Raised by process_file when cancel_event is set."""
 
 
 # Display grid cap: PNG is 12x8 in at 125 dpi. Full STFT (e.g. 32k x 9k)
@@ -112,7 +154,7 @@ def _blackmanharris_window(n_fft):
 
     0 dBFS is a complex IQ tone x[n] = exp(jωn) with |a|=1 (WAV FS = ±1.0).
     """
-    win64 = np.asarray(get_window("blackmanharris", n_fft, fftbins=True), dtype=np.float64)
+    win64 = np.asarray(_get_window()("blackmanharris", n_fft, fftbins=True), dtype=np.float64)
     wsum = float(win64.sum())
     scale = np.float32(1.0 / max(wsum, 1e-20))
     enbw_bins = float(n_fft) * float(np.dot(win64, win64)) / max(wsum * wsum, 1e-30)
@@ -135,7 +177,7 @@ def _stft_power(iq, n_fft, hop, window, scale):
     windowed = np.multiply(frame_view, window, dtype=np.complex64)
     del frame_view
     workers = -1 if n_frames * n_fft >= 65536 else 1
-    spec = fft(windowed, n=n_fft, axis=1, workers=workers, overwrite_x=True)
+    spec = _fft()(windowed, n=n_fft, axis=1, workers=workers, overwrite_x=True)
     if spec is not windowed:
         del windowed
     power = spec.real * spec.real + spec.imag * spec.imag
@@ -357,23 +399,57 @@ def _auto_db_limits(power_db):
     return vmin - pad, vmax + pad
 
 
-def _save_spectrogram_png(fig, output_dir, out_name):
+def _write_denied(exc):
+    err = str(exc).lower()
+    winerr = getattr(exc, "winerror", None)
+    return isinstance(exc, PermissionError) or winerr in (5, 32) or "denied" in err or "being used" in err
+
+
+def _save_spectrogram_png(fig, output_dir, out_name, cancel_event=None):
+    """Render to a temporary file in the output folder, then move it into place.
+
+    A cancelled or failed render never leaves a half-written PNG that looks
+    finished, and an existing PNG is replaced only once the new one is complete.
+    A cancel that arrives while the PNG is being encoded is still honoured: the
+    temp file is removed and nothing is moved into place.
+    """
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, out_name)
+    # Short temp name: a 200+ character stem must not push the temp path past MAX_PATH.
+    tmp_path = os.path.join(output_dir, f".iq_{os.getpid()}_{time.time_ns() % 1_000_000}.part.png")
     try:
-        fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
-    except PermissionError as exc:
-        raise PermissionError(
-            f"Cannot write {out_name}. Close the PNG if it is open in another app, then try again."
-        ) from exc
+        fig.savefig(tmp_path, dpi=SAVE_DPI, bbox_inches="tight")
+        if cancel_event is not None and cancel_event.is_set():
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise ConversionCancelled("Conversion cancelled.")
+        os.replace(tmp_path, out_path)
     except OSError as exc:
-        err = str(exc).lower()
-        winerr = getattr(exc, "winerror", None)
-        if winerr in (5, 32) or "denied" in err or "being used" in err:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        if _write_denied(exc):
             raise PermissionError(
-                f"Cannot write {out_name}. Close the PNG if it is open in another app, then try again."
+                f"Cannot write {out_name}. Close the PNG if it is open in another app, "
+                "check that the output folder is not read-only, then try again."
             ) from exc
         raise
+    return out_path
+
+
+def validate_rbw(rbw):
+    """Return rbw as a positive finite float or raise ValueError with a user message."""
+    try:
+        value = float(rbw)
+    except (TypeError, ValueError):
+        raise ValueError("RBW must be a positive number (Hz).") from None
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("RBW must be a positive number (Hz).")
+    return value
 
 
 def process_file(
@@ -386,10 +462,33 @@ def process_file(
     db_auto=True,
     db_vmin=None,
     db_vmax=None,
+    cancel_event=None,
+    output_name=None,
 ):
+    """Convert one stereo IQ WAV to <output_dir>/<stem>.png and return the PNG path.
+
+    cancel_event: optional threading.Event. When set, the chunk loop stops and
+    ConversionCancelled is raised; no PNG is written.
+    output_name: optional PNG file name (default <input stem>.png). The GUI
+    uses this so two inputs with the same name do not overwrite each other.
+    """
+
     def report(fraction, message):
         if progress_callback is not None:
             progress_callback(max(0.0, min(1.0, fraction)), message)
+
+    def check_cancel():
+        if cancel_event is not None and cancel_event.is_set():
+            raise ConversionCancelled("Conversion cancelled.")
+
+    rbw = validate_rbw(rbw)
+    path = os.fspath(path)
+    output_dir = os.fspath(output_dir)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Input file not found:\n{path}")
+    out_name = str(output_name).strip() if output_name else Path(path).stem + ".png"
+    if not out_name.lower().endswith(".png"):
+        out_name += ".png"
 
     t0 = time.perf_counter()
     try:
@@ -401,6 +500,7 @@ def process_file(
     freq_smooth = bool(freq_smooth)
     db_auto = bool(db_auto)
 
+    check_cancel()
     report(0.02, "Opening WAV…")
     try:
         snd = sf.SoundFile(path)
@@ -466,6 +566,7 @@ def process_file(
         frames_done = 0
 
         while True:
+            check_cancel()
             remaining = n_samples - snd.tell()
             if remaining > 0:
                 chunk = snd.read(min(read_size, remaining), dtype="float32", always_2d=True)
@@ -527,6 +628,7 @@ def process_file(
     if frames_done < 1:
         raise ValueError("No STFT frames were produced from this file.")
 
+    check_cancel()
     report(0.86, "Scaling power…")
     # Full-resolution Welch mean and max-hold (not the downsampled display grid).
     mean_lin = (sum_1d / max(frames_done, 1)).astype(np.float32)
@@ -552,8 +654,11 @@ def process_file(
         if vmin is not None and vmax is not None and vmax <= vmin:
             vmin, vmax = vmax, vmin
 
+    check_cancel()
     report(0.90, "Rendering spectrum + spectrogram…")
+    plt = _plt()
     fig = None
+    out_path = None
     f_scale, f_unit = _axis_units(axis_meta["fs"])
     f_max = (axis_meta["fs"] / 2.0) / f_scale
     duration_s = float(axis_meta["duration_s"])
@@ -642,9 +747,9 @@ def process_file(
         cbar = fig.colorbar(im, ax=[ax_spec, ax_wf], fraction=0.046, pad=0.04)
         cbar.set_label("dBFS/bin")
         del power_db, peak_db, mean_db
-        out_name = Path(path).stem + ".png"
+        check_cancel()
         report(0.95, "Saving PNG…")
-        _save_spectrogram_png(fig, output_dir, out_name)
+        out_path = _save_spectrogram_png(fig, output_dir, out_name, cancel_event)
         print(f"  Saved          : {out_name}")
         print("  Layout         : spectrum + spectrogram")
         if peak_val is not None and peak_freq_hz is not None:
@@ -661,6 +766,7 @@ def process_file(
 
     _update_eta_calibration(raw_est, time.perf_counter() - t0)
     report(1.0, "Done")
+    return out_path
 
 
 if __name__ == "__main__":

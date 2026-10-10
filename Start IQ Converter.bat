@@ -37,7 +37,7 @@ if not exist "venv\Scripts\python.exe" (
 )
 
 echo Checking dependencies...
-"venv\Scripts\python.exe" -c "import numpy, matplotlib, seaborn, scipy, soundfile, PIL" >nul 2>&1
+"venv\Scripts\python.exe" -c "import numpy, matplotlib, scipy, soundfile, PIL" >nul 2>&1
 if errorlevel 1 (
     echo Installing requirements...
     "venv\Scripts\python.exe" -m pip install --upgrade pip

@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -8,29 +9,54 @@ import traceback
 import tkinter as tk
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 
-from iq_data import estimate_conversion_seconds, process_file, wav_info
 from iq_theme import (
     DARK_MODE,
     FONT_LOG,
     FONT_UI,
     LIGHT_MODE,
+    PT_BODY,
+    PT_HEADER,
+    PT_SMALL,
     PrimaryButton,
     ThemeToggle,
     Tooltip,
     apply_option_db,
     apply_ttk_styles,
     apply_windows_titlebar,
+    ask_yes_no,
     color_combobox_popdown,
     current_mode,
     current_palette,
     fit_window_to_screen,
     hook_combobox_popdown,
     normalize_theme,
+    px,
     set_current_mode,
+    show_error,
+    show_info,
+    show_warning,
     theme_toggle_tooltip,
 )
+
+# iq_data pulls in numpy, soundfile, and (lazily) scipy + matplotlib. It is
+# imported in a background thread after the window is on screen, and on first
+# use if a file is picked before that finishes.
+_engine_mod = None
+_engine_lock = threading.Lock()
+
+
+def engine():
+    """Return the iq_data module, importing it on first use."""
+    global _engine_mod
+    if _engine_mod is None:
+        with _engine_lock:
+            if _engine_mod is None:
+                import iq_data
+
+                _engine_mod = iq_data
+    return _engine_mod
 
 try:
     from PIL import Image, ImageTk
@@ -49,8 +75,10 @@ except Exception:
     _HAS_DND = False
 
 
-__version__ = "1.3.0"
-APP_NAME = "SENSORZ IQ Spectrogram Converter"
+__version__ = "1.4.0"
+# Sister application of "CRFS IQ Recorder" (same product family, same Sensorz icon).
+APP_NAME = "CRFS IQ Spectrogram Converter"
+COMPANY_NAME = "Sensorz"
 
 
 def app_dir() -> Path:
@@ -118,9 +146,74 @@ RBW_PRESETS = [
 ]
 
 STATUS_READY = "Ready"
+STATUS_LOADING = "Loading engine…"
 STATUS_CONVERTING = "Converting…"
 STATUS_SAVED = "Image saved"
+STATUS_CANCELLED = "Cancelled"
+STATUS_FAILED = "Conversion failed"
 RBW_TOOLTIP = "Lower values show finer frequency detail. Higher values process faster."
+
+
+def parse_drop_paths(data):
+    """Split a tkdnd <<Drop>> string into paths.
+
+    tkdnd hands over a Tcl list: items with spaces are wrapped in braces
+    (`{C:/My Files/a.wav} C:/b.wav`), and a literal brace or space may be
+    backslash-escaped. This is a pure-Python equivalent of `tk.splitlist` so
+    it can be unit-tested without a Tk root.
+    """
+    text = str(data or "")
+    items = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "{":
+            depth = 1
+            j = i + 1
+            buf = []
+            while j < n and depth:
+                c = text[j]
+                if c == "\\" and j + 1 < n:
+                    buf.append(text[j + 1])
+                    j += 2
+                    continue
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+                buf.append(c)
+                j += 1
+            items.append("".join(buf))
+            i = j
+            continue
+        buf = []
+        while i < n and not text[i].isspace():
+            if text[i] == "\\" and i + 1 < n:
+                buf.append(text[i + 1])
+                i += 2
+                continue
+            buf.append(text[i])
+            i += 1
+        items.append("".join(buf))
+    return [item for item in items if item]
+
+
+def unique_output_names(wav_paths):
+    """PNG names for a batch; equal stems from different folders get (2), (3), ..."""
+    names = []
+    seen = {}
+    for path in wav_paths:
+        stem = Path(path).stem
+        count = seen.get(stem.casefold(), 0) + 1
+        seen[stem.casefold()] = count
+        names.append(f"{stem}.png" if count == 1 else f"{stem} ({count}).png")
+    return names
 
 
 def settings_path() -> Path:
@@ -216,6 +309,13 @@ class IQConverterGUI(_TkBase):
         super().__init__()
         self.title(APP_NAME)
         self.resizable(True, True)
+        # Test hook: IQ_GUI_TK_SCALING=2.0 simulates a 150 % display (points per pixel * 1.5).
+        forced_scaling = os.environ.get("IQ_GUI_TK_SCALING")
+        if forced_scaling:
+            try:
+                self.tk.call("tk", "scaling", float(forced_scaling))
+            except (tk.TclError, ValueError):
+                pass
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar(value=str(DEFAULT_OUTPUT))
@@ -238,6 +338,13 @@ class IQConverterGUI(_TkBase):
         self._last_png_path = None
         self._converting = False
         self._closing = False
+        self._cancel_event = threading.Event()
+        self._cancel_requested = False
+        self._ui_queue = queue.Queue()
+        self._pump_job = None
+        self._engine_ready = False
+        self._engine_error = None
+        self._inspect_token = 0
         self._progress_fraction = 0.0
         self._progress_stage = ""
         self._convert_started_at = 0.0
@@ -257,6 +364,7 @@ class IQConverterGUI(_TkBase):
         self._cards = []
         self._tooltips = []
         self._display_open = False
+        self._status_kind = "idle"
         self._style = ttk.Style(self)
 
         self._load_settings()
@@ -274,8 +382,73 @@ class IQConverterGUI(_TkBase):
         self.bind("<Escape>", self._on_escape_key)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._enable_drag_drop()
-        fit_window_to_screen(self, 840, 700, min_width=640, min_height=520)
+        self._fit_to_screen()
+        self._set_status(STATUS_LOADING, "busy")
+        self._pump_ui_queue()
+        # Heavy imports (numpy, soundfile, scipy, matplotlib) load after the first paint.
+        self.after(30, self._start_engine_preload)
         self._on_input_changed()
+
+    def _fit_to_screen(self):
+        """Open at the Recorder's proportions; never smaller than the controls need."""
+        self.update_idletasks()
+        req_w = int(self.winfo_reqwidth())
+        req_h = int(self.winfo_reqheight())
+        self._min_height = max(px(self, 480), req_h)
+        fit_window_to_screen(
+            self,
+            max(px(self, 840), req_w),
+            max(px(self, 700), req_h + px(self, 170)),
+            min_width=max(px(self, 640), req_w),
+            min_height=self._min_height,
+        )
+
+    def _ensure_height_for_display(self):
+        """Raise the minimum height (and grow if needed) while Display is open."""
+        try:
+            self.update_idletasks()
+            from iq_theme import available_workarea
+
+            _left, _top, _aw, ah = available_workarea(self)
+            need = min(int(self.winfo_reqheight()), max(200, ah - 24))
+            min_w, _min_h = self.minsize()
+            self.minsize(min_w, max(self._min_height, need))
+            if int(self.winfo_height()) < need:
+                self.geometry(f"{self.winfo_width()}x{need}")
+        except tk.TclError:
+            pass
+
+    def _restore_min_height(self):
+        try:
+            min_w, _min_h = self.minsize()
+            self.minsize(min_w, self._min_height)
+        except (tk.TclError, AttributeError):
+            pass
+
+    # ----- engine (iq_data) -------------------------------------------------
+    def _start_engine_preload(self):
+        if self._closing or not self._alive() or self._engine_ready:
+            return
+        threading.Thread(target=self._engine_preload_worker, daemon=True).start()
+
+    def _engine_preload_worker(self):
+        try:
+            engine().preload_engine()
+        except Exception as exc:  # pragma: no cover - import problems are fatal anyway
+            self._safe_after(self._on_engine_failed, f"{exc.__class__.__name__}: {exc}")
+            return
+        self._safe_after(self._on_engine_ready)
+
+    def _on_engine_ready(self):
+        self._engine_ready = True
+        if not self._converting and self._status_kind == "busy":
+            self._set_status(STATUS_READY, "idle")
+        self._on_input_changed()
+
+    def _on_engine_failed(self, text):
+        self._engine_error = text
+        self._set_status("Engine failed to load", "bad")
+        self._append_log(f"ERROR: the conversion engine could not be loaded: {text}")
 
     def theme_mode(self):
         return current_mode()
@@ -339,9 +512,15 @@ class IQConverterGUI(_TkBase):
                 self._version_label.configure(bg=p.surface, fg=p.muted)
             except tk.TclError:
                 pass
-        if getattr(self, "_header_rule", None) is not None:
+        for rule in (getattr(self, "_header_rule", None), getattr(self, "_statusbar_rule", None)):
+            if rule is not None:
+                try:
+                    rule.configure(bg=p.border)
+                except tk.TclError:
+                    pass
+        if getattr(self, "_statusbar", None) is not None:
             try:
-                self._header_rule.configure(bg=p.border)
+                self._statusbar.configure(bg=p.surface)
             except tk.TclError:
                 pass
         if getattr(self, "_display_toggle", None) is not None:
@@ -476,12 +655,12 @@ class IQConverterGUI(_TkBase):
                 photos = []
                 for side in (16, 32, 48, 64):
                     resized = img.resize((side, side), Image.Resampling.LANCZOS)
-                    photos.append(ImageTk.PhotoImage(resized))
+                    photos.append(ImageTk.PhotoImage(resized, master=self))
                 if photos:
                     self._window_icon_photo = photos  # keep refs alive
                     self.iconphoto(True, *photos)
             elif ICON_PNG_PATH.is_file():
-                self._window_icon_photo = tk.PhotoImage(file=str(ICON_PNG_PATH))
+                self._window_icon_photo = tk.PhotoImage(master=self, file=str(ICON_PNG_PATH))
                 self.iconphoto(True, self._window_icon_photo)
         except Exception:
             pass
@@ -499,9 +678,9 @@ class IQConverterGUI(_TkBase):
                 ratio = max_height / img.height
                 size = (max(1, int(img.width * ratio)), max_height)
                 img = img.resize(size, Image.Resampling.LANCZOS)
-                self._logo_photo = ImageTk.PhotoImage(img)
+                self._logo_photo = ImageTk.PhotoImage(img, master=self)
                 return self._logo_photo
-            self._logo_photo = tk.PhotoImage(file=str(ICON_PNG_PATH))
+            self._logo_photo = tk.PhotoImage(master=self, file=str(ICON_PNG_PATH))
             while self._logo_photo.height() > max_height * 2:
                 self._logo_photo = self._logo_photo.subsample(2, 2)
             return self._logo_photo
@@ -592,19 +771,22 @@ class IQConverterGUI(_TkBase):
     def _build_ui(self):
         p = current_palette()
 
+        s = px  # shorthand: s(self, 20) -> 20 CSS px scaled to this screen
+
+        # Header bar: Recorder `headerBar` (surface, 1px bottom border, 20/10/16/10 margins).
         self._header = tk.Frame(self, bg=p.surface, bd=0, highlightthickness=0)
         self._header.pack(fill="x")
         self._header_left = tk.Frame(self._header, bg=p.surface)
-        self._header_left.pack(side="left", padx=(20, 12), pady=10)
+        self._header_left.pack(side="left", padx=(s(self, 20), s(self, 12)), pady=s(self, 10))
         self._header_right = tk.Frame(self._header, bg=p.surface)
-        self._header_right.pack(side="right", padx=(8, 16), pady=10)
+        self._header_right.pack(side="right", padx=(s(self, 8), s(self, 16)), pady=s(self, 10))
 
-        logo = self._load_logo()
+        logo = self._load_logo(max_height=s(self, 32))
         if logo is not None:
             self._logo_label = tk.Label(
                 self._header_left, image=logo, bg=p.surface, bd=0, highlightthickness=0
             )
-            self._logo_label.pack(side="left", padx=(0, 12))
+            self._logo_label.pack(side="left", padx=(0, s(self, 12)))
         else:
             self._logo_label = None
 
@@ -613,7 +795,7 @@ class IQConverterGUI(_TkBase):
             text=APP_NAME,
             bg=p.surface,
             fg=p.text,
-            font=("Segoe UI Semibold", 14),
+            font=(FONT_UI, PT_HEADER, "bold"),
             anchor="w",
         )
         self._title_label.pack(side="left")
@@ -625,60 +807,78 @@ class IQConverterGUI(_TkBase):
             text=f"v{__version__}",
             bg=p.surface,
             fg=p.muted,
-            font=(FONT_UI, 9),
+            font=(FONT_UI, PT_SMALL),
         )
-        self._version_label.pack(side="right", padx=(0, 10))
+        self._version_label.pack(side="right", padx=(0, s(self, 12)))
 
         self._header_rule = tk.Frame(self, bg=p.border, height=1, bd=0, highlightthickness=0)
         self._header_rule.pack(fill="x")
 
-        body = ttk.Frame(self, style="App.TFrame", padding=(20, 14, 20, 12))
+        # Status bar: Recorder QStatusBar (surface, 1px top border, muted bold 12px, size grip).
+        self._statusbar_rule = tk.Frame(self, bg=p.border, height=1, bd=0, highlightthickness=0)
+        self._statusbar_rule.pack(side="bottom", fill="x")
+        self._statusbar = tk.Frame(self, bg=p.surface, bd=0, highlightthickness=0)
+        self._statusbar.pack(side="bottom", fill="x")
+        self.status_label = ttk.Label(
+            self._statusbar, textvariable=self.status_var, style="StatusBar.TLabel"
+        )
+        self.status_label.pack(side="left", padx=(s(self, 16), s(self, 8)), pady=s(self, 5))
+        try:
+            ttk.Sizegrip(self._statusbar, style="App.TSizegrip").pack(side="right", anchor="se")
+        except tk.TclError:
+            pass
+
+        body = ttk.Frame(self, style="App.TFrame", padding=(s(self, 16), s(self, 12), s(self, 16), s(self, 12)))
         body.pack(fill="both", expand=True)
 
+        # Files card: Recorder `card` (surface, 1px border, 16/12 padding, 8px spacing).
         files_card = self._make_card(body)
-        files_card.pack(fill="x", pady=(0, 10))
-        files = ttk.Frame(files_card, style="Surface.TFrame", padding=14)
+        files_card.pack(fill="x", pady=(0, s(self, 8)))
+        files = ttk.Frame(files_card, style="Surface.TFrame", padding=(s(self, 16), s(self, 12)))
         files.pack(fill="x")
         files.columnconfigure(0, weight=1)
 
-        ttk.Label(files, text="Choose file", style="Field.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(0, 4)
+        ttk.Label(files, text="Conversion", style="SectionTitle.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        ttk.Label(
+            files,
+            text="Pick a stereo IQ WAV (I left, Q right), where the PNG goes, and the RBW.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, s(self, 8)))
+
+        ttk.Label(files, text="IQ WAV file", style="Field.TLabel").grid(
+            row=2, column=0, sticky="w", pady=(0, s(self, 4))
         )
         self.input_entry = ttk.Entry(files, textvariable=self.input_var, style="App.TEntry")
-        self.input_entry.grid(row=1, column=0, sticky="ew")
+        self.input_entry.grid(row=3, column=0, sticky="ew")
         self.browse_input_btn = ttk.Button(
             files, text="Browse", style="Browse.TButton", command=self.choose_input
         )
-        self.browse_input_btn.grid(row=1, column=1, sticky="e", padx=(10, 0))
+        self.browse_input_btn.grid(row=3, column=1, sticky="e", padx=(s(self, 10), 0))
 
         self.file_info_label = ttk.Label(
             files, textvariable=self.file_info_var, style="Hint.TLabel"
         )
-        self.file_info_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 10))
+        self.file_info_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(s(self, 6), s(self, 10)))
 
         ttk.Label(files, text="Output folder", style="Field.TLabel").grid(
-            row=3, column=0, sticky="w", pady=(0, 4)
+            row=5, column=0, sticky="w", pady=(0, s(self, 4))
         )
         self.output_entry = ttk.Entry(files, textvariable=self.output_var, style="App.TEntry")
-        self.output_entry.grid(row=4, column=0, sticky="ew")
+        self.output_entry.grid(row=6, column=0, sticky="ew")
         self.browse_output_btn = ttk.Button(
             files, text="Browse", style="Browse.TButton", command=self.choose_output
         )
-        self.browse_output_btn.grid(row=4, column=1, sticky="e", padx=(10, 0))
+        self.browse_output_btn.grid(row=6, column=1, sticky="e", padx=(s(self, 10), 0))
 
-        rbw_card = self._make_card(body)
-        rbw_card.pack(fill="x", pady=(0, 10))
-        params = ttk.Frame(rbw_card, style="Surface.TFrame", padding=14)
-        params.pack(fill="x")
-        params.columnconfigure(0, weight=1)
-
-        rbw_row = ttk.Frame(params, style="Surface.TFrame")
-        rbw_row.grid(row=0, column=0, sticky="ew")
+        rbw_row = ttk.Frame(files, style="Surface.TFrame")
+        rbw_row.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(s(self, 12), 0))
         rbw_label = ttk.Label(rbw_row, text="RBW", style="Field.TLabel")
         rbw_label.pack(side="left")
         self.rbw_entry = ttk.Entry(rbw_row, textvariable=self.rbw_var, width=12, style="App.TEntry")
-        self.rbw_entry.pack(side="left", padx=(10, 6))
-        ttk.Label(rbw_row, text="Hz", style="Hint.TLabel").pack(side="left", padx=(0, 14))
+        self.rbw_entry.pack(side="left", padx=(s(self, 10), s(self, 6)))
+        ttk.Label(rbw_row, text="Hz", style="Muted.TLabel").pack(side="left", padx=(0, s(self, 14)))
         self._preset_buttons = []
         for label, value in RBW_PRESETS:
             btn = ttk.Button(
@@ -691,8 +891,8 @@ class IQConverterGUI(_TkBase):
             self._preset_buttons.append(btn)
 
         display_card = self._make_card(body)
-        display_card.pack(fill="x", pady=(0, 10))
-        d_inner = ttk.Frame(display_card, style="Surface.TFrame", padding=(12, 8))
+        display_card.pack(fill="x", pady=(0, s(self, 8)))
+        d_inner = ttk.Frame(display_card, style="Surface.TFrame", padding=(s(self, 16), s(self, 10)))
         d_inner.pack(fill="x")
 
         d_head = ttk.Frame(d_inner, style="Surface.TFrame")
@@ -702,12 +902,14 @@ class IQConverterGUI(_TkBase):
             text="▸  Display",
             bg=p.surface,
             fg=p.text,
-            font=("Segoe UI Semibold", 10),
+            font=(FONT_UI, PT_BODY + 1, "bold"),
             cursor="hand2",
         )
         self._display_toggle.pack(side="left")
         self._display_toggle.bind("<Button-1>", lambda e: self._toggle_display())
-        ttk.Label(d_head, text="advanced", style="Hint.TLabel").pack(side="left", padx=(8, 0))
+        ttk.Label(d_head, text="Colormap, dB scale, open when done", style="Muted.TLabel").pack(
+            side="left", padx=(s(self, 10), 0)
+        )
 
         self._display_body = ttk.Frame(d_inner, style="Surface.TFrame")
 
@@ -769,27 +971,19 @@ class IQConverterGUI(_TkBase):
         self.open_check.pack(side="left")
 
         actions = ttk.Frame(body, style="App.TFrame")
-        actions.pack(fill="x", pady=(2, 10))
+        actions.pack(fill="x", pady=(s(self, 4), s(self, 8)))
 
         self.convert_button = PrimaryButton(actions, text="Convert", command=self.start_conversion)
         self.convert_button.pack(side="left")
 
-        self.open_last_btn = ttk.Button(
+        self.cancel_button = ttk.Button(
             actions,
-            text="Open image",
+            text="Cancel",
             style="Secondary.TButton",
-            command=self.open_last_image,
+            command=self.cancel_conversion,
             state="disabled",
         )
-        self.open_last_btn.pack(side="left", padx=(10, 0))
-
-        self.open_folder_btn = ttk.Button(
-            actions,
-            text="Open output folder",
-            style="Secondary.TButton",
-            command=self.open_output_folder,
-        )
-        self.open_folder_btn.pack(side="left", padx=(10, 0))
+        self.cancel_button.pack(side="left", padx=(s(self, 10), 0))
 
         self.folder_button = ttk.Button(
             actions,
@@ -797,15 +991,29 @@ class IQConverterGUI(_TkBase):
             style="Secondary.TButton",
             command=self.start_folder_conversion,
         )
-        self.folder_button.pack(side="left", padx=(10, 0))
+        self.folder_button.pack(side="left", padx=(s(self, 10), 0))
+
+        self.open_folder_btn = ttk.Button(
+            actions,
+            text="Open output folder",
+            style="Ghost.TButton",
+            command=self.open_output_folder,
+        )
+        self.open_folder_btn.pack(side="right")
+
+        self.open_last_btn = ttk.Button(
+            actions,
+            text="Open image",
+            style="Ghost.TButton",
+            command=self.open_last_image,
+            state="disabled",
+        )
+        self.open_last_btn.pack(side="right", padx=(0, s(self, 10)))
 
         progress_header = ttk.Frame(body, style="App.TFrame")
-        progress_header.pack(fill="x", pady=(4, 4))
-        ttk.Label(progress_header, textvariable=self.status_var, style="Status.TLabel").pack(
-            side="left", anchor="w"
-        )
+        progress_header.pack(fill="x", pady=(s(self, 2), s(self, 4)))
         ttk.Label(progress_header, textvariable=self.time_var, style="Time.TLabel").pack(
-            side="right", anchor="e"
+            side="left", anchor="w"
         )
 
         self.progress = ttk.Progressbar(
@@ -815,9 +1023,9 @@ class IQConverterGUI(_TkBase):
             variable=self.progress_var,
             style="App.Horizontal.TProgressbar",
         )
-        self.progress.pack(fill="x", pady=(0, 10))
+        self.progress.pack(fill="x", pady=(0, s(self, 8)))
 
-        log_frame = ttk.LabelFrame(body, text="  Activity  ", style="Log.TLabelframe", padding=8)
+        log_frame = ttk.LabelFrame(body, text="  Activity  ", style="Log.TLabelframe", padding=s(self, 8))
         log_frame.pack(fill="both", expand=True)
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
@@ -827,17 +1035,20 @@ class IQConverterGUI(_TkBase):
         log_wrap.columnconfigure(0, weight=1)
         log_wrap.rowconfigure(0, weight=1)
 
+        # Recorder QPlainTextEdit#log: log_bg, Consolas 12px, 8px padding.
+        # height=2 keeps the window's minimum size small; pack(expand) gives the
+        # log all remaining space at normal sizes.
         self.log = tk.Text(
             log_wrap,
-            height=5,
+            height=2,
             wrap="word",
             bg=p.log_bg,
             fg=p.log_text,
             insertbackground=p.log_text,
             relief="flat",
-            font=(FONT_LOG, 8),
-            padx=8,
-            pady=6,
+            font=(FONT_LOG, PT_SMALL),
+            padx=s(self, 8),
+            pady=s(self, 6),
             state="disabled",
             highlightthickness=1,
             highlightbackground=p.border,
@@ -849,23 +1060,24 @@ class IQConverterGUI(_TkBase):
         scroll.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scroll.set)
 
-        self.preview_wrap = tk.Frame(log_frame, bg=p.surface, width=200)
-        self.preview_wrap.grid(row=0, column=1, sticky="ns", padx=(8, 0))
+        self._preview_size = (s(self, 188), s(self, 100))
+        self.preview_wrap = tk.Frame(log_frame, bg=p.surface, width=self._preview_size[0] + s(self, 12))
+        self.preview_wrap.grid(row=0, column=1, sticky="ns", padx=(s(self, 8), 0))
         self.preview_wrap.grid_propagate(False)
-        ttk.Label(self.preview_wrap, text="Last image", style="Field.TLabel").pack(anchor="w")
+        ttk.Label(self.preview_wrap, text="Last image", style="Hint.TLabel").pack(anchor="w")
         self.preview_label = tk.Label(
             self.preview_wrap,
             text="No preview yet",
             bg=p.bg,
             fg=p.muted,
-            font=(FONT_UI, 8),
+            font=(FONT_UI, PT_SMALL),
             width=24,
-            height=6,
+            height=2,
             bd=0,
             highlightthickness=1,
             highlightbackground=p.border,
         )
-        self.preview_label.pack(fill="both", expand=True, pady=(6, 0))
+        self.preview_label.pack(fill="both", expand=True, pady=(s(self, 6), 0))
 
         self._busy_widgets = [
             self.convert_button,
@@ -878,6 +1090,7 @@ class IQConverterGUI(_TkBase):
             self.db_auto_check,
             *self._preset_buttons,
         ]
+        self._set_widget_tooltip(self.cancel_button, "Stop the current conversion. No PNG is written for it.")
 
         self._set_widget_tooltip(rbw_label, RBW_TOOLTIP)
         self._set_widget_tooltip(self.rbw_entry, RBW_TOOLTIP)
@@ -908,14 +1121,48 @@ class IQConverterGUI(_TkBase):
         self._apply_db_entry_state()
         self._sync_preset_highlight()
 
+    # ----- status bar -------------------------------------------------------
+    def _set_status(self, text, kind="idle"):
+        """kind: idle | busy | ok | bad (Recorder status colours)."""
+        self._status_kind = kind
+        self.status_var.set(text)
+        style = {
+            "busy": "StatusBarBusy.TLabel",
+            "ok": "StatusBarOk.TLabel",
+            "bad": "StatusBarBad.TLabel",
+        }.get(kind, "StatusBar.TLabel")
+        label = getattr(self, "status_label", None)
+        if label is not None:
+            try:
+                label.configure(style=style)
+            except tk.TclError:
+                pass
+
+    # ----- dialogs (themed, modal) -----------------------------------------
+    def _info(self, title, message):
+        show_info(self, title, message)
+
+    def _warn(self, title, message):
+        show_warning(self, title, message)
+
+    def _error(self, title, message):
+        show_error(self, title, message)
+
+    def _ask(self, title, message):
+        return ask_yes_no(self, title, message)
+
     def _toggle_display(self):
         self._display_open = not self._display_open
         if self._display_open:
             self._display_body.pack(fill="x")
             self._display_toggle.configure(text="▾  Display")
+            if getattr(self, "_min_height", None):
+                self._ensure_height_for_display()
         else:
             self._display_body.pack_forget()
             self._display_toggle.configure(text="▸  Display")
+            if getattr(self, "_min_height", None):
+                self._restore_min_height()
 
     def _sync_preset_highlight(self):
         current = self.rbw_var.get().strip()
@@ -941,12 +1188,36 @@ class IQConverterGUI(_TkBase):
             return False
 
     def _safe_after(self, func, *args):
-        if self._closing or not self._alive():
+        """Run func(*args) on the Tk thread.
+
+        Worker threads must not touch Tk at all (not even winfo_exists), so
+        they enqueue; the main thread drains the queue every 40 ms.
+        """
+        if self._closing:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            self._ui_queue.put((func, args))
+            return
+        if not self._alive():
             return
         try:
             self.after(0, self._run_if_alive, func, *args)
         except tk.TclError:
             pass
+
+    def _pump_ui_queue(self):
+        if self._closing or not self._alive():
+            return
+        for _ in range(200):
+            try:
+                func, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._run_if_alive(func, *args)
+        try:
+            self._pump_job = self.after(40, self._pump_ui_queue)
+        except tk.TclError:
+            self._pump_job = None
 
     def _run_if_alive(self, func, *args):
         if self._closing or not self._alive():
@@ -980,6 +1251,11 @@ class IQConverterGUI(_TkBase):
         if hasattr(self, "convert_button"):
             try:
                 self.convert_button.apply_palette(current_palette())
+            except tk.TclError:
+                pass
+        if hasattr(self, "cancel_button"):
+            try:
+                self.cancel_button.configure(state="normal" if busy else "disabled")
             except tk.TclError:
                 pass
         entry_state = "disabled" if busy else "normal"
@@ -1031,40 +1307,93 @@ class IQConverterGUI(_TkBase):
         self._closing = True
         self._converting = False
         self._job_id += 1
-        if self._timer_job is not None:
-            try:
-                self.after_cancel(self._timer_job)
-            except tk.TclError:
-                pass
-            self._timer_job = None
+        self._inspect_token += 1
+        # Stop the worker's chunk loop; a partial PNG is never left behind.
+        self._cancel_event.set()
+        for job in (self._timer_job, self._pump_job):
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self._timer_job = None
+        self._pump_job = None
         self._save_settings()
         self.destroy()
+
+    def cancel_conversion(self):
+        if not self._converting or self._cancel_requested:
+            return
+        self._cancel_requested = True
+        self._cancel_event.set()
+        self._progress_stage = "Cancelling…"
+        self._set_status("Cancelling…", "busy")
+        self._append_log("Cancel requested. Stopping after the current chunk…")
+        try:
+            self.cancel_button.configure(state="disabled")
+        except tk.TclError:
+            pass
 
     def _on_rbw_changed(self):
         self._sync_preset_highlight()
         if self._converting:
             return
-        self._update_estimate_preview()
+        self._schedule_inspect()
 
     def _on_input_changed(self):
         if self._converting:
             return
-        self._update_file_info()
-        self._update_estimate_preview()
+        self._schedule_inspect()
 
-    def _update_file_info(self):
-        path = Path(self.input_var.get().strip())
-        if not path.is_file():
+    # ----- file inspection (header read + ETA) in a worker thread ----------
+    def _schedule_inspect(self):
+        """Read the WAV header and estimate the run time off the UI thread."""
+        self._inspect_token += 1
+        token = self._inspect_token
+        raw = self.input_var.get().strip()
+        path = Path(raw) if raw else None
+        if path is None or not path.is_file():
             self.file_info_var.set("Drop or browse a stereo IQ WAV to see sample rate, duration, and size.")
             self.file_info_label.configure(style="Hint.TLabel")
+            self.time_var.set("")
             return
         try:
-            info = wav_info(str(path))
+            rbw = float(self.rbw_var.get())
+            if rbw <= 0:
+                rbw = None
+        except ValueError:
+            rbw = None
+        self.file_info_var.set("Reading WAV header…")
+        self.file_info_label.configure(style="Hint.TLabel")
+        threading.Thread(
+            target=self._inspect_worker, args=(str(path), rbw, token), daemon=True
+        ).start()
+
+    def _inspect_worker(self, path, rbw, token):
+        result = {"path": path}
+        try:
+            result["info"] = engine().wav_info(path)
         except Exception as exc:
-            self.file_info_var.set(f"Could not read WAV header: {exc}")
+            result["error"] = str(exc).strip() or exc.__class__.__name__
+        if "info" in result and rbw is not None and result["info"]["channels"] >= 2:
+            try:
+                result["estimate"] = engine().estimate_conversion_seconds(path, rbw)
+            except Exception:
+                pass
+        self._safe_after(self._on_inspect_done, token, result)
+
+    def _on_inspect_done(self, token, result):
+        if token != self._inspect_token or self._converting:
+            return
+        if result["path"] != self.input_var.get().strip():
+            return
+        if "error" in result:
+            self.file_info_var.set(f"Could not read WAV header: {result['error']}")
             self.file_info_label.configure(style="Warn.TLabel")
+            self.time_var.set("")
             return
 
+        info = result["info"]
         channels = info["channels"]
         if channels == 2:
             ch_txt = "stereo"
@@ -1087,9 +1416,12 @@ class IQConverterGUI(_TkBase):
                 + "  ·  ".join(bits[1:])
             )
             self.file_info_label.configure(style="Warn.TLabel")
+            self.time_var.set("")
             return
         self.file_info_var.set("  ·  ".join(bits))
         self.file_info_label.configure(style="Info.TLabel")
+        est = result.get("estimate")
+        self.time_var.set(f"Est. ~{format_duration(est)}" if est else "")
 
     def choose_input(self):
         initial = self._last_input_dir
@@ -1116,17 +1448,20 @@ class IQConverterGUI(_TkBase):
         self.input_var.set(str(path))
         if path.parent.is_dir():
             self._last_input_dir = str(path.parent)
-        self.status_var.set(STATUS_READY)
+        if self._engine_ready and not self._converting:
+            self._set_status(STATUS_READY, "idle")
         self._append_log(f"Input: {path}")
         self._save_settings()
 
     def _on_drop(self, event):
         if self._converting:
             return
-        try:
-            raw_paths = self.tk.splitlist(event.data)
-        except Exception:
-            return
+        raw_paths = parse_drop_paths(getattr(event, "data", ""))
+        if not raw_paths:
+            try:
+                raw_paths = list(self.tk.splitlist(event.data))
+            except Exception:
+                return
         paths = [Path(p) for p in raw_paths]
         wavs = [p for p in paths if p.is_file() and p.suffix.lower() == ".wav"]
         dirs = [p for p in paths if p.is_dir()]
@@ -1137,7 +1472,7 @@ class IQConverterGUI(_TkBase):
         if len(wavs) > 1:
             names = "\n".join(p.name for p in wavs[:8])
             extra = f"\n… and {len(wavs) - 8} more" if len(wavs) > 8 else ""
-            if messagebox.askyesno(
+            if self._ask(
                 "Convert dropped files",
                 f"Convert {len(wavs)} WAV files?\n\n{names}{extra}",
             ):
@@ -1147,40 +1482,23 @@ class IQConverterGUI(_TkBase):
             folder = dirs[0]
             found = list_wavs(folder)
             if not found:
-                messagebox.showinfo("No WAV files", f"No .wav files in:\n{folder}")
+                self._info("No WAV files", f"No .wav files in:\n{folder}")
                 return
-            if messagebox.askyesno(
+            if self._ask(
                 "Convert folder",
                 f"Convert {len(found)} WAV file(s) in:\n{folder}?",
             ):
                 self._last_input_dir = str(folder)
                 self._start_jobs(found)
             return
-
-    def _update_estimate_preview(self):
-        if self._converting:
-            return
-        path = Path(self.input_var.get().strip())
-        if not path.is_file():
-            self.time_var.set("")
-            return
-        try:
-            rbw = float(self.rbw_var.get())
-            if rbw <= 0:
-                raise ValueError
-            est = estimate_conversion_seconds(str(path), rbw)
-            self.time_var.set(f"Est. ~{format_duration(est)}")
-        except Exception:
-            self.time_var.set("")
+        if paths:
+            self._info("Not a WAV file", "Drop a .wav file or a folder that contains .wav files.")
 
     def _parse_rbw(self):
         try:
-            rbw = float(self.rbw_var.get())
-            if rbw <= 0:
-                raise ValueError
-            return rbw
-        except ValueError:
-            messagebox.showerror("Invalid RBW", "RBW must be a positive number.")
+            return engine().validate_rbw(self.rbw_var.get())
+        except ValueError as exc:
+            self._error("Invalid RBW", str(exc))
             return None
 
     def _parse_optional_db(self, raw, label):
@@ -1188,10 +1506,14 @@ class IQConverterGUI(_TkBase):
         if not text:
             return None
         try:
-            return float(text)
+            value = float(text)
         except ValueError:
-            messagebox.showerror("Invalid dB range", f"{label} must be a number.")
+            self._error("Invalid dB range", f"{label} must be a number.")
             return False
+        if value != value or value in (float("inf"), float("-inf")):
+            self._error("Invalid dB range", f"{label} must be a finite number.")
+            return False
+        return value
 
     def _parse_display_options(self):
         cmap = (self.cmap_var.get() or "jet").strip().lower()
@@ -1209,7 +1531,7 @@ class IQConverterGUI(_TkBase):
             if db_vmax is False:
                 return None
             if db_vmin is not None and db_vmax is not None and db_vmax <= db_vmin:
-                messagebox.showerror("Invalid dB range", "dB max must be greater than dB min.")
+                self._error("Invalid dB range", "dB max must be greater than dB min.")
                 return None
         return cmap, freq_smooth, db_auto, db_vmin, db_vmax
 
@@ -1218,30 +1540,34 @@ class IQConverterGUI(_TkBase):
         return Path(raw) if raw else DEFAULT_OUTPUT
 
     def start_conversion(self):
+        if self._converting or self._closing:
+            return
         input_path = Path(self.input_var.get().strip())
         if not input_path.is_file():
-            messagebox.showerror("Invalid file", "Please choose an existing WAV file.")
+            self._error("Invalid file", "Please choose an existing WAV file.")
             return
         if input_path.suffix.lower() != ".wav":
-            messagebox.showerror("Invalid file", "The selected input must be a .wav file.")
+            self._error("Invalid file", "The selected input must be a .wav file.")
             return
         try:
-            info = wav_info(str(input_path))
+            info = engine().wav_info(str(input_path))
         except Exception as exc:
-            messagebox.showerror(
+            self._error(
                 "Invalid WAV",
                 f"Could not read this WAV file (it may be truncated or invalid):\n{exc}",
             )
             return
         if info["channels"] < 2:
-            messagebox.showerror("Need stereo IQ (I left, Q right)", "Need stereo IQ (I left, Q right).")
+            self._error("Need stereo IQ", "Need stereo IQ (I left, Q right).")
             return
         if info["frames"] < 1:
-            messagebox.showerror("Invalid WAV", "WAV file has no samples.")
+            self._error("Invalid WAV", "WAV file has no samples.")
             return
         self._start_jobs([input_path])
 
     def start_folder_conversion(self):
+        if self._converting or self._closing:
+            return
         initial = self._last_input_dir
         if not Path(initial).is_dir():
             initial = str(DEFAULT_INPUT_DIR if DEFAULT_INPUT_DIR.is_dir() else APP_DIR)
@@ -1251,18 +1577,37 @@ class IQConverterGUI(_TkBase):
         folder = Path(selected)
         wavs = list_wavs(folder)
         if not wavs:
-            messagebox.showinfo("No WAV files", f"No .wav files in:\n{folder}")
+            self._info("No WAV files", f"No .wav files in:\n{folder}")
             return
         self._last_input_dir = str(folder)
         self._save_settings()
         self._start_jobs(wavs)
+
+    @staticmethod
+    def _folder_writable(folder):
+        """True if a file can be created in `folder` (catches read-only ACLs early)."""
+        probe = Path(folder) / f".iq_write_test_{os.getpid()}.tmp"
+        try:
+            with open(probe, "wb"):
+                pass
+        except OSError:
+            return False
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+        return True
 
     def _start_jobs(self, wav_paths):
         if self._converting or self._closing:
             return
         wav_paths = [Path(p) for p in wav_paths]
         if not wav_paths:
-            messagebox.showerror("No files", "No WAV files to convert.")
+            self._error("No files", "No WAV files to convert.")
+            return
+        missing = [p for p in wav_paths if not p.is_file()]
+        if missing:
+            self._error("Missing file", f"This file no longer exists:\n{missing[0]}")
             return
 
         rbw = self._parse_rbw()
@@ -1278,23 +1623,35 @@ class IQConverterGUI(_TkBase):
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            messagebox.showerror(
+            self._error(
                 "Output folder",
                 f"Cannot create or write to the output folder:\n{output_dir}\n\n{exc}",
+            )
+            return
+        if not self._folder_writable(output_dir):
+            self._error(
+                "Output folder",
+                f"The output folder is read-only or not writable:\n{output_dir}\n\n"
+                "Choose another folder.",
             )
             return
 
         estimated = 0.0
         for path in wav_paths:
             try:
-                estimated += estimate_conversion_seconds(str(path), rbw)
+                estimated += engine().estimate_conversion_seconds(str(path), rbw)
             except Exception:
                 estimated += 30.0
         estimated = max(2.0, estimated)
 
+        output_names = unique_output_names(wav_paths)
+        jobs = list(zip(wav_paths, output_names))
+
         self._job_id += 1
         job_id = self._job_id
         self._converting = True
+        self._cancel_requested = False
+        self._cancel_event = threading.Event()
         self._progress_fraction = 0.0
         self._last_display_fraction = 0.0
         self._progress_stage = "Starting…"
@@ -1308,7 +1665,7 @@ class IQConverterGUI(_TkBase):
         self._job_db_vmax = db_vmax
         self.progress_var.set(0)
         self._set_busy(True)
-        self.status_var.set(STATUS_CONVERTING)
+        self._set_status(STATUS_CONVERTING, "busy")
         self.time_var.set(f"Elapsed 0:00 · Est. {format_duration(estimated)} remaining")
         self._append_log("-" * 48)
         if len(wav_paths) == 1:
@@ -1320,13 +1677,16 @@ class IQConverterGUI(_TkBase):
             f"Display: {cmap}  ·  freq smooth {'on' if freq_smooth else 'off'}  ·  "
             + ("auto dB" if db_auto else "manual dB")
         )
+        renamed = [(p.name, n) for p, n in jobs if n != f"{p.stem}.png"]
+        for src, name in renamed:
+            self._append_log(f"Note: {src} has the same name as another file; saving as {name}")
         self._append_log(f"Estimated time: ~{format_duration(estimated)}")
         self._save_settings()
         self._schedule_timer()
 
         thread = threading.Thread(
             target=self._convert_worker,
-            args=(wav_paths, output_dir, rbw, job_id),
+            args=(jobs, output_dir, rbw, job_id, self._cancel_event),
             daemon=True,
         )
         thread.start()
@@ -1364,7 +1724,8 @@ class IQConverterGUI(_TkBase):
         else:
             remaining = max(1.0, self._estimated_total_s - elapsed)
 
-        self.status_var.set(STATUS_CONVERTING)
+        if not self._cancel_requested:
+            self._set_status(STATUS_CONVERTING, "busy")
         stage = self._progress_stage or "Working…"
         self.time_var.set(
             f"{stage} · Elapsed {format_duration(elapsed)} · Est. {format_duration(remaining)} remaining"
@@ -1380,14 +1741,19 @@ class IQConverterGUI(_TkBase):
         self._progress_fraction = max(self._progress_fraction, fraction)
         self._progress_stage = message
 
-    def _convert_worker(self, wav_paths, output_dir, rbw, job_id):
+    def _convert_worker(self, jobs, output_dir, rbw, job_id, cancel_event):
         ok = []
         failed = []
-        n = len(wav_paths)
+        cancelled = False
+        n = len(jobs)
+        mod = engine()
 
-        for i, input_path in enumerate(wav_paths):
+        for i, (input_path, out_name) in enumerate(jobs):
             if self._closing or job_id != self._job_id:
                 return
+            if cancel_event.is_set():
+                cancelled = True
+                break
 
             buffer = io.StringIO()
 
@@ -1403,7 +1769,7 @@ class IQConverterGUI(_TkBase):
 
             try:
                 with redirect_stdout(buffer), redirect_stderr(buffer):
-                    process_file(
+                    result = mod.process_file(
                         str(input_path),
                         str(output_dir),
                         rbw,
@@ -1413,13 +1779,15 @@ class IQConverterGUI(_TkBase):
                         db_auto=self._job_db_auto,
                         db_vmin=self._job_db_vmin,
                         db_vmax=self._job_db_vmax,
+                        cancel_event=cancel_event,
+                        output_name=out_name,
                     )
 
                 details = buffer.getvalue().strip()
                 if details:
                     self._safe_after(self._append_log, details)
 
-                png_path = output_dir / f"{input_path.stem}.png"
+                png_path = Path(result) if result else output_dir / out_name
                 if not png_path.is_file():
                     failed.append((input_path.name, f"Expected image was not found:\n{png_path}"))
                     self._safe_after(
@@ -1430,6 +1798,10 @@ class IQConverterGUI(_TkBase):
 
                 ok.append(png_path)
 
+            except mod.ConversionCancelled:
+                cancelled = True
+                self._safe_after(self._append_log, f"Cancelled: {input_path.name} (no PNG written)")
+                break
             except Exception as exc:
                 details = buffer.getvalue().strip()
                 tech = traceback.format_exc()
@@ -1442,7 +1814,7 @@ class IQConverterGUI(_TkBase):
 
         if self._closing or job_id != self._job_id:
             return
-        self._safe_after(self._conversion_finished, ok, failed)
+        self._safe_after(self._conversion_finished, ok, failed, cancelled)
 
     def _stop_timer(self):
         self._converting = False
@@ -1453,14 +1825,17 @@ class IQConverterGUI(_TkBase):
                 pass
             self._timer_job = None
 
-    def _conversion_finished(self, ok, failed):
+    def _conversion_finished(self, ok, failed, cancelled=False):
         if not self._alive():
             return
         elapsed = time.monotonic() - self._convert_started_at
         estimated = self._estimated_total_s
         self._stop_timer()
+        self._cancel_requested = False
         self._set_busy(False)
         self._save_settings()
+        # Refresh header info / ETA now that controls are enabled again.
+        self._schedule_inspect()
 
         timing = self._format_run_timing(elapsed, estimated)
         if ok:
@@ -1471,11 +1846,23 @@ class IQConverterGUI(_TkBase):
             except tk.TclError:
                 pass
 
+        if cancelled:
+            self.progress_var.set(0)
+            if ok:
+                self._set_status(f"{STATUS_CANCELLED} — {len(ok)} file(s) finished first", "idle")
+                for png_path in ok:
+                    self._append_log(f"Saved spectrum + spectrogram: {png_path}")
+            else:
+                self._set_status(STATUS_CANCELLED, "idle")
+            self.time_var.set(f"Cancelled after {format_duration(elapsed)}")
+            self._append_log("Conversion cancelled.")
+            return
+
         if ok and not failed:
             self.progress_var.set(100)
             if len(ok) == 1:
                 png_path = ok[0]
-                self.status_var.set(f"{STATUS_SAVED} — {png_path.name}")
+                self._set_status(f"{STATUS_SAVED} — {png_path.name}", "ok")
                 self.time_var.set(timing)
                 self._append_log(f"Saved spectrum + spectrogram: {png_path}")
                 self._append_log(timing)
@@ -1483,17 +1870,17 @@ class IQConverterGUI(_TkBase):
                     try:
                         os.startfile(png_path)
                     except OSError as exc:
-                        messagebox.showwarning(
+                        self._warn(
                             "Image created",
                             f"The PNG was created, but Windows could not open it automatically.\n\n{exc}",
                         )
             else:
-                self.status_var.set(f"{STATUS_SAVED} — {len(ok)} files")
+                self._set_status(f"{STATUS_SAVED} — {len(ok)} files", "ok")
                 self.time_var.set(timing)
                 for png_path in ok:
                     self._append_log(f"Saved spectrum + spectrogram: {png_path}")
                 self._append_log(f"Batch complete: {len(ok)} files. {timing}")
-                messagebox.showinfo(
+                self._info(
                     "Batch complete",
                     f"Converted {len(ok)} files to:\n{ok[0].parent}",
                 )
@@ -1501,21 +1888,21 @@ class IQConverterGUI(_TkBase):
 
         if ok and failed:
             self.progress_var.set(100)
-            self.status_var.set(f"{STATUS_SAVED} — {len(ok)} ok, {len(failed)} failed")
+            self._set_status(f"{STATUS_SAVED} — {len(ok)} ok, {len(failed)} failed", "bad")
             self.time_var.set(timing)
             for png_path in ok:
                 self._append_log(f"Saved spectrum + spectrogram: {png_path}")
             self._append_log(timing)
-            messagebox.showwarning("Batch finished with errors", self._batch_summary(ok, failed))
+            self._warn("Batch finished with errors", self._batch_summary(ok, failed))
             return
 
         self.progress_var.set(0)
-        self.status_var.set("Conversion failed.")
+        self._set_status(STATUS_FAILED, "bad")
         self.time_var.set("")
         if len(failed) == 1:
-            messagebox.showerror("Conversion failed", failed[0][1])
+            self._error("Conversion failed", failed[0][1])
         else:
-            messagebox.showerror("Conversion failed", self._batch_summary(ok, failed))
+            self._error("Conversion failed", self._batch_summary(ok, failed))
 
     def _format_run_timing(self, elapsed, estimated):
         if elapsed < 60:
@@ -1531,23 +1918,24 @@ class IQConverterGUI(_TkBase):
         if Image is None or ImageTk is None or not png_path.is_file():
             return
         try:
+            w, h = getattr(self, "_preview_size", (188, 100))
             img = Image.open(png_path)
-            img.thumbnail((188, 100), Image.Resampling.LANCZOS)
-            photo = ImageTk.PhotoImage(img)
+            img.thumbnail((w, h), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(img, master=self)
             self._preview_photo = photo
-            self.preview_label.configure(image=photo, text="", width=188, height=100)
+            self.preview_label.configure(image=photo, text="", width=w, height=h)
         except Exception:
             pass
 
     def open_last_image(self):
         path = self._last_png_path
         if path is None or not Path(path).is_file():
-            messagebox.showinfo("No image yet", "Convert a file first, then you can open the last PNG.")
+            self._info("No image yet", "Convert a file first, then you can open the last PNG.")
             return
         try:
             os.startfile(path)
         except OSError as exc:
-            messagebox.showerror("Open image", f"Windows could not open:\n{path}\n\n{exc}")
+            self._error("Open image", f"Windows could not open:\n{path}\n\n{exc}")
 
     def _batch_summary(self, ok, failed):
         lines = [f"Converted {len(ok)} of {len(ok) + len(failed)} files."]
@@ -1565,15 +1953,57 @@ class IQConverterGUI(_TkBase):
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            messagebox.showerror("Output folder", f"Cannot open the output folder:\n{exc}")
+            self._error("Output folder", f"Cannot open the output folder:\n{exc}")
             return
         try:
             os.startfile(output_dir)
         except OSError as exc:
-            messagebox.showerror("Output folder", f"Windows could not open:\n{output_dir}\n\n{exc}")
+            self._error("Output folder", f"Windows could not open:\n{output_dir}\n\n{exc}")
 
 
-if __name__ == "__main__":
+def run_headless(argv):
+    """`--input file.wav [--output dir] [--rbw hz] [--log file]`: convert without a window.
+
+    Used by the packaged EXE for scripted runs and by the QA suite to prove the
+    bundle converts on a machine without Python. Exit code 0 on success.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog=APP_NAME, add_help=True)
+    parser.add_argument("--input", required=True, help="Stereo IQ WAV file")
+    parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="Output folder")
+    parser.add_argument("--rbw", default="15000", help="Resolution bandwidth in Hz")
+    parser.add_argument("--cmap", default="jet")
+    parser.add_argument("--log", default=None, help="Write the conversion log to this file")
+    args = parser.parse_args(argv)
+
+    buffer = io.StringIO()
+    code = 0
+    try:
+        with redirect_stdout(buffer), redirect_stderr(buffer):
+            out = engine().process_file(args.input, args.output, args.rbw, cmap=args.cmap)
+        buffer.write(f"OK {out}\n")
+    except Exception as exc:
+        buffer.write(f"ERROR {user_error_text(exc)}\n{traceback.format_exc()}")
+        code = 1
+    text = buffer.getvalue()
+    if args.log:
+        try:
+            Path(args.log).write_text(text, encoding="utf-8")
+        except OSError:
+            pass
+    if sys.stdout is not None:
+        try:
+            sys.stdout.write(text)
+        except (OSError, ValueError):
+            pass
+    return code
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--input" in argv:
+        return run_headless(argv)
     # Must run before Tk root exists so the taskbar groups under our icon, not pythonw.exe.
     set_app_user_model_id()
     enable_dpi_awareness()
@@ -1584,3 +2014,8 @@ if __name__ == "__main__":
         pass
     app = IQConverterGUI()
     app.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
