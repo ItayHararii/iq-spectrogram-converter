@@ -62,6 +62,10 @@ class ConversionCancelled(Exception):
 # does not need to sit in RAM or be sent to the renderer.
 MAX_FREQ_BINS = 2048
 MAX_TIME_BINS = 1536
+# Largest FFT the engine will run. 2^24 bins is 128 MB of float64 window plus
+# a 256 MB framed block; anything finer gives no visible benefit on a 2048-bin
+# display and risks MemoryError on an ordinary laptop.
+MAX_N_FFT = 2**24
 SMOOTH_TAPS = 5
 FIGSIZE = (12.0, 8.0)
 SPECTRUM_HEIGHT_RATIO = 1
@@ -464,6 +468,7 @@ def process_file(
     db_vmax=None,
     cancel_event=None,
     output_name=None,
+    stats=None,
 ):
     """Convert one stereo IQ WAV to <output_dir>/<stem>.png and return the PNG path.
 
@@ -471,6 +476,10 @@ def process_file(
     ConversionCancelled is raised; no PNG is written.
     output_name: optional PNG file name (default <input stem>.png). The GUI
     uses this so two inputs with the same name do not overwrite each other.
+    stats: optional dict. When given it is filled with the numbers behind the
+    image (fs, n_fft, frames, true RBW, peak/floor dBFS, full-resolution
+    spectra and the pooled waterfall grid) so tests can check the DSP against
+    independent expectations instead of inspecting pixels.
     """
 
     def report(fraction, message):
@@ -520,8 +529,27 @@ def process_file(
         n_fft = _n_fft(fs, rbw)
         hop = max(n_fft // 2, 1)
         n_frames = _n_stft_frames(n_samples, n_fft, hop)
+
+        # Validate before allocating anything sized by n_fft. A 1 Hz RBW on a
+        # 125 MHz recording would otherwise build a 2 GB window only to fail.
+        if n_channels < 2:
+            raise ValueError("Need stereo IQ (I left, Q right).")
+        if n_samples < 1:
+            raise ValueError("WAV file has no samples.")
+        if n_fft > MAX_N_FFT:
+            min_rbw = 2.0 * fs / MAX_N_FFT
+            raise ValueError(
+                f"RBW {_format_rbw(rbw)} is too fine for a {fs:,.0f} Hz recording "
+                f"(FFT would need {n_fft:,} points). Use an RBW of at least {_format_rbw(min_rbw)}."
+            )
+        if n_frames < 1:
+            raise ValueError(
+                f"File is too short for this RBW (need at least {n_fft:,} samples, have {n_samples:,})."
+            )
+        float_samples = str(getattr(snd, "subtype", "") or "").upper().startswith(("FLOAT", "DOUBLE"))
+
         n_freq_out = _pooled_len(n_fft, MAX_FREQ_BINS)
-        n_time_out = max(1, min(n_frames, MAX_TIME_BINS)) if n_frames else 1
+        n_time_out = max(1, min(n_frames, MAX_TIME_BINS))
         read_size = _block_sample_count(n_fft, hop)
         window, win_scale, enbw_bins = _blackmanharris_window(n_fft)
         df_hz = fs / n_fft
@@ -539,15 +567,6 @@ def process_file(
         print(f"  Display grid   : {n_freq_out} × {n_time_out}")
         print(f"  Colormap       : {cmap}")
         print(f"  Freq smooth    : {'on' if freq_smooth else 'off'}")
-
-        if n_channels < 2:
-            raise ValueError("Need stereo IQ (I left, Q right).")
-        if n_samples < 1:
-            raise ValueError("WAV file has no samples.")
-        if n_frames < 1:
-            raise ValueError(
-                f"File is too short for this RBW (need at least {n_fft:,} samples, have {n_samples:,})."
-            )
 
         # Metadata for axes — extent uses these, not the pooled display shape.
         axis_meta = {
@@ -570,6 +589,10 @@ def process_file(
             remaining = n_samples - snd.tell()
             if remaining > 0:
                 chunk = snd.read(min(read_size, remaining), dtype="float32", always_2d=True)
+                if float_samples and chunk is not None and chunk.shape[0] and not np.isfinite(chunk).all():
+                    # A single NaN or Inf sample in a float WAV would turn every
+                    # bin of its frame, and so the max-hold spectrum, into NaN.
+                    np.nan_to_num(chunk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
                 if chunk is None or chunk.shape[0] == 0:
                     remaining = 0
                     block = leftover
@@ -680,6 +703,31 @@ def process_file(
         peak_val = None
         peak_freq_hz = None
     floor_val = _robust_noise_floor_db(mean_db)
+    if stats is not None:
+        stats.update(
+            {
+                "fs": float(axis_meta["fs"]),
+                "n_samples": int(n_samples),
+                "duration_s": duration_s,
+                "n_fft": int(axis_meta["n_fft"]),
+                "hop": int(hop),
+                "n_frames": int(n_frames),
+                "frames_done": int(frames_done),
+                "df_hz": float(axis_meta["fs"]) / float(axis_meta["n_fft"]),
+                "enbw_bins": float(enbw_bins),
+                "rbw_requested_hz": rbw_req,
+                "rbw_true_hz": rbw_true,
+                "freqs_hz": freqs_hz.copy(),
+                "spectrum_mean_db": mean_db.copy(),
+                "spectrum_peak_db": peak_db.copy(),
+                "waterfall_db": power_db.copy(),
+                "peak_db": peak_val,
+                "peak_freq_hz": peak_freq_hz,
+                "floor_db": floor_val,
+                "vmin": vmin,
+                "vmax": vmax,
+            }
+        )
     try:
         fig, (ax_spec, ax_wf) = plt.subplots(
             2,
@@ -765,6 +813,8 @@ def process_file(
         gc.collect()
 
     _update_eta_calibration(raw_est, time.perf_counter() - t0)
+    if stats is not None:
+        stats["out_path"] = out_path
     report(1.0, "Done")
     return out_path
 

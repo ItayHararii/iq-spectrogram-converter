@@ -75,7 +75,7 @@ except Exception:
     _HAS_DND = False
 
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 # Sister application of "CRFS IQ Recorder" (same product family, same Sensorz icon).
 APP_NAME = "CRFS IQ Spectrogram Converter"
 COMPANY_NAME = "Sensorz"
@@ -386,7 +386,8 @@ class IQConverterGUI(_TkBase):
         self._set_status(STATUS_LOADING, "busy")
         self._pump_ui_queue()
         # Heavy imports (numpy, soundfile, scipy, matplotlib) load after the first paint.
-        self.after(30, self._start_engine_preload)
+        # Tracked so a window closed within 30 ms does not fire it on a dead Tk.
+        self._preload_job = self.after(30, self._start_engine_preload)
         self._on_input_changed()
 
     def _fit_to_screen(self):
@@ -427,6 +428,7 @@ class IQConverterGUI(_TkBase):
 
     # ----- engine (iq_data) -------------------------------------------------
     def _start_engine_preload(self):
+        self._preload_job = None
         if self._closing or not self._alive() or self._engine_ready:
             return
         threading.Thread(target=self._engine_preload_worker, daemon=True).start()
@@ -764,7 +766,15 @@ class IQConverterGUI(_TkBase):
         try:
             path = self._settings_path()
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            # Write beside the target and swap it in, so a crash mid-write never
+            # leaves an empty settings file.
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            try:
+                tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                os.replace(tmp, path)
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
         except OSError:
             pass
 
@@ -1310,7 +1320,7 @@ class IQConverterGUI(_TkBase):
         self._inspect_token += 1
         # Stop the worker's chunk loop; a partial PNG is never left behind.
         self._cancel_event.set()
-        for job in (self._timer_job, self._pump_job):
+        for job in (self._timer_job, self._pump_job, getattr(self, "_preload_job", None)):
             if job is not None:
                 try:
                     self.after_cancel(job)
@@ -1318,6 +1328,7 @@ class IQConverterGUI(_TkBase):
                     pass
         self._timer_job = None
         self._pump_job = None
+        self._preload_job = None
         self._save_settings()
         self.destroy()
 

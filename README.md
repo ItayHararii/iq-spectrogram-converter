@@ -1,6 +1,6 @@
 # CRFS IQ Spectrogram Converter
 
-Sister app of the CRFS IQ Recorder (same Sensorz look, light and dark theme, status bar). Current version: 1.4.0.
+Sister app of the CRFS IQ Recorder (same Sensorz look, light and dark theme, status bar). Current version: 1.5.0.
 
 Turns a stereo IQ WAV into a PNG. I must be on the left channel and Q on the right. Mono files and ordinary audio are not supported.
 

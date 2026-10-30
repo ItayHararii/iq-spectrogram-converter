@@ -1,7 +1,7 @@
 # Security notes - CRFS IQ Spectrogram Converter
 
 Why Windows warns when the EXE is opened, what was checked, what was changed,
-and what is still needed. Written for release 1.4.0.
+and what is still needed. Written for release 1.4.0; hash and version updated for 1.5.0 (30 October 2026: Defender 4.18.26100.4, signatures 1.463.34.0, custom scan of the 1.5.0 EXE clean, still unsigned - no certificate on the build PC).
 
 ## Why Windows shows a warning
 
@@ -17,6 +17,21 @@ which is a pattern some antivirus heuristics inspect. Nothing was flagged on
 the build PC (see below), but a different corporate AV may still quarantine
 an unknown unsigned executable. If that happens, send the file hash below to
 the IT team so they can allow-list it, instead of disabling protection.
+
+Three different Windows protections produce three different messages. They
+need different actions, so identify which one is talking before changing
+anything:
+
+| Message | Protection | Meaning | What helps |
+| --- | --- | --- | --- |
+| "Windows protected your PC" with a "More info" link and a "Run anyway" button | SmartScreen (reputation) | Unsigned or new file with no download history. Not a malware verdict. | "Run anyway" once; the app then opens normally. Signing with a trusted certificate removes it. |
+| "Part of this app has been blocked" or "This app has been blocked by Smart App Control", no "Run anyway" | Smart App Control (Windows 11, enforced on new PCs) | The policy refuses to run unsigned apps whose reputation Microsoft's cloud does not already know. There is no per-file override. | Only a signed release or an app that Microsoft's cloud already classifies as safe runs. Turning Smart App Control off is a one-way system setting the user would have to choose; do not ask for it in the field. |
+| Defender notification "Threat found" / the file disappears into quarantine; `Get-MpThreatDetection` lists it | Antivirus detection | A signature or heuristic matched. | Submit the file to Microsoft for analysis, give the SHA-256 to IT for an allow-list entry. Do not disable protection. |
+
+The Recorder's `crfs_iq_recorder/docs/DISTRIBUTION.md` has the full procedure
+(including Controlled folder access, which blocks writes into Documents,
+Desktop and Pictures) and the diagnosis script
+`crfs_iq_recorder/packaging/diagnose_block.ps1`; both apply to this EXE too.
 
 ## What was checked on the build PC (10 October 2026)
 
@@ -80,10 +95,10 @@ Use these details for the current build:
 | --- | --- |
 | Product name | CRFS IQ Spectrogram Converter |
 | Publisher / company | Sensorz |
-| Version | 1.4.0 |
+| Version | 1.5.0 |
 | File name | IQ_Spectrogram_Converter.exe |
-| Size | 69,174,953 bytes (66 MB) |
-| SHA-256 | EE33FCFD1C00417F1D8CB9A0ADBBCA75BA9FEC564DAFC0AF7D1336EF1E20D210 |
+| Size | 69,175,504 bytes (66 MB) |
+| SHA-256 | E6FAF5362F3C999EA15882A4E9F14FD2D76ACB6616F3EA63C1F06F3DD69D1B42 |
 | Build tool | PyInstaller 6.22.0, Python 3.13.14, one-file, windowed, no UPX |
 | What it does | Reads a stereo IQ WAV, computes an STFT, writes a PNG spectrogram. No network access, no installer, no registry changes. Settings are stored in a JSON file next to the EXE and a matplotlib cache under %LOCALAPPDATA%\CRFS IQ Spectrogram Converter. |
 
