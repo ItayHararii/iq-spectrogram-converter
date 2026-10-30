@@ -23,6 +23,16 @@ def block_real_network(monkeypatch):
     monkeypatch.setattr("crfs_iq_recorder.sftp_client.connect_sftp", _blocked_sftp)
 
 
+@pytest.fixture(autouse=True, scope="session")
+def stop_worker_threads_at_exit():
+    """GUI tests leave sensor checks and previews running; finish them before
+    the interpreter deletes their QThreads (Qt would abort with 0xC0000409)."""
+    yield
+    from crfs_iq_recorder.worker_threads import stop_worker_threads
+
+    stop_worker_threads(timeout_s=15.0)
+
+
 @pytest.fixture(autouse=True)
 def reset_demo_sftp():
     from crfs_iq_recorder.demo_sftp import reset_shared_demo_browser

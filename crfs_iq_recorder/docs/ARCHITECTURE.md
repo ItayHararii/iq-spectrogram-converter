@@ -1,6 +1,6 @@
 # CRFS IQ Recorder - architecture
 
-**Version documented:** 1.8.3
+**Version documented:** 1.8.6
 **Code:** `crfs_iq_recorder/` as of this file (21 September 2026)
 **Related app:** IQ Spectrogram Converter (`iq_gui.py`, `iq_data.py`) at the repository root
 
@@ -121,6 +121,8 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | Collection catalog | Workbook classes, worksheets, frequency styles | `collection_catalog.py`, `class_match.py` |
 | Secrets | Windows DPAPI (`CryptProtectData`); Base64 elsewhere | `secrets_store.py` |
 | Theme | Dark/light shared look | `theme.py` |
+| Worker thread registry | Track every QThread; orderly stop before exit | `worker_threads.py` |
+| Packaging | Bundle signature report, Inno Setup installer, blocked-PC diagnostics | `packaging/` |
 | Converter GUI | Folder pick, RBW, batch PNG | `iq_gui.py` |
 | Converter DSP | Chunked STFT, spectrum + spectrogram PNG | `iq_data.py` |
 
@@ -234,6 +236,8 @@ flowchart TB
 
 Tokens (`_record_gen`, `_info_token`, `_link_token`, `_watch_token`, `_storage_token`, `_preview_token`) drop late results after a new action.
 
+**Shutdown.** Every worker `QThread` is registered in `worker_threads.py` when it starts. After `app.exec()` returns, `gui.run()` calls `stop_worker_threads()`: abort each worker, `quit()`, wait up to 8 s in total, and leak (never delete) any thread that is still blocked, then skip interpreter teardown. Before 1.8.6 Python deleted running `QThread` objects at exit, which Qt treats as fatal (`QThread: Destroyed while thread is still running`, Windows exit code 0xC0000409) - the Application-log crash on every close of 1.8.5. `tests/conftest.py` does the same at session end.
+
 ## Data and metadata
 
 There is no CRFS WAVE RF chunk in the files we have inspected for this app. Labeling comes from **this PC's history**, matched onto remote names.
@@ -300,9 +304,11 @@ Typical field path: Recorder download folder → copy or save into the Converter
 1. `build_exe.bat` creates `.venv`, installs `requirements.txt` and PyInstaller, runs `CRFS_IQ_Recorder.spec`.
 2. One-file windowed EXE: `crfs_iq_recorder/dist/CRFS_IQ_Recorder.exe`. Entry `run.py`. Runtime hook `pyi_rth_crfs.py`. The spec bundles only QtCore/QtGui/QtWidgets and their plugins, matplotlib Agg, numpy, paramiko, requests, openpyxl, and pywin32; it embeds the Sensorz icon and a Windows version resource built from `__version__`.
 3. Startup cost of a one-file EXE is mostly unpacking to `%TEMP%`; keeping the bundle small is the main lever. In code, `requests` and `openpyxl` import on first use, and sensor, storage, link, workbook, and Excel work starts after the first frame (`MainWindow._start_background_init`).
-4. Optional Authenticode signing: `sign_exe.ps1` runs from `build_exe.bat` when `CRFS_SIGN_THUMBPRINT` or `CRFS_SIGN_PFX` is set. Certificates and passwords stay outside the repository.
-5. Git does not store the EXE. Tag `vX.Y.Z` must match `__version__` in `crfs_iq_recorder/__init__.py` and Quick Start **Version**.
-6. GitHub Release on `ItayHararii/iq-spectrogram-converter` holds the EXE. Older tags stay for rollback. This branch publishes with remote `personal`. Do not force-push `main` or tags.
+4. Authenticode signing: when `CRFS_SIGN_ARTIFACT_METADATA` (Azure Artifact Signing), `CRFS_SIGN_THUMBPRINT` or `CRFS_SIGN_PFX` is set, the spec signs every bundled DLL/PYD (copies under `build\signed_binaries`) and `build_exe.bat` signs the EXE and the installer through `sign_exe.ps1`. Smart App Control checks each loaded file, so the outer EXE alone is not enough. Certificates, tokens and account metadata stay outside the repository; `.signing-tools\` (downloaded signtool and plug-in) is git-ignored. `packaging\verify_bundle_signatures.py` reports the status of all ~90 files.
+5. Installer: `CRFS_BUILD_INSTALLER=1` adds a folder build (`CRFS_BUILD_ONEDIR=1`, `COLLECT`) and compiles `packaging\CRFS_IQ_Recorder.iss` with Inno Setup into `dist\CRFS_IQ_Recorder_Setup.exe` (Program Files, Start menu, uninstaller, silent switches). It exists because AppLocker/WDAC path rules on managed PCs forbid running from `%TEMP%`, where the one-file EXE unpacks.
+6. Git does not store the EXE. Tag `vX.Y.Z` must match `__version__` in `crfs_iq_recorder/__init__.py` and Quick Start **Version**.
+7. GitHub Release on `ItayHararii/iq-spectrogram-converter` holds the EXE (and the installer). Older tags stay for rollback. This branch publishes with remote `personal`. Do not force-push `main` or tags.
+8. Which Windows mechanism blocks a given PC (SmartScreen, Smart App Control, WDAC, AppLocker, ASR) and the signing decision are in [DISTRIBUTION.md](DISTRIBUTION.md); `packaging\diagnose_block.ps1` collects the evidence on the affected PC.
 
 **Converter**
 

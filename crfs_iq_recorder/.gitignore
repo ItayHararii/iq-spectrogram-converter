@@ -34,6 +34,15 @@ dist/
 *.exe
 *.spec.bak
 
+# Signing: downloaded signtool / Artifact Signing plug-in, and anything that
+# could hold a key or account metadata. Credentials never go in Git.
+.signing-tools/
+*.pfx
+*.p12
+artifact-signing*.json
+trusted-signing*.json
+metadata.json
+
 # Internal before/after shots (can include local IPs or usernames)
 docs/ui_refresh/
 

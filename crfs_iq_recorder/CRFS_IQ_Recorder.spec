@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""One-file Windows build for CRFS IQ Recorder. Double-click dist/CRFS_IQ_Recorder.exe.
+r"""One-file Windows build for CRFS IQ Recorder. Double-click dist/CRFS_IQ_Recorder.exe.
 
 Startup of a one-file EXE is dominated by unpacking the bundle into %TEMP% on
 every launch, so this spec bundles only what the app imports:
@@ -11,11 +11,27 @@ every launch, so this spec bundles only what the app imports:
 
 It also embeds a Windows version resource (product name, company, version) so
 Explorer, Task Manager, and SmartScreen show a real name instead of blanks.
-Authenticode signing is a separate step (see sign_exe.ps1); the certificate
-never lives in this repository.
+
+Signing: when signing credentials are configured (see sign_exe.ps1), every DLL,
+PYD and EXE that goes into the bundle is copied to build\signed_binaries and
+signed there before packaging. Smart App Control and App Control (WDAC) check
+each file the app loads, not just the outer EXE, so the ~40 unsigned
+third-party extensions (numpy, cryptography, Pillow, matplotlib, pywin32, ...)
+must carry a signature too. Files that already have a valid vendor signature
+(Python, Qt, Microsoft) are left as they are. The outer EXE is signed by
+build_exe.bat after PyInstaller finishes. No certificate lives in this repo.
+
+Layout: one-file by default (dist\CRFS_IQ_Recorder.exe, portable). Set
+CRFS_BUILD_ONEDIR=1 for a folder build (dist\...\CRFS_IQ_Recorder\) that the
+Inno Setup installer in packaging\ installs to Program Files - that layout does
+not unpack into %TEMP% at every launch, which AppLocker and WDAC path rules on
+managed PCs commonly forbid.
 """
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
@@ -35,6 +51,54 @@ root = Path(SPECPATH)
 APP_NAME = "CRFS IQ Recorder"
 COMPANY = "Sensorz"
 EXE_NAME = "CRFS_IQ_Recorder"
+ONEDIR = os.environ.get("CRFS_BUILD_ONEDIR", "").strip().lower() in {"1", "true", "yes"}
+SIGNING_ENV = ("CRFS_SIGN_ARTIFACT_METADATA", "CRFS_SIGN_THUMBPRINT", "CRFS_SIGN_PFX")
+PE_SUFFIXES = (".dll", ".pyd", ".exe")
+
+
+def signing_configured() -> bool:
+    return any(os.environ.get(name, "").strip() for name in SIGNING_ENV)
+
+
+def sign_bundled_binaries(binaries):
+    """Sign copies of every PE file in the TOC; return the TOC pointing at the copies."""
+    if not signing_configured():
+        return binaries
+    staging = root / "build" / "signed_binaries"
+    shutil.rmtree(staging, ignore_errors=True)
+    rewritten = []
+    copies = []
+    for dest, src, typecode in binaries:
+        if typecode in ("BINARY", "EXTENSION") and dest.lower().endswith(PE_SUFFIXES):
+            target = staging / dest
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
+            copies.append(target)
+            rewritten.append((dest, str(target), typecode))
+        else:
+            rewritten.append((dest, src, typecode))
+    listfile = staging / "files.txt"
+    listfile.write_text("\n".join(str(path) for path in copies), encoding="utf-8")
+    print(f"Signing {len(copies)} bundled binaries that lack a valid signature ...")
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(root / "sign_exe.ps1"),
+            "-FileList",
+            str(listfile),
+            "-SkipSigned",
+            "-Description",
+            APP_NAME,
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"Signing bundled binaries failed (exit {result.returncode}).")
+    return rewritten
 
 
 def read_version() -> str:
@@ -294,6 +358,7 @@ def _keep(entry) -> bool:
 
 a.binaries = [b for b in a.binaries if _keep(b)]
 a.datas = [d for d in a.datas if _keep(d)]
+a.binaries = sign_bundled_binaries(a.binaries)
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
@@ -310,11 +375,28 @@ exe_kwargs = dict(
 if icon.is_file():
     exe_kwargs["icon"] = str(icon)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    **exe_kwargs,
-)
+if ONEDIR:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        **exe_kwargs,
+    )
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name=EXE_NAME,
+    )
+else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.datas,
+        [],
+        **exe_kwargs,
+    )

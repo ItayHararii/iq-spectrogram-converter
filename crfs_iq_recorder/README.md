@@ -8,14 +8,18 @@ How the Recorder, Node, local files, Excel, and Converter fit together is in [Ar
 
 ## Share the EXE
 
-On a PC with Python, double-click `build_exe.bat`. Copy `dist\CRFS_IQ_Recorder.exe` to a USB stick or shared folder. The other PC does not need Python.
+On a PC with Python, double-click `build_exe.bat`. Copy `dist\CRFS_IQ_Recorder.exe` to a USB stick or shared folder. The other PC does not need Python. Set `CRFS_BUILD_INSTALLER=1` to also get `dist\CRFS_IQ_Recorder_Setup.exe`, an installer for company-managed PCs.
 
 The EXE is not stored in Git. Each version is tagged and the EXE is attached to the matching GitHub Release (keep older releases for rollback).
 
 ### Windows warnings, signing, and the icon
 
-- **"Windows protected your PC"** on first run is Microsoft Defender SmartScreen. The cause is reputation: the EXE is not signed with a trusted code-signing certificate, so Windows shows "Unknown publisher", and every new build is a new file hash with no download history. Browsers show a similar "not commonly downloaded" notice for the same reason. Defender itself reports no threat for the build (checked with `MpCmdRun -Scan` before each release).
-- **What fixes the publisher part:** Authenticode-sign every release with a certificate from a trusted CA (OV or EV) and a timestamp. `build_exe.bat` does this when `CRFS_SIGN_THUMBPRINT` (certificate in the Windows store) or `CRFS_SIGN_PFX` + `CRFS_SIGN_PFX_PASSWORD` (file outside the repo) is set; see `sign_exe.ps1`. Signing names the publisher and lets later releases inherit trust, but per Microsoft it does not give a brand-new file instant SmartScreen reputation, and EV no longer bypasses SmartScreen. Self-signed certificates behave like no signature and are refused by the script.
+Full analysis, signing enrollment steps and costs, IT guidance, and the diagnostics script are in [Distribution](docs/DISTRIBUTION.md).
+
+- **"Windows protected your PC" / "Unknown publisher"** on first run is Microsoft Defender SmartScreen: the EXE is not signed with a trusted code-signing certificate, and every new build is a new file hash with no download history. Defender itself reports no threat for the build (checked with `MpCmdRun -Scan` before each release).
+- **"Cannot run at all"** on a Windows 11 PC with **Smart App Control** on, or on a company PC with App Control (WDAC) / AppLocker: unsigned code is refused, including the DLL/PYD files the one-file EXE unpacks into `%TEMP%`. Turning those protections off is not the fix.
+- **What fixes the publisher part:** sign every release, and every bundled binary, with a trusted identity. The build does this automatically when one of `CRFS_SIGN_ARTIFACT_METADATA` (Azure Artifact Signing, formerly Trusted Signing, the recommended option), `CRFS_SIGN_THUMBPRINT` (certificate in the Windows store or on a token) or `CRFS_SIGN_PFX` + `CRFS_SIGN_PFX_PASSWORD` is set; see `sign_exe.ps1`. Signing names the publisher, satisfies Smart App Control, and lets later releases inherit trust, but per Microsoft it does not give a brand-new file instant SmartScreen reputation, and EV no longer bypasses SmartScreen. Self-signed certificates behave like no signature and are refused by the script. **Releases are unsigned until the Sensorz signing enrollment is done.**
+- **Managed PCs:** use the installer (`CRFS_IQ_Recorder_Setup.exe`, installs to Program Files) and ask IT for a publisher rule once releases are signed. `packaging\diagnose_block.ps1` tells which mechanism blocks a given PC.
 - **If Defender ever flags the EXE** (it does not today), submit the file as a software developer at https://www.microsoft.com/wdsi/filesubmission instead of adding exclusions.
 - The EXE carries a Windows version resource (product name, company, version), which is what Explorer, Task Manager, and the SmartScreen dialog display.
 - **Icon:** the EXE embeds the Sensorz `.ico` (16-256 px), the window sets the same icon, and the process registers the AppUserModelID `Sensorz.CRFSIQRecorder` so the taskbar groups it on its own. If a pinned shortcut keeps an old icon after an update, unpin and pin again; Windows caches shortcut icons per file.
@@ -110,6 +114,7 @@ Click a WAVE file for a short spectrogram preview of the start of the file (I le
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) - components, recording flow, threads, persistence, and Converter hand-off
+- [Distribution](docs/DISTRIBUTION.md) - SmartScreen / Smart App Control / WDAC analysis, code signing, installer, IT guidance
 - [Quick Start](docs/confluence/CRFS_IQ_Recorder_Quick_Start.md)
 
 ## Tests
@@ -120,4 +125,4 @@ Click a WAVE file for a short spectrogram preview of the start of the file (I le
 
 ## Build the EXE
 
-On Windows with Python, double-click `build_exe.bat`. It writes `dist\CRFS_IQ_Recorder.exe`.
+On Windows with Python, double-click `build_exe.bat`. It writes `dist\CRFS_IQ_Recorder.exe`. With `CRFS_BUILD_INSTALLER=1` it also writes `dist\CRFS_IQ_Recorder_Setup.exe` (needs Inno Setup 6: `winget install --id JRSoftware.InnoSetup --exact --scope user`). Signing is automatic when signing credentials are configured; see [Distribution](docs/DISTRIBUTION.md).

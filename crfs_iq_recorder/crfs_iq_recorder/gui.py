@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QSize, QThread, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QSize, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QGuiApplication, QIcon, QImageReader, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -143,6 +143,8 @@ from .theme import (
     theme_toggle_tooltip,
 )
 from .validation import ValidationError, parse_connection, parse_recorded_time
+from .worker_threads import stop_worker_threads
+from .worker_threads import track as track_worker_thread
 
 def configure_appearance(app: QApplication, mode: str | None = None) -> None:
     apply_theme(app, mode)
@@ -1591,6 +1593,7 @@ class MainWindow(QMainWindow):
         thread.finished.connect(self._job_thread_finished, queued)
         thread.started.connect(worker.run)
         self._jobs.append((thread, worker))
+        track_worker_thread(thread, worker)
         thread.start()
 
     @Slot(object)
@@ -2289,4 +2292,21 @@ def run(*, demo: bool = False) -> int:
     except OSError as exc:
         window.log(f"Could not create download folder: {exc}", level="error")
     window.show()
-    return app.exec()
+    rc = app.exec()
+    # Worker threads must be finished before Python deletes their QThread
+    # objects, otherwise Qt aborts the process with 0xC0000409 on every exit
+    # that still has a sensor check or SFTP connect in flight.
+    leaked = stop_worker_threads(timeout_s=8.0)
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    if leaked:
+        # A worker is still blocked (for example a sensor that stopped
+        # answering mid-request). Settings are already saved; skip interpreter
+        # teardown so the blocked thread is never deleted from under Qt.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                if stream is not None:
+                    stream.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        os._exit(rc)
+    return rc

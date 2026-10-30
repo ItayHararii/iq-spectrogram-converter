@@ -76,6 +76,7 @@ from .spectrogram_preview import (
 )
 from .theme import current_palette, fit_window_to_screen, format_bytes, format_display_datetime
 from .validation import ValidationError, parse_optional_port
+from .worker_threads import track as track_worker_thread
 
 MAX_PARALLEL_DOWNLOADS = 4
 _PREVIEW_CACHE = 8
@@ -749,6 +750,7 @@ class SftpWindow(QWidget):
         self._worker.listed.connect(self._on_listed, queued)
         self._worker.failed.connect(self._on_failed, queued)
         self._worker.removed.connect(self._on_removed, queued)
+        track_worker_thread(self._thread, self._worker)
         self._thread.start()
         self._set_busy(True)
         self._show_list_state("loading", f"Connecting to {state.host or 'the sensor'}…")
@@ -1217,6 +1219,7 @@ class SftpWindow(QWidget):
             thread.finished.connect(self._on_download_thread_finished, queued)
             thread.started.connect(worker.run)
             self._dl_active.append((thread, worker))
+            track_worker_thread(thread, worker)
             thread.start()
 
     @Slot(str, str)
@@ -1592,6 +1595,7 @@ class SftpWindow(QWidget):
         thread.finished.connect(self._on_preview_thread_finished, queued)
         thread.started.connect(worker.run)
         self._preview_jobs.append((thread, worker))
+        track_worker_thread(thread, worker)
         thread.start()
 
     @Slot(int, object)
