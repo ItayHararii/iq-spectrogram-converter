@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .json_store import write_json
 from .sanitizer import redact_obj
 
 PRESET_VERSION = 1
@@ -27,8 +28,8 @@ def _strip_secrets(data: dict[str, Any]) -> dict[str, Any]:
 
 def save_preset(path: Path, data: dict[str, Any]) -> None:
     payload = {"preset_version": PRESET_VERSION, **_strip_secrets(data)}
-    path = Path(path)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    # Preset files live wherever the user saved them: atomic write, no .bak litter.
+    write_json(Path(path), payload, backup=False)
 
 
 def load_preset(path: Path) -> dict[str, Any]:

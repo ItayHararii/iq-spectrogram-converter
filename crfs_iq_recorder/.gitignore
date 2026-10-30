@@ -10,9 +10,11 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Local settings, history, secrets
+# Local settings, history, secrets (plus the .bak / .tmp files of the crash-safe writer)
 .crfs_iq_recorder_settings.json
 .crfs_iq_recorder_recordings.json
+.crfs_iq_recorder_*.json.bak
+.crfs_iq_recorder_*.json.*.tmp
 .env
 .env.*
 *.pem

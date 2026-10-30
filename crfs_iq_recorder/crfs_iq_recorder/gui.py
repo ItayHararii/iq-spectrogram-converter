@@ -239,6 +239,9 @@ class MainWindow(QMainWindow):
         self._log_sizes = [680, 300]
         self._catalog = None
         self._excel_store = ExcelLogStore()
+        self._excel_flush_async = not demo
+        self._excel_flush_in_flight = False
+        self._excel_flush_again = False
         self._class_user_set = False
         self._series_active = False
         self._series_remaining: int | None = None
@@ -1072,12 +1075,44 @@ class MainWindow(QMainWindow):
         )
 
     def _flush_excel(self) -> None:
-        saved, pending = flush_excel_queue(self._excel_store)
+        """Write queued rows. Real workbooks are written on a worker thread.
+
+        openpyxl loads and Excel COM calls take seconds on a large workbook;
+        running them on the UI thread froze the window on every flush. Demo
+        mode stays synchronous so the in-process demo is deterministic.
+        """
+        if not self._alive:
+            return
+        if self._excel_store.pending_count() == 0:
+            self._update_collection_status()
+            return
+        if not self._excel_flush_async:
+            self._show_excel_flush(flush_excel_queue(self._excel_store))
+            return
+        if self._excel_flush_in_flight:
+            self._excel_flush_again = True
+            return
+        self._excel_flush_in_flight = True
+        store = self._excel_store
+
+        def work() -> tuple[int, int]:
+            return flush_excel_queue(store)
+
+        self._start_job(work, self._show_excel_flush, excel=True)
+
+    def _show_excel_flush(self, result: Any) -> None:
+        self._excel_flush_in_flight = False
+        if not self._alive:
+            return
+        saved, pending = result if isinstance(result, tuple) and len(result) == 2 else (0, 0)
         if saved:
             self.log(f"Excel: saved {saved} row(s).")
         if pending:
             self.log(f"Pending Excel updates: {pending}.")
         self._update_collection_status()
+        if self._excel_flush_again:
+            self._excel_flush_again = False
+            self._flush_excel()
 
     def _close_watch_browser(self) -> None:
         browser = self._watch_browser
@@ -1573,6 +1608,7 @@ class MainWindow(QMainWindow):
         record: bool = False,
         info: bool = False,
         link: bool = False,
+        excel: bool = False,
         record_gen: int | None = None,
         info_token: int | None = None,
         link_token: int | None = None,
@@ -1583,6 +1619,7 @@ class MainWindow(QMainWindow):
         worker._is_record = record  # noqa: SLF001
         worker._is_info = info  # noqa: SLF001
         worker._is_link = link  # noqa: SLF001
+        worker._is_excel = excel  # noqa: SLF001
         worker._record_gen = record_gen  # noqa: SLF001
         worker._info_token = info_token  # noqa: SLF001
         worker._link_token = link_token  # noqa: SLF001
@@ -1606,6 +1643,12 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _job_failed(self, text: str) -> None:
         worker = self.sender()
+        if getattr(worker, "_is_excel", False):
+            self._excel_flush_in_flight = False
+            if self._alive:
+                self.log(f"Excel update failed: {text}", level="error")
+                self._update_collection_status()
+            return
         if getattr(worker, "_is_record", False):
             gen = getattr(worker, "_record_gen", None)
             if gen is not None and gen != self._record_gen:

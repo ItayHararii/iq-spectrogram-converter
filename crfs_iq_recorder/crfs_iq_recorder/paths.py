@@ -16,6 +16,7 @@ from .constants import (
     RECORDINGS_FILENAME,
     SETTINGS_FILENAME,
 )
+from .json_store import read_json, write_json
 from .sanitizer import redact_obj
 
 
@@ -206,13 +207,7 @@ def prepare_runtime() -> None:
 
 
 def load_settings() -> dict[str, Any]:
-    path = settings_path()
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    data = read_json(settings_path())
     if not isinstance(data, dict):
         return {}
     data.pop("password", None)
@@ -235,4 +230,4 @@ def save_settings(data: dict[str, Any]) -> None:
             payload["sftp_secret"] = sftp_secret
         path = settings_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        write_json(path, payload)

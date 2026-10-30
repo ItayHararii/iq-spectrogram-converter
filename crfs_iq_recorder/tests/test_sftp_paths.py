@@ -73,3 +73,17 @@ def test_candidate_today_includes_utc_when_dates_differ():
     assert message
     assert "does not exist yet" in message
 
+
+
+def test_folders_for_recording_cover_a_midnight_crossing():
+    from datetime import datetime
+
+    from crfs_iq_recorder.file_watch import folders_for_recording
+
+    started = datetime(2026, 9, 10, 23, 59, 40)
+    now = datetime(2026, 9, 11, 0, 0, 30)
+    folders = folders_for_recording(started, now)
+    assert "/mnt/1/remdata/20260910/" in folders
+    assert "/mnt/1/remdata/20260911/" in folders
+    assert folders[0] == "/mnt/1/remdata/20260910/"
+    assert len(folders) == len(set(folders))

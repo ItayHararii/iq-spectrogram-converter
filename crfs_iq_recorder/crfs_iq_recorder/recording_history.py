@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .frequency import display_from_hz
+from .json_store import read_json, write_json
 from .paths import recordings_path
 from .sftp_client import RemoteEntry
 
@@ -330,11 +331,8 @@ def file_time(entry: RemoteEntry) -> datetime | None:
 
 def load_recordings(path: Path | None = None) -> list[RecordingParams]:
     file = path or recordings_path()
-    if not file.is_file():
-        return []
-    try:
-        raw = json.loads(file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    raw = read_json(file)
+    if raw is None:
         return []
     rows = raw.get("recordings") if isinstance(raw, dict) else raw
     if not isinstance(rows, list):
@@ -357,7 +355,7 @@ def save_recordings(records: list[RecordingParams], path: Path | None = None) ->
     payload = {
         "recordings": [item.to_dict() for item in records[:_MAX_SAVED]],
     }
-    file.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    write_json(file, payload)
 
 
 def add_recording(record: RecordingParams, path: Path | None = None) -> None:

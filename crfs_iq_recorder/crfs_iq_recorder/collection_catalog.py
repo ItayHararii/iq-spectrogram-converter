@@ -179,6 +179,28 @@ def load_catalog_from_rows(
     )
 
 
+# Stop reading a sheet after this many consecutive empty rows. Stray formatting
+# can push a sheet's used range to row 1,048,576; reading every row of such a
+# sheet costs seconds and hundreds of MB for no data.
+EMPTY_ROW_RUN_LIMIT = 2000
+
+
+def sheet_rows(ws, *, empty_run_limit: int = EMPTY_ROW_RUN_LIMIT) -> list[list[Any]]:
+    """Rows with at least one value, in order; trailing empty rows are skipped early."""
+    rows: list[list[Any]] = []
+    empty_run = 0
+    for raw in ws.iter_rows(values_only=True):
+        row = list(raw)
+        if all(value in (None, "") for value in row):
+            empty_run += 1
+            if empty_run >= empty_run_limit:
+                break
+            continue
+        empty_run = 0
+        rows.append(row)
+    return rows
+
+
 def load_workbook_catalog(path: str | Path) -> WorkbookCatalog:
     from openpyxl import load_workbook
 
@@ -188,10 +210,10 @@ def load_workbook_catalog(path: str | Path) -> WorkbookCatalog:
         sheets: list[tuple[str, list[Any], list[list[Any]]]] = []
         for name in workbook.sheetnames:
             ws = workbook[name]
-            rows = list(ws.iter_rows(values_only=True))
+            rows = sheet_rows(ws)
             if not rows:
                 continue
-            sheets.append((name, list(rows[0]), [list(row) for row in rows[1:]]))
+            sheets.append((name, rows[0], rows[1:]))
         return load_catalog_from_rows(str(file), sheets)
     finally:
         workbook.close()

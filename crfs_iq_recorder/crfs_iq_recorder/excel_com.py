@@ -21,43 +21,126 @@ from .collection_catalog import (
 )
 
 XL_PASTE_FORMATS = -4122
+XL_FORMULAS = -4123
+XL_PART = 2
+XL_BY_ROWS = 1
+XL_PREVIOUS = 2
 
 
 def _norm(path: Path) -> str:
     return str(path.resolve()).casefold()
 
 
+def _excel_window_exists() -> bool:
+    """True when a live Excel process owns a main window (class XLMAIN).
+
+    GetActiveObject on a running-object-table entry whose process has just
+    exited blocks for about a minute before failing. A dead process has no
+    windows, so this check skips that hang.
+    """
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.user32.FindWindowW("XLMAIN", None))
+    except Exception:
+        return True
+
+
 def excel_has_workbook(path: Path) -> bool:
     try:
         import win32com.client  # type: ignore
+        import pythoncom  # type: ignore
     except ImportError:
         return False
-    try:
-        app = win32com.client.GetActiveObject("Excel.Application")
-    except Exception:
+    if not _excel_window_exists():
         return False
-    want = _norm(path)
+    # Callers may run on a worker thread that never initialised COM.
     try:
-        for book in app.Workbooks:
-            try:
-                if _norm(Path(str(book.FullName))) == want:
-                    return True
-            except Exception:
-                continue
+        pythoncom.CoInitialize()
     except Exception:
+        pass
+    try:
+        try:
+            app = win32com.client.GetActiveObject("Excel.Application")
+        except Exception:
+            return False
+        want = _norm(path)
+        try:
+            for book in app.Workbooks:
+                try:
+                    if _norm(Path(str(book.FullName))) == want:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
         return False
-    return False
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+def _range_values(sheet, first_row: int, first_col: int, last_row: int, last_col: int) -> list[list]:
+    """Read a block with one COM call. Cell-by-cell access costs ~50 µs per cell."""
+    if last_row < first_row or last_col < first_col:
+        return []
+    value = sheet.Range(sheet.Cells(first_row, first_col), sheet.Cells(last_row, last_col)).Value
+    if first_row == last_row and first_col == last_col:
+        return [[value]]
+    if first_row == last_row:
+        return [list(value[0]) if isinstance(value, tuple) and value and isinstance(value[0], tuple) else list(value)]
+    rows: list[list] = []
+    for item in value:
+        rows.append(list(item) if isinstance(item, tuple) else [item])
+    return rows
 
 
 def _header_map(sheet) -> dict[str, int]:
     found: dict[str, int] = {}
     last_col = int(sheet.UsedRange.Columns.Count)
-    for col in range(1, last_col + 1):
-        value = sheet.Cells(1, col).Value
+    header = _range_values(sheet, 1, 1, 1, last_col)
+    values = header[0] if header else []
+    for index, value in enumerate(values, start=1):
         text = str(value).strip() if value is not None else ""
         if text and text not in found:
-            found[text] = col
+            found[text] = index
     return found
+
+
+def _last_used_row(sheet, columns: int) -> int:
+    """Last row with a value. UsedRange can reach row 1,048,576 after stray formatting.
+
+    Walking UsedRange cell by cell over COM takes minutes on such a sheet and
+    blocks the UI. Excel's own Find (searching backwards from A1) returns the
+    last non-empty cell in one call.
+    """
+    try:
+        found = sheet.Cells.Find(
+            What="*",
+            After=sheet.Cells(1, 1),
+            LookIn=XL_FORMULAS,
+            LookAt=XL_PART,
+            SearchOrder=XL_BY_ROWS,
+            SearchDirection=XL_PREVIOUS,
+            MatchCase=False,
+        )
+    except Exception:
+        found = None
+    if found is not None:
+        try:
+            return max(1, int(found.Row))
+        except Exception:
+            pass
+    # Fallback for a sheet without values or a failed Find: bounded walk.
+    last = 1
+    used = min(int(sheet.UsedRange.Rows.Count), 5000)
+    block = _range_values(sheet, 1, 1, used, max(1, columns))
+    for index, row in enumerate(block, start=1):
+        if any(value not in (None, "") for value in row):
+            last = index
+    return last
 
 
 def _find_row_with_names(sheet, headers: dict[str, int], names: list[str]) -> int | None:
@@ -67,23 +150,15 @@ def _find_row_with_names(sheet, headers: dict[str, int], names: list[str]) -> in
     wanted = {name.casefold() for name in names if name}
     if not wanted:
         return None
-    last = int(sheet.UsedRange.Rows.Count)
-    for row in range(2, last + 1):
-        existing = split_iq_filenames(sheet.Cells(row, iq_col).Value)
+    last = _last_used_row(sheet, max(headers.values()))
+    if last < 2:
+        return None
+    column = _range_values(sheet, 2, iq_col, last, iq_col)
+    for offset, row in enumerate(column, start=2):
+        existing = split_iq_filenames(row[0] if row else None)
         if any(name.casefold() in wanted for name in existing):
-            return row
+            return offset
     return None
-
-
-def _last_used_row(sheet, columns: int) -> int:
-    last = 1
-    used = int(sheet.UsedRange.Rows.Count)
-    for row in range(1, used + 1):
-        for col in range(1, columns + 1):
-            if sheet.Cells(row, col).Value not in (None, ""):
-                last = row
-                break
-    return last
 
 
 def append_rows_com(path: Path, rows: list[ExcelRow]) -> list[int]:
@@ -95,16 +170,108 @@ def append_rows_com(path: Path, rows: list[ExcelRow]) -> list[int]:
     except ImportError as exc:
         raise ExcelBusyError("Excel COM is not available on this PC.") from exc
     pythoncom.CoInitialize()
-    started = False
-    app = None
+    quit_pid = 0
     try:
+        written, quit_pid = _append_rows_com_impl(win32com.client, path, rows)
+        return written
+    finally:
+        # _append_rows_com_impl has returned, so every COM proxy it held is out
+        # of scope. Uninitialising with live proxies raises RPC_E_DISCONNECTED
+        # (0x80010108) inside the COM runtime.
+        import gc
+
+        gc.collect()
         try:
-            app = win32com.client.GetActiveObject("Excel.Application")
+            pythoncom.CoUninitialize()
         except Exception:
-            app = win32com.client.Dispatch("Excel.Application")
+            pass
+        if quit_pid:
+            _wait_for_process_exit(quit_pid, HEADLESS_EXIT_WAIT_S)
+
+
+HEADLESS_EXIT_WAIT_S = 15.0
+
+
+def _process_id_of_app(app) -> int:
+    """PID of an Excel.Application via its window handle (0 when unknown)."""
+    try:
+        import ctypes
+
+        hwnd = int(app.Hwnd)
+        if not hwnd:
+            return 0
+        pid = ctypes.c_ulong(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value)
+    except Exception:
+        return 0
+
+
+def _wait_for_process_exit(pid: int, timeout_s: float) -> bool:
+    """Block until a process we told to quit has really exited.
+
+    Excel stays registered in the running-object table until it exits. If the
+    next flush attaches to that dying instance, its calls hang for a minute or
+    the instance is revived and left running invisibly with the workbook open.
+    """
+    try:
+        import ctypes
+
+        SYNCHRONIZE = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+        if not handle:
+            return True
+        try:
+            result = ctypes.windll.kernel32.WaitForSingleObject(handle, int(max(timeout_s, 0) * 1000))
+            return result == 0
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
+def _append_rows_com_impl(win32com_client, path: Path, rows: list[ExcelRow]) -> tuple[list[int], int]:
+    """Write rows; return (row numbers, pid of an instance that was told to quit or 0)."""
+    started = False
+    headless = False
+    app = None
+    book = None
+    sheet = None
+    quit_pid = 0
+    want = _norm(path)
+    try:
+        app = None
+        if _excel_window_exists():
+            try:
+                app = win32com_client.GetActiveObject("Excel.Application")
+            except Exception:
+                app = None
+        if app is not None:
+            try:
+                headless = not bool(app.Visible)
+            except Exception:
+                headless = False
+            if headless:
+                # Invisible instances are ones this app started. Use one only
+                # when it still holds our workbook (it would keep the file
+                # locked otherwise); never attach to one that is shutting down.
+                holds_book = False
+                try:
+                    for item in app.Workbooks:
+                        try:
+                            if _norm(Path(str(item.FullName))) == want:
+                                holds_book = True
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    holds_book = False
+                if not holds_book:
+                    app = None
+        if app is None:
+            app = win32com_client.Dispatch("Excel.Application")
             started = True
-        want = _norm(path)
-        book = None
+            headless = False
         for item in app.Workbooks:
             try:
                 if _norm(Path(str(item.FullName))) == want:
@@ -204,10 +371,17 @@ def append_rows_com(path: Path, rows: list[ExcelRow]) -> list[int]:
             book.Save()
         finally:
             app.DisplayAlerts = alerts
-        if started and book is not None:
+        if (started or headless) and book is not None:
             book.Close(SaveChanges=True)
-            app.Quit()
-        return written
+            book = None
+            try:
+                remaining = int(app.Workbooks.Count)
+            except Exception:
+                remaining = 0
+            if remaining == 0:
+                quit_pid = _process_id_of_app(app)
+                app.Quit()
+        return written, quit_pid
     except ExcelBusyError:
         raise
     except Exception as exc:
@@ -217,10 +391,9 @@ def append_rows_com(path: Path, rows: list[ExcelRow]) -> list[int]:
             raise ExcelBusyError(f"Excel could not save {path.name} right now.") from exc
         raise
     finally:
-        try:
-            pythoncom.CoUninitialize()
-        except Exception:
-            pass
+        sheet = None
+        book = None
+        app = None
 
 
 def _col_letter(index: int) -> str:

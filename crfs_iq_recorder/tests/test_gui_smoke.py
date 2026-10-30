@@ -39,6 +39,15 @@ def isolated_settings(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_excel_log(tmp_path, monkeypatch):
+    # Keep the dedupe set / pending queue of the developer's own install untouched.
+    monkeypatch.setattr(
+        "crfs_iq_recorder.excel_log.excel_log_path",
+        lambda: tmp_path / "excel_log.json",
+    )
+
+
+@pytest.fixture(autouse=True)
 def no_explorer(monkeypatch):
     monkeypatch.setattr(
         "crfs_iq_recorder.sftp_window.QDesktopServices.openUrl",
@@ -1273,5 +1282,232 @@ def test_sftp_delete_parent_removes_all_listed_parts(qapp, monkeypatch):
         assert parts[0].path not in browser._files
         assert parts[1].path not in browser._files
     finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_gui_excel_flush_runs_on_worker_and_keeps_ui_state(qapp, tmp_path, monkeypatch):
+    """Real (non-demo) mode writes the workbook on a worker thread; a second
+    request during the write is coalesced into one follow-up flush."""
+    import threading
+    import time
+
+    import crfs_iq_recorder.excel_log as excel_log
+    from crfs_iq_recorder.excel_writer import ExcelRow, append_rows_openpyxl
+    from crfs_iq_recorder.excel_log import pending_from_row
+    from crfs_iq_recorder.gui import MainWindow
+    from test_collection_excel import build_sample_workbook, haifa_mappings
+
+    path = build_sample_workbook(tmp_path / "collection.xlsm")
+    window = MainWindow(demo=True)
+    try:
+        window._excel_flush_async = True
+        mapping = haifa_mappings()[1]
+
+        def make_row(name: str) -> ExcelRow:
+            return ExcelRow(
+                worksheet="SATCOM",
+                collection_event="Haifa Port",
+                target_class="Iridium",
+                start_hz=mapping.start_hz,
+                end_hz=mapping.end_hz,
+                start_style=mapping.start_style,
+                stop_style=mapping.stop_style,
+                sensor="CRFS 100-18",
+                filename=name,
+                remote_path=f"/mnt/1/remdata/20260915/{name}",
+                sensor_id="rfeyeDEMO",
+                duration_s=0.08,
+            )
+
+        writer_threads: list[str] = []
+        release = threading.Event()
+
+        def slow_write(book, rows):
+            writer_threads.append(threading.current_thread().name)
+            release.wait(5.0)
+            return append_rows_openpyxl(book, rows)
+
+        monkeypatch.setattr(excel_log, "write_excel_rows", slow_write)
+        assert window._excel_store.enqueue(pending_from_row(workbook=path, row=make_row("iq_async_0001.wav")))
+        window._flush_excel()
+        assert window._excel_flush_in_flight is True
+        # UI thread stays responsive while the worker is blocked in the write.
+        t0 = time.time()
+        while not writer_threads and time.time() - t0 < 3:
+            qapp.processEvents()
+            time.sleep(0.02)
+        assert writer_threads and writer_threads[0] != threading.main_thread().name
+        window._excel_store.enqueue(pending_from_row(workbook=path, row=make_row("iq_async_0002.wav")))
+        window._flush_excel()
+        assert window._excel_flush_again is True
+        release.set()
+        deadline = time.time() + 10
+        while time.time() < deadline and (window._excel_flush_in_flight or window._excel_store.pending_count()):
+            qapp.processEvents()
+            time.sleep(0.02)
+        assert window._excel_flush_in_flight is False
+        assert window._excel_store.pending_count() == 0
+        assert len(writer_threads) == 2
+        from crfs_iq_recorder.recording_history import split_iq_filenames
+
+        wb = load_workbook(path)
+        names = [
+            name
+            for cell in wb["SATCOM"]["I"]
+            if cell.row > 1
+            for name in split_iq_filenames(cell.value)
+        ]
+        wb.close()
+        # Both parts of the split capture end up in one merged row.
+        assert sorted(names) == ["iq_async_0001.wav", "iq_async_0002.wav"]
+        assert "Pending Excel updates" not in window.collection_status.text()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+class _ScriptedClient:
+    """Stands in for EmpClient: returns scripted HttpOutcomes, counts POST attempts."""
+
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.calls = 0
+        self.payloads = []
+        self.closed = False
+
+    def start_recording(self, _target, _password, payload):
+        self.calls += 1
+        self.payloads.append(payload)
+        return self.outcome
+
+    def close(self):
+        self.closed = True
+
+
+def _pump_until(qapp, predicate, timeout=5.0):
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_gui_connection_failure_before_send_drops_record_and_ends_series(qapp, tmp_path, monkeypatch):
+    from crfs_iq_recorder.api_client import HttpOutcome
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.recording_history import load_recordings
+    from crfs_iq_recorder.recording_status import IDLE
+
+    window = MainWindow(demo=True)
+    client = _ScriptedClient(
+        HttpOutcome(kind="connection_failure", title="No connection", detail="Could not connect.", request_sent=False)
+    )
+    monkeypatch.setattr(window, "_client", lambda: client)
+    monkeypatch.setattr("crfs_iq_recorder.gui.QMessageBox.warning", lambda *a, **k: None)
+    try:
+        window.mode_start.setChecked(True)
+        window.field_a.setText("790")
+        window.field_b.setText("810")
+        window.time_edit.setText("3")
+        window.repeat_n.setChecked(True)
+        window.repeat_spin.setValue(3)
+        window.wait_spin.setValue(0)
+        window._on_start()
+        assert window._series_active
+        assert len(load_recordings(tmp_path / "recordings.json")) == 1
+        assert _pump_until(qapp, lambda: window._record_phase == IDLE and not window._recording_active)
+        # Nothing was sent, so the saved parameters are discarded and no retry is attempted.
+        assert client.calls == 1
+        assert load_recordings(tmp_path / "recordings.json") == []
+        assert window._series_active is False
+        assert window.start_btn.isEnabled()
+        assert window._record_timer.isActive() is False
+        qapp.processEvents()
+        assert client.calls == 1
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_gui_lost_response_after_send_keeps_record_and_never_retries(qapp, tmp_path, monkeypatch):
+    from crfs_iq_recorder.api_client import HttpOutcome
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.recording_history import load_recordings
+    from crfs_iq_recorder.recording_status import FINALIZING, RECORDING
+
+    window = MainWindow(demo=True)
+    client = _ScriptedClient(
+        HttpOutcome(
+            kind="timeout_after_send",
+            title="No reply",
+            detail="Request sent; no reply in time.",
+            request_sent=True,
+            outcome_unknown=True,
+        )
+    )
+    monkeypatch.setattr(window, "_client", lambda: client)
+    try:
+        window.mode_start.setChecked(True)
+        window.field_a.setText("790")
+        window.field_b.setText("810")
+        window.time_edit.setText("3")
+        window._on_start()
+        assert _pump_until(qapp, lambda: client.calls == 1 and window._http_in_flight is False)
+        # The sensor may well be recording: stay in the recording phase and keep the parameters.
+        assert window._record_phase == RECORDING
+        assert window._recording_active
+        assert len(load_recordings(tmp_path / "recordings.json")) == 1
+        assert any("no reply in time" in line.lower() for line in window.log_edit.toPlainText().splitlines())
+        # Pressing Start again while recording is ignored - no duplicate task.
+        window._on_start()
+        qapp.processEvents()
+        assert client.calls == 1
+        window._record_timer.stop()
+        window._on_recording_time_elapsed()
+        assert window._record_phase == FINALIZING
+        assert client.calls == 1
+        assert len(load_recordings(tmp_path / "recordings.json")) == 1
+    finally:
+        window._watch_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_gui_series_sends_distinct_task_ids_and_logs_each_completion(qapp, tmp_path, monkeypatch):
+    from crfs_iq_recorder.api_client import HttpOutcome
+    from crfs_iq_recorder.gui import MainWindow
+
+    window = MainWindow(demo=True)
+    client = _ScriptedClient(HttpOutcome(kind="accepted", title="OK", detail="Accepted", request_sent=True, accepted=True))
+    monkeypatch.setattr(window, "_client", lambda: client)
+    try:
+        window._settle_s = 0
+        window._stable_needed = 2
+        window.mode_start.setChecked(True)
+        window.field_a.setText("790")
+        window.field_b.setText("810")
+        window.time_edit.setText("0.05")
+        window.wait_spin.setValue(0)
+        window.repeat_n.setChecked(True)
+        window.repeat_spin.setValue(3)
+        window._on_start()
+        for _ in range(3):
+            assert _pump_until(qapp, lambda: window._http_in_flight is False)
+            _drive_capture(window, qapp)
+        assert window._recordings_completed == 3
+        assert client.calls == 3
+        ids = [p["remote_recording_scans"][0]["task_id"] for p in client.payloads]
+        assert all(tid.startswith("iq-") for tid in ids)
+        durations = {p["remote_recording_scans"][0]["duration"] for p in client.payloads}
+        assert durations == {0.05}
+        assert window._series_active is False
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
         window.close()
         qapp.processEvents()

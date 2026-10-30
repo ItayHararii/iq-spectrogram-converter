@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,6 +18,7 @@ from .excel_writer import (
     workbook_has_iq_filename,
 )
 from .frequency import FreqTextStyle
+from .json_store import read_json, write_json
 from .paths import excel_log_path
 from .recording_history import (
     iq_group_key,
@@ -183,8 +185,15 @@ class PendingExcelItem:
 
 
 class ExcelLogStore:
+    """Queue of rows waiting for a workbook write, plus what was already logged.
+
+    The UI thread enqueues while a worker thread flushes, so every mutation
+    and the JSON save take ``lock``.
+    """
+
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or excel_log_path()
+        self.lock = threading.RLock()
         self.logged: set[str] = set()
         self.queue: list[PendingExcelItem] = []
         self.backups: dict[str, str] = {}
@@ -192,12 +201,7 @@ class ExcelLogStore:
         self.load()
 
     def load(self) -> None:
-        if not self.path.is_file():
-            return
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
+        raw = read_json(self.path)
         if not isinstance(raw, dict):
             return
         logged = raw.get("logged") or []
@@ -232,24 +236,28 @@ class ExcelLogStore:
             self.queue = out
 
     def save(self) -> None:
-        payload = {
-            "logged": sorted(self.logged),
-            "backups": self.backups,
-            "groups": self.groups,
-            "queue": [item.to_dict() for item in self.queue],
-        }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        with self.lock:
+            payload = {
+                "logged": sorted(self.logged),
+                "backups": self.backups,
+                "groups": self.groups,
+                "queue": [item.to_dict() for item in self.queue],
+            }
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(self.path, payload)
 
     def is_logged(self, sensor_id: str, remote_path: str) -> bool:
-        return file_log_key(sensor_id, remote_path) in self.logged
+        with self.lock:
+            return file_log_key(sensor_id, remote_path) in self.logged
 
     def mark_logged(self, sensor_id: str, remote_path: str) -> None:
-        self.logged.add(file_log_key(sensor_id, remote_path))
+        with self.lock:
+            self.logged.add(file_log_key(sensor_id, remote_path))
 
     def ensure_backup(self, workbook: Path) -> Path | None:
         key = str(workbook.resolve())
-        existing = self.backups.get(key)
+        with self.lock:
+            existing = self.backups.get(key)
         if existing and Path(existing).is_file():
             return Path(existing)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -258,21 +266,34 @@ class ExcelLogStore:
             backup_workbook(workbook, dest)
         except OSError:
             return None
-        self.backups[key] = str(dest)
-        self.save()
+        with self.lock:
+            self.backups[key] = str(dest)
+            self.save()
         return dest
 
     def enqueue(self, item: PendingExcelItem) -> bool:
-        if self.is_logged(item.sensor_id, item.remote_path):
-            return False
-        if any(existing.key() == item.key() for existing in self.queue):
-            return False
-        self.queue.append(item)
-        self.save()
-        return True
+        with self.lock:
+            if self.is_logged(item.sensor_id, item.remote_path):
+                return False
+            if any(existing.key() == item.key() for existing in self.queue):
+                return False
+            self.queue.append(item)
+            self.save()
+            return True
 
     def pending_count(self) -> int:
-        return len(self.queue)
+        with self.lock:
+            return len(self.queue)
+
+    def snapshot_queue(self) -> list[PendingExcelItem]:
+        with self.lock:
+            return list(self.queue)
+
+    def drop_from_queue(self, item_ids: set[str]) -> None:
+        """Remove flushed items; anything enqueued meanwhile stays."""
+        with self.lock:
+            self.queue = [item for item in self.queue if item.id not in item_ids]
+            self.save()
 
 
 def pending_from_row(
@@ -362,12 +383,21 @@ def _remember_group(store: ExcelLogStore, item: PendingExcelItem, row: ExcelRow)
 
 
 def flush_excel_queue(store: ExcelLogStore) -> tuple[int, int]:
-    """Return (saved, still_pending). Reconcile workbook rows before writing."""
-    remaining: list[PendingExcelItem] = []
+    """Return (saved, still_pending). Reconcile workbook rows before writing.
+
+    Works on a snapshot of the queue so it can run on a worker thread while
+    the UI keeps enqueueing; only the items handled here are removed.
+    """
+    snapshot = store.snapshot_queue()
+    if not snapshot:
+        return 0, 0
+    done_ids: set[str] = set()
+    remaining = 0
     saved = 0
     by_book: dict[str, list[PendingExcelItem]] = {}
-    for item in store.queue:
+    for item in snapshot:
         if store.is_logged(item.sensor_id, item.remote_path):
+            done_ids.add(item.id)
             saved += 1
             continue
         book = Path(item.workbook)
@@ -376,6 +406,7 @@ def flush_excel_queue(store: ExcelLogStore) -> tuple[int, int]:
                 if workbook_has_iq_filename(book, item.worksheet, item.filename):
                     store.mark_logged(item.sensor_id, item.remote_path)
                     _remember_group(store, item, item.to_row())
+                    done_ids.add(item.id)
                     saved += 1
                     continue
             except Exception:
@@ -384,7 +415,7 @@ def flush_excel_queue(store: ExcelLogStore) -> tuple[int, int]:
     for book_text, items in by_book.items():
         book = Path(book_text)
         if not book.is_file():
-            remaining.extend(items)
+            remaining += len(items)
             continue
         store.ensure_backup(book)
         grouped: dict[str, list[PendingExcelItem]] = {}
@@ -394,15 +425,15 @@ def flush_excel_queue(store: ExcelLogStore) -> tuple[int, int]:
         try:
             write_excel_rows(book, rows)
         except ExcelBusyError:
-            remaining.extend(items)
+            remaining += len(items)
             continue
         except Exception:
-            remaining.extend(items)
+            remaining += len(items)
             continue
         for item in items:
             store.mark_logged(item.sensor_id, item.remote_path)
             _remember_group(store, item, _merged_group_row(store, [item]))
+            done_ids.add(item.id)
             saved += 1
-    store.queue = remaining
-    store.save()
-    return saved, len(remaining)
+    store.drop_from_queue(done_ids)
+    return saved, remaining

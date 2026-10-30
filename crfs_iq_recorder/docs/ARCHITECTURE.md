@@ -1,6 +1,6 @@
 # CRFS IQ Recorder - architecture
 
-**Version documented:** 1.8.7
+**Version documented:** 1.8.8
 **Code:** `crfs_iq_recorder/` as of this file (21 September 2026)
 **Related app:** IQ Spectrogram Converter (`iq_gui.py`, `iq_data.py`) at the repository root
 
@@ -117,7 +117,8 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | SFTP client | Paramiko connect (8 s), read (20 s), download via `.part` | `sftp_client.py`, `download_util.py` |
 | Listing groups | `_0001` / `_0002` as one capture; NEW badge | `listing_sort.py` |
 | Waterfall preview | First ~0.8 MB of a WAVE; STFT PNG | `spectrogram_preview.py`, `iq_wav.py` |
-| Excel log | Queue, backup, merge split names, COM or openpyxl | `excel_log.py`, `excel_writer.py`, `excel_com.py` |
+| Excel log | Queue, backup, merge split names, COM or openpyxl; flushed on a worker thread (1.8.8) | `excel_log.py`, `excel_writer.py`, `excel_com.py` |
+| JSON state files | Atomic temp-file + replace writes, `.bak` fallback on a corrupt file (1.8.8) | `json_store.py` |
 | Collection catalog | Workbook classes, worksheets, frequency styles | `collection_catalog.py`, `class_match.py` |
 | Secrets | Windows DPAPI (`CryptProtectData`); Base64 elsewhere | `secrets_store.py` |
 | Theme | Dark/light shared look | `theme.py` |
@@ -280,6 +281,8 @@ Matching: prefer a remembered `iq_stem`; otherwise the lead part's timestamp mus
 | Matplotlib cache | `%LOCALAPPDATA%\CRFS IQ Recorder\cache\matplotlib` | unused unless frozen | Yes |
 | Converter settings | `.iq_gui_settings.json` next to the Converter | same | Separate app |
 | Demo SFTP | In-memory | - | No |
+
+Settings, recording history and the Excel queue are written through `json_store.write_json`: the document goes to `<name>.<pid>.tmp` and is moved over the live file (`os.replace`), and the previous document is kept as `<name>.bak`. A kill or power loss mid-write therefore leaves the old or the new file, never an empty one; if the live file is unreadable at startup the `.bak` copy is loaded instead and the next save repairs the live file.
 
 After a disconnect: the header goes Checking, then Reconnecting... (one missed HTTP check), then Disconnected (two). It returns to Connected when probe succeeds. SFTP timeouts stay in Sensor Files. Reopening Sensor Files starts a new SSH session. Pending Excel rows retry until the workbook is writable. History still matches files after an IP change if stems or timestamps line up.
 

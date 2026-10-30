@@ -1,6 +1,6 @@
 # Distributing CRFS IQ Recorder on Windows
 
-**Version documented:** 1.8.7 (October 2026)
+**Version documented:** 1.8.8 (October 2026)
 
 This page explains why Windows warns about or blocks `CRFS_IQ_Recorder.exe` on
 other computers, what was changed in the build, what still has to happen on the

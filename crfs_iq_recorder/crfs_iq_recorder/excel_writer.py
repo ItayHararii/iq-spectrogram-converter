@@ -75,13 +75,42 @@ def _header_map(ws: Worksheet) -> dict[str, int]:
     return found
 
 
+# Consecutive empty rows after which a streamed (read-only) scan stops. A
+# workbook whose used range was dragged to row 1,048,576 by stray formatting
+# must not cost a million-row walk on every flush.
+EMPTY_ROW_RUN_LIMIT = 2000
+
+
+def _populated_cells(ws: Worksheet) -> list[tuple[int, int, Any]]:
+    """(row, col, value) for cells that hold a value, without creating cells.
+
+    ``ws.cell(row, col)`` materialises a Cell for every coordinate it touches,
+    so walking ``range(1, ws.max_row + 1)`` on a sheet whose used range reaches
+    the bottom of Excel creates ~14 million objects and takes tens of seconds.
+    openpyxl keeps the loaded cells in ``ws._cells``; fall back to the slow walk
+    only when that attribute is missing (foreign worksheet implementations).
+    """
+    cells = getattr(ws, "_cells", None)
+    if isinstance(cells, dict):
+        return [
+            (row, col, cell.value)
+            for (row, col), cell in cells.items()
+            if cell.value not in (None, "")
+        ]
+    out: list[tuple[int, int, Any]] = []
+    for row in range(1, (ws.max_row or 1) + 1):
+        for col in range(1, (ws.max_column or 1) + 1):
+            value = ws.cell(row, col).value
+            if value not in (None, ""):
+                out.append((row, col, value))
+    return out
+
+
 def _last_used_row(ws: Worksheet, columns: int) -> int:
     last = 1
-    for row in range(1, (ws.max_row or 1) + 1):
-        for col in range(1, columns + 1):
-            if ws.cell(row, col).value not in (None, ""):
-                last = row
-                break
+    for row, col, _value in _populated_cells(ws):
+        if col <= columns and row > last:
+            last = row
     return last
 
 
@@ -90,8 +119,10 @@ def existing_iq_names(ws: Worksheet, headers: dict[str, int]) -> set[str]:
     if not iq_col:
         return set()
     names: set[str] = set()
-    for row in range(2, (ws.max_row or 1) + 1):
-        for name in split_iq_filenames(ws.cell(row, iq_col).value):
+    for row, col, value in _populated_cells(ws):
+        if col != iq_col or row < 2:
+            continue
+        for name in split_iq_filenames(value):
             names.add(name)
     return names
 
@@ -167,11 +198,13 @@ def find_row_with_iq_names(ws: Worksheet, names: list[str]) -> int | None:
     wanted = {name.casefold() for name in names if name}
     if not wanted:
         return None
-    for row in range(2, (ws.max_row or 1) + 1):
-        existing = split_iq_filenames(ws.cell(row, iq_col).value)
-        if any(name.casefold() in wanted for name in existing):
-            return row
-    return None
+    hits = [
+        row
+        for row, col, value in _populated_cells(ws)
+        if col == iq_col and row >= 2
+        and any(name.casefold() in wanted for name in split_iq_filenames(value))
+    ]
+    return min(hits) if hits else None
 
 
 def append_iq_row(ws: Worksheet, row_data: ExcelRow) -> int:
@@ -237,8 +270,16 @@ def workbook_has_iq_filename(path: Path, sheet: str, filename: str) -> bool:
         wanted = {name.casefold() for name in (split_iq_filenames(filename) or [filename]) if name}
         if not wanted:
             return False
+        empty_run = 0
         for row in ws.iter_rows(min_row=2, min_col=iq_col, max_col=iq_col, values_only=True):
-            names = split_iq_filenames(row[0] if row else None)
+            value = row[0] if row else None
+            if value in (None, ""):
+                empty_run += 1
+                if empty_run >= EMPTY_ROW_RUN_LIMIT:
+                    break
+                continue
+            empty_run = 0
+            names = split_iq_filenames(value)
             if any(name.casefold() in wanted for name in names):
                 return True
         return False

@@ -426,3 +426,143 @@ def preferred_event_name(events) -> str:
     from crfs_iq_recorder.collection_catalog import preferred_event
 
     return preferred_event(events)
+
+
+def _inflate_used_range(path: Path, sheet: str, row: int = 1_048_000) -> None:
+    """Mimic a workbook whose used range reaches the bottom of Excel: one styled, empty cell."""
+    from openpyxl.styles import Font
+
+    wb = load_workbook(path)
+    wb[sheet].cell(row, 1).font = Font(bold=True)
+    wb.save(path)
+    wb.close()
+
+
+def test_inflated_used_range_catalog_and_append_stay_fast(tmp_path):
+    """Regression: a stray formatted cell at row 1,048,000 used to cost a
+    million-row walk (3.6 s and +360 MB for the catalog; 25 s and 14.7 M cell
+    objects for one append) on the UI thread."""
+    import time
+
+    path = build_sample_workbook(tmp_path / "sample.xlsx")
+    _inflate_used_range(path, "SATCOM")
+    probe = load_workbook(path, read_only=True)
+    assert probe["SATCOM"].max_row >= 1_048_000
+    probe.close()
+
+    t0 = time.perf_counter()
+    catalog = load_workbook_catalog(path)
+    assert time.perf_counter() - t0 < 2.0
+    assert any(item.target_class == "Iridium" for item in catalog.mappings)
+
+    mapping = haifa_mappings()[1]
+    row = ExcelRow(
+        worksheet="SATCOM",
+        collection_event="Haifa Port",
+        target_class="Iridium",
+        start_hz=mapping.start_hz,
+        end_hz=mapping.end_hz,
+        start_style=mapping.start_style,
+        stop_style=mapping.stop_style,
+        sensor="CRFS 100-18",
+        filename="iq_fast_0001.wav",
+        remote_path="/mnt/1/remdata/20260915/iq_fast_0001.wav",
+        sensor_id="rfeyeDEMO",
+        duration_s=0.5,
+    )
+    t0 = time.perf_counter()
+    written = append_rows_openpyxl(path, [row])
+    assert time.perf_counter() - t0 < 5.0
+    after = load_workbook(path)
+    ws = after["SATCOM"]
+    # The saved sheet holds only real cells (a column slice such as ws["B"]
+    # would itself materialise a million cells, so inspect _cells directly).
+    assert len(ws._cells) < 5_000
+    data_rows = [row for (row, col), cell in ws._cells.items() if col == 2 and cell.value not in (None, "")]
+    # Appended directly under the last real row, not under the stray formatted cell.
+    assert written[0] == max(data_rows)
+    assert written[0] < 100
+    assert ws.cell(written[0], 9).value == "iq_fast_0001.wav"
+    after.close()
+
+
+def test_workbook_has_iq_filename_stops_scanning_after_empty_run(tmp_path):
+    import time
+
+    from crfs_iq_recorder.excel_writer import workbook_has_iq_filename
+
+    path = build_sample_workbook(tmp_path / "sample.xlsx")
+    mapping = haifa_mappings()[1]
+    row = ExcelRow(
+        worksheet="SATCOM",
+        collection_event="Haifa Port",
+        target_class="Iridium",
+        start_hz=mapping.start_hz,
+        end_hz=mapping.end_hz,
+        start_style=mapping.start_style,
+        stop_style=mapping.stop_style,
+        sensor="CRFS 100-18",
+        filename="iq_present_0001.wav",
+        remote_path="/mnt/1/remdata/20260915/iq_present_0001.wav",
+        sensor_id="rfeyeDEMO",
+        duration_s=0.5,
+    )
+    append_rows_openpyxl(path, [row])
+    _inflate_used_range(path, "SATCOM")
+    t0 = time.perf_counter()
+    assert workbook_has_iq_filename(path, "SATCOM", "iq_present_0001.wav") is True
+    assert workbook_has_iq_filename(path, "SATCOM", "iq_absent_0001.wav") is False
+    assert time.perf_counter() - t0 < 2.0
+
+
+def test_flush_keeps_items_enqueued_while_writing(tmp_path, monkeypatch):
+    """The flush runs on a worker; a row enqueued by the UI mid-write must survive."""
+    import crfs_iq_recorder.excel_log as excel_log
+
+    path = build_sample_workbook(tmp_path / "sample.xlsx")
+    store = ExcelLogStore(tmp_path / "queue.json")
+    mapping = haifa_mappings()[1]
+
+    def make_row(name: str) -> ExcelRow:
+        return ExcelRow(
+            worksheet="SATCOM",
+            collection_event="Haifa Port",
+            target_class="Iridium",
+            start_hz=mapping.start_hz,
+            end_hz=mapping.end_hz,
+            start_style=mapping.start_style,
+            stop_style=mapping.stop_style,
+            sensor="CRFS 100-18",
+            filename=name,
+            remote_path=f"/mnt/1/remdata/20260915/{name}",
+            sensor_id="rfeyeDEMO",
+            duration_s=0.08,
+        )
+
+    assert store.enqueue(pending_from_row(workbook=path, row=make_row("iq_first_0001.wav")))
+    real_write = excel_log.write_excel_rows
+
+    def write_and_enqueue(book, rows):
+        # Simulates the UI thread logging a new part while the worker writes.
+        store.enqueue(pending_from_row(workbook=path, row=make_row("iq_second_0001.wav")))
+        return real_write(book, rows)
+
+    monkeypatch.setattr(excel_log, "write_excel_rows", write_and_enqueue)
+    saved, pending = flush_excel_queue(store)
+    assert saved == 1
+    assert pending == 0
+    assert [item.filename for item in store.queue] == ["iq_second_0001.wav"]
+    reloaded = ExcelLogStore(tmp_path / "queue.json")
+    assert [item.filename for item in reloaded.queue] == ["iq_second_0001.wav"]
+    assert reloaded.is_logged("rfeyeDEMO", "/mnt/1/remdata/20260915/iq_first_0001.wav")
+
+    monkeypatch.setattr(excel_log, "write_excel_rows", real_write)
+    saved, pending = flush_excel_queue(store)
+    assert saved == 1
+    assert store.pending_count() == 0
+
+
+def test_flush_with_empty_queue_does_not_rewrite_store(tmp_path):
+    store = ExcelLogStore(tmp_path / "queue.json")
+    assert flush_excel_queue(store) == (0, 0)
+    assert not (tmp_path / "queue.json").exists()
