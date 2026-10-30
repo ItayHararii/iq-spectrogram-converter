@@ -250,6 +250,26 @@ if ($pref -and $pref.AttackSurfaceReductionRules_Ids) {
 } else {
     Out-Line "ASR rules: none configured"
 }
+# Controlled folder access ("Ransomware protection"): only apps Microsoft already
+# trusts may change files in Documents, Desktop, Pictures, Videos, Music, Favorites.
+# It does not stop the app from starting, but it blocks an unknown installer or
+# uninstaller inside those folders, and the app itself when it saves recordings there.
+$cfa = if ($pref) { $pref.EnableControlledFolderAccess } else { $null }
+$cfaText = switch ($cfa) { 0 { "off" } 1 { "ON (block)" } 2 { "audit only" } 3 { "block disk-sector writes only" } 4 { "audit disk-sector writes only" } default { "unknown" } }
+Out-Line ("Controlled folder access (ransomware protection): {0}" -f $cfaText)
+if ($cfa -eq 1) {
+    Out-Line "  Unknown programs cannot create, change or delete files in Documents, Desktop, Pictures, Videos, Music or Favorites."
+    Out-Line "  Install to Program Files or %LOCALAPPDATA%\Programs, and keep the download folder outside those folders."
+}
+$cfaEvents = Try-Get { @(Get-WinEvent -FilterHashtable @{LogName = "Microsoft-Windows-Windows Defender/Operational"; Id = 1123, 1124; StartTime = $since } -ErrorAction Stop -MaxEvents 400 |
+        Where-Object { $_.Message -match ("(?i)" + [regex]::Escape($fileName) + "|CRFS_IQ_Recorder|CRFS IQ Recorder|_unins\.tmp|is-[A-Z0-9]+") }) } @()
+Out-Line ("Controlled folder access blocks (1123) / audits (1124) involving the app or its installer: {0}" -f $cfaEvents.Count)
+foreach ($e in ($cfaEvents | Select-Object -First 6)) {
+    $x = [xml]$e.ToXml(); $d = @{}
+    foreach ($row in $x.Event.EventData.Data) { $d[$row.Name] = $row.'#text' }
+    Out-Line ("  {0}  id={1}  process: {2}" -f $e.TimeCreated.ToString("yyyy-MM-dd HH:mm"), $e.Id, (Redact $d["Process Name"]))
+    Out-Line ("        target: {0}" -f (Redact $d["Path"]))
+}
 $av = Try-Get { Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop }
 if ($av) { Out-Line ("Registered AV products: {0}" -f (($av | ForEach-Object { $_.displayName }) -join "; ")) }
 $threats = Try-Get { Get-MpThreatDetection -ErrorAction Stop }
@@ -334,6 +354,11 @@ if ($pol -and $pol.ShellSmartScreenLevel -eq "Block") {
 }
 if ($hits.Count -gt 0) {
     $verdict.Add("Defender reported a detection on this file: submit it at https://www.microsoft.com/wdsi/filesubmission as a false positive (IT) and share the detection name with the app owner.")
+}
+if ($cfaEvents.Count -gt 0) {
+    $verdict.Add(("Controlled folder access blocked the app, its installer or its uninstaller {0} time(s): it was installed or saving into Documents/Desktop/Pictures. Delete a leftover install folder in File Explorer, reinstall to the default folder (Program Files or %LOCALAPPDATA%\Programs), and keep the recordings folder outside protected folders." -f $cfaEvents.Count))
+} elseif ($cfa -eq 1) {
+    $verdict.Add("Controlled folder access is ON: do not install into or download recordings to Documents, Desktop, Pictures, Videos or Music; an unknown app is blocked from writing there.")
 }
 $crashes = Try-Get { @(Get-WinEvent -FilterHashtable @{LogName = "Application"; Id = 1000; StartTime = $since } -ErrorAction Stop -MaxEvents 400 |
         Where-Object { $_.Message -match ("(?i)Faulting application name:\s*" + [regex]::Escape($fileName) + "\.exe") }).Count } 0

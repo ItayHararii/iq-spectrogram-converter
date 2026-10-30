@@ -1,6 +1,6 @@
 # Distributing CRFS IQ Recorder on Windows
 
-**Version documented:** 1.8.6 (October 2026)
+**Version documented:** 1.8.7 (October 2026)
 
 This page explains why Windows warns about or blocks `CRFS_IQ_Recorder.exe` on
 other computers, what was changed in the build, what still has to happen on the
@@ -18,6 +18,12 @@ Short version:
 - "Cannot run at all" on a **company-managed** PC = App Control (WDAC),
   AppLocker or a Defender ASR rule. Signing is necessary but IT also has to
   allow the publisher (or the installer path).
+- "Some elements could not be removed" from the uninstaller, or the app
+  unable to save into Documents = Defender's **Controlled folder access**
+  (Ransomware protection). It lets only programs Microsoft already trusts
+  change files in Documents, Desktop, Pictures, Videos, Music and Favorites.
+  Install to the default folder (Program Files or `%LOCALAPPDATA%\Programs`),
+  never into those folders, and keep the recordings folder outside them.
 - None of this was a Defender detection. Defender scans of every release are
   clean and the event logs show no detections.
 - Separately, 1.8.5 and earlier crashed on every exit (Windows Error Reporting
@@ -33,6 +39,7 @@ Evidence collected on the build PC (Windows 11 Pro 26300, Smart App Control
 | "Windows protected your PC", "Unknown publisher", Run anyway works | Microsoft Defender SmartScreen | EXE has no Authenticode signature (`Get-AuthenticodeSignature` = NotSigned); reproduced with a Mark-of-the-Web copy of the GitHub download; no SmartScreen policy on the PC | Sign every release with the same trusted identity; reputation then accumulates per publisher instead of per file hash |
 | App does not start, no dialog or a brief "blocked" toast | Smart App Control (Windows 11, enforcing) | Registry `CI\Policy\VerifiedAndReputablePolicyState = 1`; `Microsoft-Windows-CodeIntegrity/Operational` events 3077/3033 "did not meet the Enterprise signing level requirements" for the freshly built 1.8.6 EXE, for the installer's extracted `CRFS_IQ_Recorder_Setup.tmp`, and (older) for a bundled `.pyd` unpacked to `%TEMP%\_MEIxxxx`. Event 3118 shows the decision inputs: Defender cloud reputation asked = true, threat named = none, signature count = 0 | Trusted signature on the EXE **and** on every bundled DLL/PYD. There is no per-app exception in Smart App Control |
 | App does not start on a work PC | App Control for Business (WDAC) / AppLocker / Defender ASR | Not present on the build PC (no AppLocker rules, no ASR rules, workgroup machine). These are the standard reasons on Intune/GPO-managed PCs; AppLocker default rules forbid running from `%TEMP%`, which is exactly where a one-file PyInstaller EXE unpacks | Signed build plus an IT publisher rule; install to Program Files (installer) instead of running from `%TEMP%` |
+| Uninstaller says "Some elements could not be removed" and leaves every file; or the app cannot write recordings | Defender **Controlled folder access** (Ransomware protection) | Observed 30 Oct 2026 after an install into `Documents\CRFS IQ Recorder`: three `Microsoft-Windows-Windows Defender/Operational` events 1123, process `%TEMP%\is-xxxx-uninstall.tmp\_unins.tmp`, target `%userprofile%\Documents\CRFS IQ Recorder\`; PowerShell was blocked the same way; the install itself had been allowed because Microsoft's cloud had just classified the setup program as friendly, while the uninstaller is a different, unknown binary. Inno Setup still removed its registry entry, so the folder was orphaned | Install only to the default folder (Program Files / `%LOCALAPPDATA%\Programs`, not protected). Since 1.8.7 the installer warns before installing into a protected folder and, if an uninstall is blocked, says so and tells the user to delete the folder in File Explorer (the only program always allowed). Signing helps indirectly (trusted publishers are more likely to be allowed); IT can add the app to the Controlled folder access allow list |
 | Windows Error Reporting entry on every close | Application bug | 32 `Application` log events 1000 for `CRFS_IQ_Recorder.exe` 1.8.5, exception 0xC0000409 in `Qt6Core.dll`; reproduced from source: `QThread: Destroyed while thread '' is still running` | Fixed in 1.8.6 (`worker_threads.py`): worker threads are stopped before Python tears down |
 
 Why the same unsigned file runs on one Smart App Control PC and not on
@@ -170,6 +177,20 @@ identifies the publisher. When signing is configured, Inno Setup signs the
 embedded, verified in the Inno Setup compiler source), and therefore the
 uninstaller too, so no unsigned executable is ever run from the installer.
 
+**Where to install.** Keep the default folder. `Documents`, `Desktop`,
+`Pictures`, `Videos`, `Music` and `Favorites` (and their OneDrive-redirected
+locations) are guarded by Defender's Controlled folder access on many PCs: an
+unknown program may be refused when it writes or deletes there, so an
+installation inside them can become impossible to uninstall. The installer's
+`[Code]` section checks the chosen folder against those locations (plus any
+folders added to the protection list in the registry) and asks for
+confirmation, with "No" as the default; in silent mode it only logs. After an
+uninstall that could not delete the program files it shows which folder is
+left and why, instead of only Inno Setup's generic "Some elements could not be
+removed". The same protection applies to the app's **download folder**: with
+Controlled folder access on, the recordings folder must stay outside those
+locations (the default `%USERPROFILE%\CRFS IQ Recorder\Recordings` is fine).
+
 Both artifacts are attached to the GitHub Release for the tag. The EXE is not
 stored in Git.
 
@@ -196,6 +217,12 @@ rule** so that every future version is covered:
 - **SmartScreen "Warn and prevent bypass"** policy: users cannot click Run
   anyway; distribute from an intranet share or install via Intune, and/or
   submit the signed file through the Microsoft Security Intelligence portal.
+- **Controlled folder access** (Defender ransomware protection, often enabled
+  by Intune): deploy to Program Files and leave the default recordings folder;
+  if users must save recordings into Documents, add
+  `%ProgramFiles%\CRFS IQ Recorder\CRFS_IQ_Recorder.exe` to the Controlled
+  folder access allowed applications (Intune: Attack surface reduction >
+  Controlled folder access > allowed apps).
 - Until a signed release exists, IT can only allow by **hash** or **path**,
   which has to be repeated for every version.
 
@@ -260,6 +287,13 @@ Verification done for 1.8.6 on the build PC:
   because Smart App Control refused them (CodeIntegrity 3077/3118), which is
   the behaviour documented in section 1, not a regression. Full test suite:
   188 passed, 1 skipped.
+- Installer 1.8.7 on the same PC (Smart App Control on, Controlled folder
+  access on): silent per-user install to `%LOCALAPPDATA%\Programs`, launch
+  and close of the installed app (exit 0, no crash event), silent uninstall
+  with "Removed all? Yes" and no leftover folder, shortcut or registry entry;
+  the folder-page warning when `Documents` is chosen (dialog shown, "No"
+  returns to the page, Cancel leaves nothing behind); the post-uninstall
+  explanation when the program EXE cannot be deleted (log line present).
 - A real signed artifact and the first-run experience on a second, protected
   PC can only be tested after enrollment.
 
@@ -277,10 +311,10 @@ writes `Desktop\CRFS_IQ_Recorder_diagnostics.txt` with user names and IP
 addresses redacted. It reports: Windows build and management state, the file's
 signature and Mark of the Web, Smart App Control state, WDAC enforcement and
 active policies, AppLocker rules, SmartScreen settings and policies, Defender
-mode, ASR rules and detections, and the relevant events from the last 30 days
-(CodeIntegrity 3077/3033, AppLocker 8004, Defender 1116/1117/1121/1122,
-Application 1000), ending with a plain-language summary of which mechanism
-applies.
+mode, ASR rules, Controlled folder access state and detections, and the
+relevant events from the last 30 days (CodeIntegrity 3077/3033/3118,
+AppLocker 8004, Defender 1116/1117/1121/1122/1123/1124, Application 1000),
+ending with a plain-language summary of which mechanism applies.
 
 ## 6. The exit crash (fixed in 1.8.6)
 
