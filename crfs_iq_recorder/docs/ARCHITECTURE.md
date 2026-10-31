@@ -1,6 +1,6 @@
 # CRFS IQ Recorder - architecture
 
-**Version documented:** 1.8.8
+**Version documented:** 1.8.9
 **Code:** `crfs_iq_recorder/` as of this file (21 September 2026)
 **Related app:** IQ Spectrogram Converter (`iq_gui.py`, `iq_data.py`) at the repository root
 

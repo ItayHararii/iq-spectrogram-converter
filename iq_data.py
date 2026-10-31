@@ -3,6 +3,7 @@ import gc
 import json
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -235,6 +236,40 @@ def _update_eta_calibration(raw_predicted_s, actual_s):
         pass
 
 
+_PART_SUFFIX = re.compile(r"^(?P<stem>.+)_(?P<part>\d{4})$")
+
+
+def part_time_offset(path):
+    """Where a CRFS split part starts within its recording.
+
+    The sensor splits long recordings into ``<stem>_0001.wav``, ``_0002.wav``,
+    ... and every part's own time axis starts at zero. When the earlier parts
+    sit next to this one, their durations (from the headers only) give the
+    offset. Returns (part_number, offset_seconds) with offset None when the
+    earlier parts are not all present, or (None, None) for a non-part file.
+    """
+    p = Path(os.fspath(path))
+    m = _PART_SUFFIX.match(p.stem)
+    if not m:
+        return None, None
+    part = int(m.group("part"))
+    if part <= 1:
+        return part, 0.0
+    offset = 0.0
+    for k in range(1, part):
+        sibling = p.with_name(f"{m.group('stem')}_{k:04d}{p.suffix}")
+        if not sibling.is_file():
+            return part, None
+        try:
+            info = sf.info(str(sibling))
+        except Exception:
+            return part, None
+        if not info.samplerate:
+            return part, None
+        offset += int(info.frames) / float(info.samplerate)
+    return part, offset
+
+
 def _raw_estimate_seconds(path, rbw):
     """Wall-clock model for chunked STFT + bounded imshow save (no calibration)."""
     info = sf.info(path)
@@ -323,13 +358,16 @@ def _annotate_peak_marker(ax, freq_plot, freq_hz, peak_db):
     ax.axvline(freq_plot, color="#444444", linewidth=0.7, alpha=0.65, zorder=3)
     ha = "right" if freq_plot >= 0 else "left"
     x_off = -8 if freq_plot >= 0 else 8
+    # The y-axis ends 4 dB above the peak, so a label placed above the peak
+    # left the axes and covered the title (seen on real sensor files). Anchor
+    # the label inside the axes, below the stats box, with a line to the peak.
     ax.annotate(
         f"{freq_hz / 1e6:.4f} MHz, {peak_db:.2f} dBFS/bin",
         xy=(freq_plot, peak_db),
-        xytext=(x_off, 8),
-        textcoords="offset points",
+        xytext=(x_off, 0.66),
+        textcoords=("offset points", "axes fraction"),
         ha=ha,
-        va="bottom",
+        va="top",
         fontsize=8,
         color=SPECTRUM_COLOR,
         zorder=4,
@@ -555,10 +593,17 @@ def process_file(
         df_hz = fs / n_fft
         rbw_true = float(enbw_bins) * df_hz
 
+        part_no, part_offset_s = part_time_offset(path)
+
         print(f"--- {Path(path).name} ---")
         print(f"  Sample rate    : {fs:,.0f} Hz")
         print(f"  Samples        : {n_samples:,}")
         print(f"  Duration       : {duration_s:.3f} s")
+        if part_no is not None and part_no > 1:
+            if part_offset_s is None:
+                print(f"  Split part     : {part_no} (earlier parts not found; time axis starts at 0)")
+            else:
+                print(f"  Split part     : {part_no}, starts {part_offset_s:.3f} s into the recording")
         print(f"  Bandwidth      : {bandwidth_hz / 1e6:.3f} MHz")
         print(f"  RBW requested  : {rbw / 1e3:.3f} kHz")
         print(f"  RBW (ENBW)     : {rbw_true / 1e3:.3f} kHz  ({enbw_bins:.3f} bins x {df_hz / 1e3:.3f} kHz)")
@@ -572,6 +617,8 @@ def process_file(
         axis_meta = {
             "fs": fs,
             "duration_s": duration_s,
+            "part_no": part_no,
+            "part_offset_s": part_offset_s,
             "rbw": float(rbw),
             "rbw_true": rbw_true,
             "n_fft": n_fft,
@@ -685,6 +732,16 @@ def process_file(
     f_scale, f_unit = _axis_units(axis_meta["fs"])
     f_max = (axis_meta["fs"] / 2.0) / f_scale
     duration_s = float(axis_meta["duration_s"])
+    part_no = axis_meta.get("part_no")
+    part_offset_s = axis_meta.get("part_offset_s")
+    # A split part's own clock starts at 0; show where it sits in the recording.
+    t_start = float(part_offset_s) if part_offset_s else 0.0
+    part_label = ""
+    if part_no is not None and part_no > 1:
+        if part_offset_s is None:
+            part_label = f"  ·  part {part_no} (earlier parts not found)"
+        else:
+            part_label = f"  ·  part {part_no} from {part_offset_s:.2f} s"
     rbw_req = float(axis_meta["rbw"])
     rbw_true = float(axis_meta["rbw_true"])
     rbw_true_label = _format_rbw(rbw_true)
@@ -709,6 +766,8 @@ def process_file(
                 "fs": float(axis_meta["fs"]),
                 "n_samples": int(n_samples),
                 "duration_s": duration_s,
+                "part_no": part_no,
+                "time_offset_s": t_start,
                 "n_fft": int(axis_meta["n_fft"]),
                 "hop": int(hop),
                 "n_frames": int(n_frames),
@@ -771,7 +830,7 @@ def process_file(
         for spine in ax_spec.spines.values():
             spine.set_color("black")
         ax_spec.set_ylabel("Bin Power (dBFS/bin)")
-        ax_spec.set_title(f"{Path(path).name}  ·  RBW {rbw_label}")
+        ax_spec.set_title(f"{Path(path).name}  ·  RBW {rbw_label}{part_label}")
         ax_spec.tick_params(labelbottom=False)
         ax_spec.grid(False)
         if peak_idx is not None and np.isfinite(peak_val) and np.isfinite(peak_freq_hz):
@@ -784,12 +843,12 @@ def process_file(
             origin="lower",
             aspect="auto",
             interpolation="nearest",
-            extent=[-f_max, f_max, 0.0, duration_s],
+            extent=[-f_max, f_max, t_start, t_start + duration_s],
             vmin=vmin,
             vmax=vmax,
         )
         ax_wf.set_xlim(-f_max, f_max)
-        ax_wf.set_ylim(0.0, duration_s)
+        ax_wf.set_ylim(t_start, t_start + duration_s)
         ax_wf.set_xlabel(f"Frequency ({f_unit})")
         ax_wf.set_ylabel("Time (s)")
         cbar = fig.colorbar(im, ax=[ax_spec, ax_wf], fraction=0.046, pad=0.04)

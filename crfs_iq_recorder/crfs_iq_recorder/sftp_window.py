@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 import traceback
 from collections import OrderedDict
 from pathlib import Path
@@ -79,6 +80,7 @@ from .validation import ValidationError, parse_optional_port
 from .worker_threads import track as track_worker_thread
 
 MAX_PARALLEL_DOWNLOADS = 4
+DOWNLOAD_RETRY_DELAY_S = 3.0
 _PREVIEW_CACHE = 8
 _TABLE_HEADERS = [
     "New",
@@ -413,7 +415,16 @@ class FileDownloadWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            self._browser = _open_browser(self._state, cancel=self._cancel)
+            try:
+                self._browser = _open_browser(self._state, cancel=self._cancel)
+            except SftpError as exc:
+                # The sensor's SSH server times out handshakes when it is
+                # busy with other sessions. Nothing has been written yet, so
+                # one more try costs nothing.
+                if "timed out" not in str(exc).lower() or (self._cancel is not None and self._cancel.is_set()):
+                    raise
+                time.sleep(DOWNLOAD_RETRY_DELAY_S)
+                self._browser = _open_browser(self._state, cancel=self._cancel)
 
             def cb(done: int, total: int) -> None:
                 self.progress.emit(self._name, int(done), int(total or 0))
@@ -1030,10 +1041,27 @@ class SftpWindow(QWidget):
         paths = self._selected_file_paths()
         if not paths:
             return
+        if not self._confirm_delete(paths):
+            return
         self._deleting_paths = list(paths)
         self._set_busy(True)
         self.status.setText(f"Deleting {len(paths)} file(s)…")
         self._cmd_remove.emit(list(paths))
+
+    def _confirm_delete(self, paths: list[str]) -> bool:
+        """One key press used to erase field recordings from the sensor for good."""
+        names = [path.rsplit("/", 1)[-1] for path in paths]
+        shown = "\n".join(names[:6])
+        if len(names) > 6:
+            shown += f"\n… and {len(names) - 6} more"
+        answer = QMessageBox.question(
+            self,
+            "Delete from sensor",
+            f"Delete {len(paths)} file(s) from the sensor? This cannot be undone.\n\n{shown}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     @Slot(object, object)
     def _on_removed(self, ok: object, errors: object) -> None:

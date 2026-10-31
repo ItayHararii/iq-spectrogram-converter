@@ -75,7 +75,7 @@ except Exception:
     _HAS_DND = False
 
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 # Sister application of "CRFS IQ Recorder" (same product family, same Sensorz icon).
 APP_NAME = "CRFS IQ Spectrogram Converter"
 COMPANY_NAME = "Sensorz"

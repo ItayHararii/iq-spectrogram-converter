@@ -22,6 +22,12 @@ _PART_SUFFIX = re.compile(r"^(?P<stem>.+)_(?P<part>\d{4})(?P<ext>\.[^.]+)$", re.
 _MATCH_BEFORE = timedelta(seconds=180)
 _MATCH_AFTER_EXTRA = timedelta(seconds=180)
 _OFFSET_PENALTY_S = 10_000.0
+# A name-derived start time must agree with the file's mtime. A CRFS WAVE part
+# is capped at 524 MB, so even the slowest sample rate writes a part in well
+# under an hour; a start after the mtime is impossible. Without this, the
+# ±1-4 h guesses matched a stranger 4 h away once the real file was deleted.
+_NAME_TIME_BEFORE_MTIME = timedelta(minutes=60)
+_NAME_TIME_AFTER_MTIME = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -301,6 +307,7 @@ def ranked_file_times(entry: RemoteEntry) -> list[tuple[float, datetime]]:
     """(score_penalty, timestamp). Mtime and UTC conversion beat hour-offset guesses."""
     ranked: list[tuple[float, datetime]] = []
     seen: set[datetime] = set()
+    mtime = _naive(entry.modified).replace(microsecond=0) if entry.modified is not None else None
 
     def add(value: datetime | None, penalty: float) -> None:
         if value is None:
@@ -308,6 +315,9 @@ def ranked_file_times(entry: RemoteEntry) -> list[tuple[float, datetime]]:
         naive = _naive(value).replace(microsecond=0)
         if naive in seen:
             return
+        if mtime is not None and naive != mtime:
+            if naive > mtime + _NAME_TIME_AFTER_MTIME or naive < mtime - _NAME_TIME_BEFORE_MTIME:
+                return  # a guess the mtime rules out
         seen.add(naive)
         ranked.append((penalty, naive))
 
@@ -400,6 +410,70 @@ def persist_matched_stems(
         save_recordings(out, path)
 
 
+def set_recording_stem(record_id: str, stem: str, path: Path | None = None) -> bool:
+    """Pin a recording to the file stem the sensor reported for it.
+
+    The EMP event stream names each file the Node opens for a task, so the
+    association no longer has to be inferred from timestamps. Returns True
+    when a record was updated.
+    """
+    wanted = (stem or "").strip().casefold()
+    if not record_id or not wanted:
+        return False
+    records = load_recordings(path)
+    out: list[RecordingParams] = []
+    changed = False
+    for record in records:
+        if record.id == record_id and record.iq_stem.casefold() != wanted:
+            out.append(replace(record, iq_stem=wanted))
+            changed = True
+        else:
+            out.append(record)
+    if changed:
+        save_recordings(out, path)
+    return changed
+
+
+# A file the sensor created this long before the request was sent cannot be
+# its output. Allows for a sensor clock that runs a little behind the PC.
+LIVE_MATCH_SKEW = timedelta(seconds=60)
+
+
+def live_capture_files(
+    entries: list[RemoteEntry],
+    record: RecordingParams,
+    *,
+    known: list[RecordingParams],
+    sensor_parts: list[str] | tuple[str, ...] = (),
+    host: str = "",
+) -> list[RemoteEntry]:
+    """Files in a live listing that belong to the recording in progress.
+
+    When the sensor's event stream named the files of this task, only those
+    count. Otherwise fall back to the time window, but never adopt a file
+    that another recording already owns or that predates this request.
+    """
+    files = [entry for entry in entries if not entry.is_dir]
+    if sensor_parts:
+        stems = {iq_group_key(name) for name in sensor_parts if name}
+        return [entry for entry in files if iq_group_key(entry.name) in stems]
+    others = [item for item in known if item.id != record.id]
+    matched = match_recordings_to_entries(files, [*others, record], host=host)
+    earliest = record.started_at - LIVE_MATCH_SKEW
+    mine: list[RemoteEntry] = []
+    for entry in files:
+        owner = matched.get(entry.path)
+        if owner is None or owner.id != record.id:
+            continue
+        # Live listings have exact times (mtime, UTC name); hour-offset guesses
+        # are for matching old files whose clock context is unknown.
+        exact = [when for penalty, when in ranked_file_times(entry) if penalty < _OFFSET_PENALTY_S]
+        if exact and all(when < earliest for when in exact):
+            continue
+        mine.append(entry)
+    return mine
+
+
 def group_total_bytes(entries: list[RemoteEntry]) -> dict[str, int]:
     totals: dict[str, int] = {}
     for entry in entries:
@@ -463,6 +537,10 @@ def match_recordings_to_entries(
             continue
         for record in unused:
             if record.id in used_ids:
+                continue
+            if record.iq_stem:
+                # Pinned to a file the sensor named. If that file is gone
+                # (deleted), the metadata belongs to no other file.
                 continue
             start = record.started_at - _MATCH_BEFORE
             end = record.started_at + timedelta(seconds=max(record.duration_s, 0)) + _MATCH_AFTER_EXTRA

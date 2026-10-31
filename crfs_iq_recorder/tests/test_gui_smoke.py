@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -102,7 +105,8 @@ def test_gui_default_payload(qapp):
         scan = payload["remote_recording_scans"][0]
         assert scan["duration"] == scan["rate"] == scan["capture_length"] == 0.1
         assert scan["recording_format"] == "WAVE"
-        assert "7.631375" in window.size_label.text()
+        # 12.5 MHz is recorded at 15.625 MS/s: 0.1 s -> about 6.29 MB (measured 6.285 MB per 0.1 s).
+        assert "6.288192" in window.size_label.text()
         assert "Estimate" in window.size_label.text()
         assert window._conn.demo is True
         assert window.model_value.text() == "R100-18"
@@ -597,6 +601,59 @@ def test_storage_failure_does_not_change_api_link(qapp):
         assert window.status_value.text() == "Connected"
         assert window.link_status.text() == "Connected"
     finally:
+        window.close()
+
+
+def test_storage_reads_are_coalesced_not_cancelled(qapp, monkeypatch):
+    """Startup and the first 'connected' report both ask for storage within ~1 s.
+
+    On an RFeye Node the second request used to cancel the first mid-handshake
+    (paramiko: "Error reading SSH protocol banner") and burn one of the sensor's
+    few SSH handshake slots. Now the first read finishes and one more follows.
+    """
+    from crfs_iq_recorder import gui as gui_module
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.sensor_storage import StorageSnapshot
+
+    window = MainWindow(demo=True)
+    jobs: list = []
+    cancels: list = []
+    try:
+        window._link_timer.stop()
+        window._storage_timer.stop()
+        window._conn.demo = False
+        window._conn.host = "sensor.test"
+        monkeypatch.setattr(window, "_start_job", lambda work, done: jobs.append((work, done)))
+        monkeypatch.setattr(gui_module, "_open_browser", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no net")), raising=False)
+
+        window._refresh_storage()
+        first_cancel = window._storage_cancel
+        cancels.append(first_cancel)
+        window._refresh_storage()  # the link monitor's "connected" report
+        window._refresh_storage()  # a remote_changed signal
+        assert len(jobs) == 1, "a second read must not start while one is in flight"
+        assert not first_cancel.is_set(), "the in-flight read must not be cancelled"
+        assert window._storage_rerun is True
+
+        # The in-flight read finishes: exactly one follow-up read is scheduled.
+        token = window._storage_token
+        window._show_storage_result((token, StorageSnapshot.unavailable("probe")))
+        assert window._storage_in_flight is False
+        deadline = time.monotonic() + 2
+        while len(jobs) < 2 and time.monotonic() < deadline:
+            qapp.processEvents()
+        assert len(jobs) == 2
+        assert window._storage_rerun is False
+
+        # A different sensor (settings changed) still cancels the stale read.
+        second_cancel = window._storage_cancel
+        window._conn = copy.copy(window._conn)
+        window._conn.host = "other.test"
+        window._refresh_storage()
+        assert second_cancel.is_set()
+        assert len(jobs) == 3
+    finally:
+        window._storage_cancel.set()
         window.close()
 
 
@@ -1217,11 +1274,20 @@ def test_sftp_delete_removes_selected_files_only(qapp, monkeypatch):
     logs: list[str] = []
     window.activity.connect(logs.append)
     monkeypatch.setattr(window.table, "hasFocus", lambda: True)
+    asked: list[str] = []
     try:
         _wait_listing(window, qapp, 3, timeout=4)
         assert window.table.topLevelItemCount() >= 3
         window.select_paths([target])
         assert window._selected_file_paths() == [target]
+        # Deleting needs a confirmation; "No" keeps the file.
+        monkeypatch.setattr(window, "_confirm_delete", lambda paths: (asked.append("|".join(paths)), False)[1])
+        window._delete_selected_remote()
+        qapp.processEvents()
+        assert asked == [target]
+        assert target in browser._files
+        assert not window._busy
+        monkeypatch.setattr(window, "_confirm_delete", lambda paths: True)
         window._delete_selected_remote()
         deadline = time.time() + 4
         while time.time() < deadline and target in browser._files:
@@ -1265,6 +1331,7 @@ def test_sftp_delete_parent_removes_all_listed_parts(qapp, monkeypatch):
     parts = shared_demo_browser().publish_capture("iq_group_delete", parts=2)
     window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
     monkeypatch.setattr(window.table, "hasFocus", lambda: True)
+    monkeypatch.setattr(window, "_confirm_delete", lambda paths: True)
     try:
         _wait_listing(window, qapp, 1, timeout=4)
         group = _group_item(window, "iq_group_delete")
@@ -1506,6 +1573,214 @@ def test_gui_series_sends_distinct_task_ids_and_logs_each_completion(qapp, tmp_p
         durations = {p["remote_recording_scans"][0]["duration"] for p in client.payloads}
         assert durations == {0.05}
         assert window._series_active is False
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
+class _StreamingClient:
+    """Stands in for EmpClient against a Node that answers with an event stream.
+
+    Emits the scripted events through `on_event` from a worker thread, then
+    holds the stream (like `stop_on_finished=False`) until `cancel` is set.
+    """
+
+    def __init__(self, script, *, finished=True):
+        self.script = script  # callables (window-independent) returning SseEvent
+        self.finished = finished
+        self.calls = 0
+        self.payloads = []
+        self.cancel = None
+        self.returned = threading.Event()
+        self.closed = False
+
+    def start_recording(self, _target, _password, payload, *, cancel=None, on_event=None, stop_on_finished=True):
+        from crfs_iq_recorder.api_client import HttpOutcome
+
+        self.calls += 1
+        self.payloads.append(payload)
+        self.cancel = cancel
+        parts = []
+        for make in self.script:
+            event = make()
+            if event.event == "time.RemoteTimeData":
+                parts.append(event.data[0]["first_filename"])
+            if on_event is not None:
+                on_event(event)
+            time.sleep(0.05)
+        if cancel is not None:
+            cancel.wait(10)
+        self.returned.set()
+        return HttpOutcome(
+            kind="accepted",
+            title="Sensor reported the recording finished" if self.finished else "Accepted",
+            detail="scripted",
+            request_sent=True,
+            accepted=True,
+            stream_ended="cancelled",
+            sensor_finished=self.finished,
+            sensor_parts=parts,
+            sensor_file_dir="/mnt/1/remdata/20261031/",
+        )
+
+    def abort(self):
+        if self.cancel is not None:
+            self.cancel.set()
+
+    def close(self):
+        self.closed = True
+        self.abort()
+
+
+def _sse(event, data):
+    from crfs_iq_recorder.api_client import SseEvent
+
+    return lambda: SseEvent(event, data, 0.1)
+
+
+def _message(level, text):
+    return _sse("message.MessageData", [{"level": level, "message": text, "timestamp": "2026-10-31T19:00:00Z"}])
+
+
+def test_gui_follows_the_sensor_stream_and_pins_the_reported_filename(qapp, tmp_path, monkeypatch):
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.recording_history import load_recordings
+    from crfs_iq_recorder.recording_status import CONFIRMED
+
+    window = MainWindow(demo=True)
+    window._settle_s = 0
+    window._stable_needed = 2
+    window._demo_parts = 2
+    box = {}
+
+    def part_event():
+        # The demo browser publishes files for the open record once the time has
+        # elapsed, using this stem; the "sensor" announces the first part early.
+        record = load_recordings(tmp_path / "recordings.json")[0]
+        serial = "".join(ch if ch.isalnum() else "_" for ch in (record.sensor_id or "demo")) or "demo"
+        box["stem"] = f"iq_{serial}_{record.started_at:%Y%m%d_%H%M%S}_{record.id[:8]}"
+        return _sse("time.RemoteTimeData", [{"first_filename": f"{box['stem']}_0001.wav",
+                                             "file_dir": "/mnt/1/remdata/20261031/", "task_id": "iq-test"}])()
+
+    client = _StreamingClient([
+        _sse("crfs_iq_recorder.http_accepted", {"status": 200}),
+        _message("WARNING", "No GPS reference (0 satellites), using internal clock"),  # noise: not logged
+        part_event,
+        _message("INFO", "Remote recording is now finished"),
+    ])
+    monkeypatch.setattr(window, "_client", lambda: client)
+    try:
+        window.mode_start.setChecked(True)
+        window.field_a.setText("790")
+        window.field_b.setText("810")
+        window.time_edit.setText("0.05")
+        window.wait_spin.setValue(0)
+        window.repeat_n.setChecked(True)
+        window.repeat_spin.setValue(1)
+        window._on_start()
+        assert _pump_until(qapp, lambda: window._sensor_finished, timeout=5)
+        log = window.log_edit.toPlainText()
+        assert "Request accepted (HTTP 200)" in log
+        assert "Sensor is writing" in log and box["stem"] in log
+        assert "Sensor reported: recording finished." in log
+        assert "GPS" not in log
+        _drive_capture(window, qapp)
+        assert _pump_until(qapp, lambda: window._record_phase == CONFIRMED, timeout=5), (
+            window._record_phase,
+            window.log_edit.toPlainText(),
+        )
+        assert "sensor confirmed" in window.log_edit.toPlainText()
+        assert window._recordings_completed == 1
+        assert window._files_found == 2
+        # Finishing the capture releases the stream so the Node drops the mission.
+        assert client.returned.wait(3)
+        assert load_recordings(tmp_path / "recordings.json")[0].iq_stem == box["stem"].lower()
+        assert client.calls == 1
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_gui_gives_up_quickly_when_the_sensor_finishes_without_a_file(qapp, tmp_path, monkeypatch):
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.recording_status import UNKNOWN
+
+    monkeypatch.setattr("crfs_iq_recorder.gui.NO_FILE_GRACE_S", 0.3)
+    monkeypatch.setattr("crfs_iq_recorder.sftp_client.DemoSftpBrowser.publish_capture", lambda *a, **k: [])
+    window = MainWindow(demo=True)
+    window._settle_s = 0
+    client = _StreamingClient([
+        _sse("crfs_iq_recorder.http_accepted", {"status": 200}),
+        _message("WARNING", "No suitable antenna found"),
+        _message("INFO", "Remote recording is now finished"),
+    ])
+    monkeypatch.setattr(window, "_client", lambda: client)
+    try:
+        window.mode_start.setChecked(True)
+        window.field_a.setText("790")
+        window.field_b.setText("810")
+        window.time_edit.setText("0.05")
+        window.repeat_n.setChecked(True)
+        window.repeat_spin.setValue(1)
+        started = time.time()
+        window._on_start()
+        assert _pump_until(qapp, lambda: window._sensor_finished, timeout=5)
+        _drive_capture(window, qapp)
+        assert _pump_until(qapp, lambda: window._record_phase == UNKNOWN, timeout=5), (
+            window._record_phase,
+            window._watch_state,
+            window.log_edit.toPlainText(),
+        )
+        assert time.time() - started < 8, "must not wait the full 60 s watch"
+        log = window.log_edit.toPlainText()
+        assert "Sensor: No suitable antenna found" in log
+        assert "finished, but it named no file" in log
+        assert "finished without writing a file (No suitable antenna found)" in log
+        assert window._recordings_completed == 0
+        assert window._files_found == 0
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_gui_logs_the_measured_duration_when_the_capture_is_short(qapp, tmp_path, monkeypatch):
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.recording_history import split_iq_filenames
+    from test_collection_excel import build_sample_workbook
+
+    path = build_sample_workbook(tmp_path / "collection.xlsm")
+    window = MainWindow(demo=True)
+    try:
+        window._settle_s = 0
+        window._stable_needed = 2
+        window._demo_parts = 2
+        window.excel_check.setChecked(True)
+        assert window._load_workbook(str(path), quiet=True)
+        window.mode_start.setChecked(True)
+        window.unit_combo.setCurrentText("MHz")
+        window.field_a.setText("1616")
+        window.field_b.setText("1626")
+        window._refresh_class_suggestion()
+        window.time_edit.setText("40")
+        # 40 MHz x 40 s on the Node 40-8 held 3.3 s of IQ: stand in for the byte count model.
+        monkeypatch.setattr(window, "_measured_capture", lambda record: (823_159_264, 2, 3.29))
+        window._on_start()
+        _drive_capture(window, qapp)
+        assert _pump_until(qapp, lambda: window._recordings_completed == 1, timeout=5)
+        log = window.log_edit.toPlainText()
+        assert "hold about 3.3 s of IQ, not the 40 s requested" in log
+        assert "finished short" in window.msg.text()
+        assert _pump_until(qapp, lambda: "Pending Excel" not in window.collection_status.text(), timeout=10)
+        wb = load_workbook(path)
+        rows = [cell for cell in wb["SATCOM"]["I"] if cell.row > 1 and split_iq_filenames(cell.value)]
+        assert len(rows) == 1
+        assert wb["SATCOM"][f"K{rows[0].row}"].value == "3.3 seconds"
     finally:
         window._watch_timer.stop()
         window._record_timer.stop()

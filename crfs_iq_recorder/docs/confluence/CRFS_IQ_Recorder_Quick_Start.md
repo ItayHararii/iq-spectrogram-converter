@@ -4,10 +4,10 @@ CRFS IQ Recorder is a Windows app for CRFS sensors. It starts an IQ recording, d
 
 ## Download and run
 
-**Version:** 1.8.8
+**Version:** 1.8.9
 **File:** `CRFS_IQ_Recorder.exe` - one file, no Python, no install. `CRFS_IQ_Recorder_Setup.exe` - installer for company-managed PCs (installs to Program Files, Start-menu shortcut). With the installer, keep the default folder: do not install into Documents, Desktop or Pictures - Windows ransomware protection guards those folders and can block the uninstaller there.
 
-> Windows EXE: [CRFS IQ Recorder 1.8.8](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.8)
+> Windows EXE: [CRFS IQ Recorder 1.8.9](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.9)
 
 1. Save the exe on this PC (Desktop or a local folder).
 2. Double-click **CRFS_IQ_Recorder.exe**. The window opens in a few seconds; sensor details fill in afterwards.
@@ -33,7 +33,7 @@ To log into a collection workbook: tick **Log recordings to Excel**, choose the 
 
 Repeat count or Until stopped runs consecutive recordings, with a wait between them (default 5 seconds). **Stop after current recording** finishes the capture that is already running, or cancels the countdown, and does not start another.
 
-HTTP and SFTP logins are remembered on this computer. In Sensor Files, select files and press Delete to remove them from the sensor.
+HTTP and SFTP logins are remembered on this computer. In Sensor Files, select files and press Delete to remove them from the sensor (a confirmation is shown first).
 
 ![Main window: band and time, Log recordings to Excel, Start Recording, and Sensor Files.](01-main-window.png)
 
@@ -44,7 +44,7 @@ HTTP and SFTP logins are remembered on this computer. In Sensor Files, select fi
 1. Click **Sensor Files**.
 2. Today's folder on the sensor opens (`/mnt/1/remdata/YYYYMMDD/`). New files show **NEW**. A split capture appears as a collapsible parent such as `iq_20260915_142718`, with `_0001.wav` and `_0002.wav` underneath. Single files stay as normal rows.
 3. Start, end, center, bandwidth, and duration are shown when the app has them. The parent shows part count and combined size.
-4. Select the parent and click **Download this recording** for every listed part, or select individual children to download only those files. There is no save dialog. Delete is keyboard-only on the focused file list. Connecting and waterfall stay in the background, so you can still move, resize, or close the window, and **Open recordings folder** works while a sensor connection is pending.
+4. Select the parent and click **Download this recording** for every listed part, or select individual children to download only those files. There is no save dialog. Delete is keyboard-only on the focused file list and asks for confirmation. Connecting and waterfall stay in the background, so you can still move, resize, or close the window, and **Open recordings folder** works while a sensor connection is pending.
 
 Default local folder: `%USERPROFILE%\CRFS IQ Recorder\Recordings` on the local disk, not OneDrive. Change it in Settings.
 

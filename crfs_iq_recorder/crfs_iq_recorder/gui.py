@@ -68,6 +68,7 @@ from .demo_sftp import shared_demo_browser
 from .excel_log import ExcelLogStore, flush_excel_queue, pending_from_row
 from .excel_writer import ExcelRow
 from .file_watch import (
+    NO_FILE_GRACE_S,
     FileWatchState,
     capture_is_settled,
     folders_for_recording,
@@ -93,8 +94,8 @@ from .paths import (
 from .recording_history import (
     add_recording,
     iq_group_key,
+    live_capture_files,
     load_recordings,
-    match_recordings_to_entries,
     new_recording,
     persist_matched_stems,
     recording_group_key,
@@ -128,7 +129,12 @@ from .sensor_storage import (
     storage_note,
     warning_level,
 )
-from .size_estimate import SizeEstimateError, empirical_size_mb, format_estimate
+from .size_estimate import (
+    SizeEstimateError,
+    estimated_size_mb,
+    format_estimate,
+    recorded_seconds_from_bytes,
+)
 from .sftp_window import SftpWindow, _open_browser
 from .theme import (
     DARK_MODE,
@@ -208,6 +214,9 @@ def app_icon() -> QIcon:
 
 
 class MainWindow(QMainWindow):
+    # Events from the sensor's EMP stream, emitted on the HTTP worker thread.
+    record_event = Signal(object)
+
     def __init__(self, *, demo: bool = False) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
@@ -232,6 +241,15 @@ class MainWindow(QMainWindow):
         self._confirm_attempts = 0
         self._last_match_sizes: dict[str, int] = {}
         self._record_client: EmpClient | None = None
+        self._record_cancel = threading.Event()
+        self._sensor_finished = False
+        self._sensor_finished_at = 0.0
+        self._stream_lost = False
+        self._sensor_parts: list[str] = []
+        self._sensor_warnings: list[str] = []
+        self._expected_bytes = 0
+        self._pending_excel_entries: list = []
+        self.record_event.connect(self._on_record_event, Qt.ConnectionType.QueuedConnection)
         self._sftp_win: SftpWindow | None = None
         self._last_recording_s: float | None = None
         self._open_record_id: str | None = None
@@ -280,6 +298,8 @@ class MainWindow(QMainWindow):
         self._storage_timer.setInterval(STORAGE_POLL_MS)
         self._storage_timer.timeout.connect(self._refresh_storage)
         self._storage_cancel = threading.Event()
+        self._storage_in_flight = False
+        self._storage_rerun = False
         self._link_timer = QTimer(self)
         self._link_timer.setInterval(LINK_CHECK_INTERVAL_MS)
         self._link_timer.timeout.connect(self._poll_link)
@@ -816,14 +836,42 @@ class MainWindow(QMainWindow):
         if getattr(self, "_storage_cancel", None) is not None:
             self._storage_cancel.set()
         self._close_watch_browser()
-        if self._record_client is not None:
-            self._record_client.close()
+        self._abort_record_stream()
+        if self._pending_excel_entries and self._open_record_id:
+            # Closing mid-capture: queue what finished so far with the requested time.
+            record = next((item for item in load_recordings() if item.id == self._open_record_id), None)
+            if record is not None:
+                try:
+                    self._log_pending_iq_files(record, duration_s=None)
+                except Exception:
+                    pass
         if self._sftp_win:
             self._sftp_win.close()
             self._sftp_win = None
         for thread, _worker in list(self._jobs):
             thread.quit()
         super().closeEvent(event)
+
+    def _abort_record_stream(self) -> None:
+        """Stop following the sensor's event stream and release its connection.
+
+        The sensor keeps the recording task listed (and its radio session open)
+        for as long as a client holds the EMP response, so this runs as soon as
+        the application no longer needs the stream.
+        """
+        self._record_cancel.set()
+        client = self._record_client
+        self._record_client = None
+        if client is None:
+            return
+        try:
+            client.abort()
+        except Exception:
+            pass
+        try:
+            client.close()
+        except Exception:
+            pass
 
     def _freq_unit(self) -> str:
         if hasattr(self, "unit_combo"):
@@ -1283,13 +1331,24 @@ class MainWindow(QMainWindow):
             return
         from .sftp_window import _open_browser
 
+        state = self._conn
+        if getattr(self, "_storage_in_flight", False) and getattr(self, "_storage_state", None) is state:
+            # Startup and the first "connected" report both ask within a
+            # second or two. Cancelling the first read closed its socket
+            # mid-handshake (paramiko logged "Error reading SSH protocol
+            # banner") and wasted one of the sensor's few handshake slots.
+            # Let the running read finish, then read once more.
+            self._storage_rerun = True
+            return
+        if getattr(self, "_storage_cancel", None) is not None:
+            self._storage_cancel.set()  # a read for another sensor: drop it
         self._storage_token += 1
         token = self._storage_token
-        state = self._conn
-        if getattr(self, "_storage_cancel", None) is not None:
-            self._storage_cancel.set()
         cancel = threading.Event()
         self._storage_cancel = cancel
+        self._storage_state = state
+        self._storage_in_flight = True
+        self._storage_rerun = False
 
         def work() -> tuple[int, StorageSnapshot]:
             browser = None
@@ -1319,11 +1378,15 @@ class MainWindow(QMainWindow):
         if isinstance(result, tuple) and len(result) == 2:
             token, snap = result
             if token != self._storage_token:
-                return
+                return  # superseded by a read for another sensor
         elif isinstance(result, StorageSnapshot):
             snap = result
         else:
             snap = StorageSnapshot.unavailable(str(result))
+        self._storage_in_flight = False
+        if self._storage_rerun:
+            self._storage_rerun = False
+            QTimer.singleShot(0, self._refresh_storage)
         if not snap.ok:
             snap = self._failed_storage(snap.detail)
         self._apply_storage(snap)
@@ -1533,7 +1596,7 @@ class MainWindow(QMainWindow):
             return
         scan = payload["remote_recording_scans"][0]
         try:
-            mb = empirical_size_mb(scan["bandwidth"], scan["duration"])
+            mb = estimated_size_mb(scan["bandwidth"], scan["duration"])
             self.size_label.setText(f"Estimate ≈ {format_estimate(mb)}")
         except (SizeEstimateError, ValidationError, KeyError):
             self.size_label.setText("Estimate —")
@@ -1796,6 +1859,16 @@ class MainWindow(QMainWindow):
         self._ignore_late_http = False
         self._last_match_sizes = {}
         self._confirm_attempts = 0
+        self._sensor_finished = False
+        self._sensor_finished_at = 0.0
+        self._stream_lost = False
+        self._sensor_parts = []
+        self._sensor_warnings = []
+        self._pending_excel_entries = []
+        try:
+            self._expected_bytes = estimated_recording_bytes(int(scan["bandwidth"]), seconds)
+        except Exception:
+            self._expected_bytes = 0
         record = new_recording(
             host=self._conn.host.strip(),
             start_hz=plan.start_hz,
@@ -1818,8 +1891,11 @@ class MainWindow(QMainWindow):
         if self._sftp_win is not None:
             self._sftp_win.set_recent_record_id(record.id)
             self._sftp_win.relabel_files()
+        self._abort_record_stream()
         client = self._client()
         self._record_client = client
+        self._record_cancel = threading.Event()
+        cancel = self._record_cancel
         self._record_gen += 1
         gen = self._record_gen
         unit = self._freq_unit()
@@ -1833,19 +1909,46 @@ class MainWindow(QMainWindow):
         self._set_recording_ui(True, seconds=seconds)
         self._http_in_flight = True
         self._record_timer.start(int(max(seconds, 0.05) * 1000) + 400)
+        emit_event = self.record_event.emit
+
+        def on_event(event) -> None:
+            emit_event((gen, event))
 
         def work() -> tuple[int, HttpOutcome]:
-            return gen, client.start_recording(target, self._conn.http_password, payload)
+            try:
+                # Hold the stream after "finished": the Node drops the mission
+                # as soon as its client disconnects, and the last WAVE part can
+                # still be flushing. _finish_current_capture() closes it.
+                outcome = client.start_recording(
+                    target,
+                    self._conn.http_password,
+                    payload,
+                    cancel=cancel,
+                    on_event=on_event,
+                    stop_on_finished=False,
+                )
+            except TypeError as exc:
+                # Stand-in clients in tests only accept the three positional arguments.
+                if "argument" not in str(exc):
+                    raise
+                outcome = client.start_recording(target, self._conn.http_password, payload)
+            return gen, outcome
 
         self._start_job(work, self._show_recording_outcome, record=True, record_gen=gen)
 
     def _on_recording_time_elapsed(self) -> None:
-        self._http_in_flight = False
-        client = self._record_client
-        self._record_client = None
-        if client is not None:
-            self._ignore_late_http = True
-            client.close()
+        if self._http_in_flight and self._record_client is not None and not self._conn.demo:
+            # The sensor answers the POST with an event stream that reports
+            # "Remote recording is now finished" a few seconds after the
+            # nominal end. Keep following it; the file watch runs alongside.
+            pass
+        else:
+            self._http_in_flight = False
+            client = self._record_client
+            self._record_client = None
+            if client is not None:
+                self._ignore_late_http = True
+                client.close()
         if self._record_phase in {FINALIZING, CONFIRMED, UNKNOWN}:
             return
         self._set_phase(FINALIZING)
@@ -1968,31 +2071,59 @@ class MainWindow(QMainWindow):
         cancel = threading.Event()
         self._watch_cancel = cancel
 
-        def work() -> tuple[int, object, str]:
-            browser = None
-            try:
-                browser = _open_browser(state, cancel=cancel)
-                return token, list_watch_entries(browser, folders), ""
-            except Exception as exc:
-                return token, [], str(exc)
-            finally:
-                if browser is not None:
+        # One SFTP session serves the whole watch: a fresh SSH handshake per poll
+        # cost ~2.5 s on the Node 40-8 and made the 2 s poll run every 4 s.
+        browser = self._watch_browser
+
+        def work() -> tuple[int, object, str, object]:
+            session = browser
+            if session is not None:
+                try:
+                    return token, list_watch_entries(session, folders), "", session
+                except Exception:
+                    # The sensor may have closed an idle session: reconnect silently.
                     try:
-                        browser.close()
+                        session.close()
                     except Exception:
                         pass
+                    session = None
+            try:
+                session = _open_browser(state, cancel=cancel)
+                return token, list_watch_entries(session, folders), "", session
+            except Exception as exc:
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                return token, [], str(exc), None
 
         self._start_job(work, self._show_watch_listing)
 
     def _show_watch_listing(self, result: object) -> None:
         self._watch_in_flight = False
-        if not self._alive or not isinstance(result, tuple) or len(result) != 3:
+        if not self._alive or not isinstance(result, tuple) or len(result) not in (3, 4):
             return
-        token, entries, error = result
+        if len(result) == 4:
+            token, entries, error, session = result
+        else:
+            token, entries, error = result
+            session = None
         if token != self._watch_token:
+            if session is not None and session is not self._watch_browser:
+                try:
+                    session.close()
+                except Exception:
+                    pass
             return
+        if session is not None and session is not self._watch_browser:
+            self._close_watch_browser()
+            self._watch_browser = session
+        elif session is None and not self._conn.demo:
+            self._watch_browser = None
         if error:
-            self.log(f"Could not list sensor files: {error}", level="error")
+            if self._record_phase in {FINALIZING, UNKNOWN}:
+                self.log(f"Could not list sensor files: {error}", level="error")
             return
         record_id = self._open_record_id
         if not record_id:
@@ -2003,10 +2134,21 @@ class MainWindow(QMainWindow):
         self._apply_watch_listing(record, list(entries or []))
 
     def _apply_watch_listing(self, record, entries) -> None:
-        record_id = getattr(record, "id", "")
-        matched = match_recordings_to_entries(entries, [record], host=self._conn.host)
-        persist_matched_stems(matched)
-        mine = [entry for entry in entries if matched.get(entry.path) and matched[entry.path].id == record_id]
+        if self._sensor_finished and not self._sensor_parts and not self._stream_lost:
+            # The sensor ran the task to its end and never named a file (e.g.
+            # "No suitable antenna found"). Nothing in the folder is ours, so do
+            # not adopt a neighbour's file by time proximity.
+            mine: list = []
+        else:
+            mine = live_capture_files(
+                entries,
+                record,
+                known=load_recordings(),
+                sensor_parts=self._sensor_parts,
+                host=self._conn.host,
+            )
+        if mine and not (record.iq_stem or "").strip():
+            persist_matched_stems({entry.path: record for entry in mine})
         if self._sftp_win is not None:
             self._sftp_win.refresh()
         self._watch_state, newly = update_file_watch(
@@ -2016,25 +2158,66 @@ class MainWindow(QMainWindow):
             stable_needed=self._stable_needed,
         )
         for entry in newly:
-            try:
-                self._log_iq_file(record, entry)
-            except Exception as exc:
-                self.log(f"Excel log failed for {entry.name}: {exc}", level="error")
+            self._files_found += 1
+            # Excel rows are written once the capture is complete, so the row
+            # carries the duration the files actually hold.
+            self._pending_excel_entries.append(entry)
         if newly:
+            self._update_collection_status()
             self._set_phase(FINALIZING)
             self._set_msg(f"Recording file found ({len(self._watch_state.finalized)} part(s)). Waiting for more…")
-            self.log(f"Logged {len(newly)} finalized IQ file(s).")
+            self.log(f"{len(newly)} IQ file(s) finished writing.")
+        if (
+            self._sensor_finished
+            and not self._sensor_parts
+            and not self._watch_state.sizes
+            and self._sensor_finished_at
+            and time.monotonic() - self._sensor_finished_at >= NO_FILE_GRACE_S
+        ):
+            # e.g. "No suitable antenna found": the sensor ran the task and
+            # wrote nothing. No point watching the folder for a minute.
+            reason = self._sensor_warnings[-1] if self._sensor_warnings else "no sensor message explains why"
+            self.log(f"The sensor finished without writing a file ({reason}).", level="error")
+            self._finish_current_capture()
+            return
         if capture_is_settled(
             self._watch_state,
             now=datetime.now(),
             elapsed=True,
             settle_s=self._settle_s,
             elapsed_at=self._elapsed_at,
+            sensor_finished=self._sensor_finished,
+            stream_pending=self._http_in_flight and self._record_client is not None,
+            expected_bytes=self._expected_bytes,
         ):
             self._finish_current_capture()
 
-    def _log_iq_file(self, record, entry) -> None:
-        self._files_found += 1
+    def _measured_capture(self, record) -> tuple[int, int, float | None]:
+        """(total bytes, parts, seconds of IQ) held by the finalized files of this capture."""
+        state = self._watch_state
+        sizes = [size for path, size in state.sizes.items() if path in state.finalized]
+        total = sum(sizes)
+        parts = len(sizes)
+        if not parts or record is None or self._conn.demo:
+            # Demo files have made-up sizes; the bytes-to-seconds model is for real Node WAVE files.
+            return total, parts, None
+        try:
+            return total, parts, recorded_seconds_from_bytes(total, int(record.bandwidth_hz), parts)
+        except Exception:
+            return total, parts, None
+
+    def _log_pending_iq_files(self, record, *, duration_s: float | None) -> None:
+        entries = list(self._pending_excel_entries)
+        self._pending_excel_entries = []
+        for entry in entries:
+            try:
+                self._log_iq_file(record, entry, duration_s=duration_s)
+            except Exception as exc:
+                self.log(f"Excel log failed for {entry.name}: {exc}", level="error")
+        if entries and hasattr(self, "excel_check") and self.excel_check.isChecked():
+            self.log(f"Logged {len(entries)} IQ file(s) to Excel.")
+
+    def _log_iq_file(self, record, entry, *, duration_s: float | None = None) -> None:
         self._update_collection_status()
         if not hasattr(self, "excel_check") or not self.excel_check.isChecked():
             return
@@ -2071,7 +2254,7 @@ class MainWindow(QMainWindow):
             local_path=str(local) if local.is_file() else "",
             remote_path=entry.path,
             sensor_id=sensor_id,
-            duration_s=record.duration_s,
+            duration_s=record.duration_s if duration_s is None else duration_s,
             record_id=record.id,
             group_key=recording_group_key(
                 sensor_id=sensor_id,
@@ -2089,17 +2272,53 @@ class MainWindow(QMainWindow):
             return
         self._watch_timer.stop()
         self._watching = False
-        parts = len(self._watch_state.finalized)
+        self._abort_record_stream()
+        record = None
+        if self._open_record_id:
+            record = next((item for item in load_recordings() if item.id == self._open_record_id), None)
+        total, parts, held_s = self._measured_capture(record)
+        excel_duration: float | None = None
         if parts:
             self._set_phase(CONFIRMED)
             self._set_msg(f"Recording finished ({parts} file(s)).")
-            self.log(f"Capture finished with {parts} file(s).")
+            source = "sensor confirmed" if self._sensor_finished else "files stable"
+            self.log(f"Capture finished with {parts} file(s), {total / 1_000_000:,.1f} MB ({source}).")
+            requested = float(record.duration_s) if record is not None else 0.0
+            if held_s is not None and requested > 0:
+                if held_s < 0.95 * requested:
+                    excel_duration = round(held_s, 1)
+                    if self._stream_lost:
+                        why = (
+                            "The connection to the sensor dropped during the capture, and this sensor stops "
+                            "recording when its client disconnects."
+                        )
+                    elif self._sensor_finished:
+                        why = "The sensor reported it finished early; at 62.5 MS/s it cannot sustain long captures."
+                    else:
+                        why = "The sensor stopped early."
+                    self.log(
+                        f"The files hold about {held_s:.1f} s of IQ, not the {requested:g} s requested. "
+                        f"{why} The Excel row gets the measured time.",
+                        level="error",
+                    )
+                    self._set_msg(f"Recording finished short: {held_s:.1f} s of {requested:g} s.", error=True)
+                elif held_s > 1.5 * requested:
+                    self.log(
+                        f"The files hold about {held_s:.1f} s of IQ for a {requested:g} s request; "
+                        "check that the sample-rate model fits this sensor.",
+                        level="error",
+                    )
         else:
             self._set_phase(UNKNOWN)
             self._set_msg("Time elapsed. No matching recording file yet.")
             self.log("File not confirmed.")
+        if record is not None:
+            self._log_pending_iq_files(record, duration_s=excel_duration)
+        else:
+            self._pending_excel_entries = []
         self._refresh_storage()
-        self._recordings_completed += 1
+        if parts:
+            self._recordings_completed += 1
         self._update_collection_status()
         if self._series_active:
             self._maybe_start_next()
@@ -2152,6 +2371,9 @@ class MainWindow(QMainWindow):
         was_waiting = self._waiting
         self._waiting = False
         self._wait_deadline = 0.0
+        if was_waiting and self._record_phase == WAITING:
+            # The countdown is gone; show the state of the last capture again.
+            self._set_phase(CONFIRMED if self._watch_state.finalized else IDLE)
         if message and was_waiting:
             self.log(message)
             self._set_msg(message)
@@ -2221,6 +2443,9 @@ class MainWindow(QMainWindow):
             self._set_phase(IDLE)
             self._end_series()
             return
+        if outcome.stream_ended:
+            self._show_stream_outcome(outcome)
+            return
         if self._ignore_late_http and not self._recording_active:
             self._ignore_late_http = False
             if outcome.kind == "accepted":
@@ -2247,6 +2472,113 @@ class MainWindow(QMainWindow):
             self.log("Stopped waiting for HTTP. Use Sensor Files if needed.")
             return
         self._show_http_outcome(outcome, recording=True)
+
+    def _show_stream_outcome(self, outcome: HttpOutcome) -> None:
+        """The EMP event stream ended (sensor finished, error, budget, or we stopped it)."""
+        self._ignore_late_http = False
+        self._abort_record_stream()
+        if outcome.kind == "sensor_error":
+            self.log(outcome.detail, level="error")
+            self._record_timer.stop()
+            self._set_recording_ui(False)
+            self._watch_timer.stop()
+            self._watching = False
+            self._set_phase(UNKNOWN)
+            self._set_msg("The sensor reported an error. Check Sensor Files.", error=True)
+            self._end_series()
+            return
+        if outcome.sensor_finished:
+            for name in outcome.sensor_parts:
+                self._note_sensor_part(outcome.sensor_file_dir, name)
+            if not self._sensor_finished:
+                self._sensor_finished = True
+                self._sensor_finished_at = time.monotonic()
+                if self._sensor_parts:
+                    self.log("Sensor reported: recording finished.")
+                else:
+                    self.log("Sensor reported: recording finished, but it named no file.", level="error")
+            if self._record_phase in {FINALIZING, UNKNOWN} and self._uses_collection_watch():
+                self._poll_collection_files()
+            return
+        if outcome.stream_ended == "cancelled":
+            return
+        if outcome.stream_ended.startswith("lost"):
+            self._stream_lost = True
+            self.log(
+                "Connection to the sensor dropped while waiting for its completion message. "
+                "This sensor stops recording when its client disconnects; completion is confirmed from the files.",
+                level="error",
+            )
+        elif outcome.stream_ended == "budget":
+            self.log("No completion message from the sensor within the time budget. Checking files.")
+        else:
+            self.log("The sensor closed its event stream before reporting completion. Checking files.")
+        if self._recording_active:
+            # The recording time has not elapsed yet; the timer still drives the next phase.
+            return
+
+    def _on_record_event(self, payload: object) -> None:
+        """Live event from the sensor's EMP stream (queued onto the UI thread)."""
+        if not self._alive or not isinstance(payload, tuple) or len(payload) != 2:
+            return
+        gen, event = payload
+        if gen != self._record_gen:
+            return
+        from .api_client import (
+            SSE_EVENT_HTTP_ACCEPTED,
+            sse_message_is_error,
+            sse_message_is_finished,
+            sse_message_is_noise,
+            sse_part_filename,
+        )
+
+        name = getattr(event, "event", "")
+        if name == SSE_EVENT_HTTP_ACCEPTED:
+            status = getattr(event, "data", {}).get("status") if isinstance(getattr(event, "data", None), dict) else None
+            self.log(f"Request accepted (HTTP {status}). Recording…" if status else "Request accepted. Recording…")
+            if self._sftp_win is not None:
+                self._sftp_win.retry_today()
+            return
+        directory, filename = sse_part_filename(event)
+        if filename:
+            self._note_sensor_part(directory, filename)
+            return
+        data = getattr(event, "data", None)
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if not isinstance(item, dict) or sse_message_is_noise(item):
+                continue
+            text = str(item.get("message", "")).strip()
+            if sse_message_is_finished(item):
+                if not self._sensor_finished:
+                    self._sensor_finished = True
+                    self._sensor_finished_at = time.monotonic()
+                    if self._sensor_parts:
+                        self.log("Sensor reported: recording finished.")
+                    else:
+                        self.log("Sensor reported: recording finished, but it named no file.", level="error")
+            elif sse_message_is_error(item):
+                self.log(f"Sensor: {text}", level="error")
+            elif text:
+                level = "error" if str(item.get("level", "")).upper() == "WARNING" else "info"
+                self._sensor_warnings.append(text)
+                self.log(f"Sensor: {text}", level=level)
+
+    def _note_sensor_part(self, directory: str, filename: str) -> None:
+        """The sensor named a file it is writing for the current task."""
+        if filename in self._sensor_parts:
+            return
+        self._sensor_parts.append(filename)
+        self.log(f"Sensor is writing {filename}" + (f" in {directory}" if directory else ""))
+        record_id = self._open_record_id
+        if not record_id:
+            return
+        from .recording_history import iq_group_key, set_recording_stem
+
+        try:
+            set_recording_stem(record_id, iq_group_key(filename))
+        except Exception as exc:  # noqa: BLE001 - history is best effort
+            self.log(f"Could not save the file name for this recording: {exc}", level="error")
 
     def _show_http_outcome(self, outcome: Any, *, recording: bool) -> None:
         if not isinstance(outcome, HttpOutcome):

@@ -301,6 +301,7 @@ def _append_rows_com_impl(win32com_client, path: Path, rows: list[ExcelRow]) -> 
                 columns = max(headers.values())
                 incoming = split_iq_filenames(row.filename) or [row.filename]
                 found = _find_row_with_names(sheet, headers, incoming)
+                template_height = 0.0
                 if found:
                     dest = found
                     existing = split_iq_filenames(sheet.Cells(dest, headers[HEADER_IQ]).Value)
@@ -316,6 +317,11 @@ def _append_rows_com_impl(win32com_client, path: Path, rows: list[ExcelRow]) -> 
                             app.CutCopyMode = False
                         except Exception:
                             pass
+                        try:
+                            # PasteSpecial(formats) does not carry the row height.
+                            template_height = float(sheet.Rows(last).RowHeight or 0)
+                        except Exception:
+                            template_height = 0.0
                     def write(header: str, value) -> None:
                         sheet.Cells(dest, headers[header]).Value = value
 
@@ -340,7 +346,10 @@ def _append_rows_com_impl(win32com_client, path: Path, rows: list[ExcelRow]) -> 
                 except Exception:
                     pass
                 try:
-                    sheet.Rows(dest).RowHeight = max(18, 16 * max(1, merged.count("\n") + 1) + 4)
+                    # One line per part, never shorter than the sheet's own
+                    # rows (the row it was copied from may be taller).
+                    current = max(template_height, float(sheet.Rows(dest).RowHeight or 0) if found else 0.0)
+                    sheet.Rows(dest).RowHeight = max(18, 16 * max(1, merged.count("\n") + 1) + 4, current)
                 except Exception:
                     pass
                 local = Path(row.local_path) if row.local_path else None

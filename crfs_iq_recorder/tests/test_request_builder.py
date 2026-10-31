@@ -130,3 +130,17 @@ def test_unverified_format_identifier_is_still_sent_verbatim():
         recording_format="BIN",
     )
     assert payload["remote_recording_scans"][0]["recording_format"] == "BIN"
+
+
+def test_zero_or_negative_recording_time_is_refused_before_the_post():
+    # The Node 40-8 (2.25-325) accepts duration 0 and then records until the
+    # client disconnects (618 MB in 40 s at 2 MHz), so the app must refuse it.
+    import pytest
+
+    from crfs_iq_recorder.request_builder import RequestBuildError
+
+    plan = from_center_bandwidth(411_000_000, 2_000_000)
+    for seconds in (0, 0.0, -1, float("nan")):
+        with pytest.raises(RequestBuildError, match="greater than zero"):
+            build_payload_for_recording_time(plan, seconds)
+    assert build_payload_for_recording_time(plan, 0.5)["remote_recording_scans"][0]["duration"] == 0.5

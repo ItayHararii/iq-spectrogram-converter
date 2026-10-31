@@ -12,6 +12,9 @@ STABLE_LISTINGS = 2
 SETTLE_S = 8.0
 POLL_S = 2.0
 MAX_WATCH_AFTER_ELAPSED_S = 60.0
+# The sensor said "finished" but never named a file: how long to keep looking
+# before giving up. The first part is normally announced ~1 s after the POST.
+NO_FILE_GRACE_S = 10.0
 
 
 def folders_for_recording(started_at: datetime, now: datetime | None = None) -> list[str]:
@@ -105,16 +108,31 @@ def capture_is_settled(
     settle_s: float = SETTLE_S,
     max_watch_s: float = MAX_WATCH_AFTER_ELAPSED_S,
     elapsed_at: datetime | None = None,
+    sensor_finished: bool = False,
+    stream_pending: bool = False,
+    expected_bytes: int | None = None,
 ) -> bool:
-    """True when elapsed, known files are stable, and no new parts arrived recently.
+    """True when the capture can be treated as complete.
+
+    Rules, in order:
+    - Nothing before the recording time has elapsed.
+    - While the sensor's event stream is still open and has not said
+      "finished", wait (the stream has its own time budget).
+    - Files that are still growing are never complete. A listing that has not
+      changed for `max_watch_s` ends the wait anyway, so a stalled writer cannot
+      hold the application forever.
+    - No file at all after `max_watch_s`: give up (caller reports UNKNOWN).
+    - All known parts stable: done once the sensor said finished and the parts
+      hold at least 98 % of the expected bytes, otherwise after `settle_s` of
+      quiet so a late part can still be picked up.
 
     HTTP success, the duration timer, or the first file is not enough on its own.
     """
     if not elapsed:
         return False
-    if elapsed_at is not None and (now - elapsed_at).total_seconds() >= max_watch_s:
-        return True
-    if not state.finalized:
+    since_elapsed = (now - elapsed_at).total_seconds() if elapsed_at is not None else 0.0
+    quiet_s = (now - state.last_change_at).total_seconds() if state.last_change_at is not None else None
+    if stream_pending and not sensor_finished:
         return False
     pending = [
         path
@@ -122,7 +140,14 @@ def capture_is_settled(
         if size > 0 and path not in state.finalized
     ]
     if pending:
+        # Growing files: only a long stall ends the wait.
+        return quiet_s is not None and quiet_s >= max_watch_s
+    if not state.finalized:
+        return elapsed_at is not None and since_elapsed >= max_watch_s
+    if quiet_s is None:
         return False
-    if state.last_change_at is None:
-        return False
-    return (now - state.last_change_at) >= timedelta(seconds=max(settle_s, 0))
+    if sensor_finished and expected_bytes and expected_bytes > 0:
+        total = sum(size for path, size in state.sizes.items() if path in state.finalized)
+        if total >= 0.98 * expected_bytes:
+            return True
+    return quiet_s >= max(settle_s, 0)

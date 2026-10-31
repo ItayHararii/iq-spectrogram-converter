@@ -1,17 +1,23 @@
 """File-size estimates.
 
-Empirical estimate uses the user-supplied reference (61.051 MB at 10 MHz × 1 s).
-Technical estimate is optional and never assumes RF bandwidth equals sample rate.
+The WAVE estimate follows the sensor's sample-rate steps measured on an RFeye
+Node 40-8 (firmware 2.25-325, 31 Oct 2026, 13 recordings from 1 MHz to 60 MHz):
+the Node records 16-bit I/Q at 125 MS/s divided by a power of two, choosing the
+smallest rate that is at least 1.25 × the requested bandwidth, capped at
+62.5 MS/s. The old linear reference (61.051 MB at 10 MHz × 1 s) is kept for
+comparison; it was 17-46 % off whenever the bandwidth was not 5, 10, 20 or
+40 MHz. The technical estimate never assumes RF bandwidth equals sample rate.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 
 from .constants import (
     DATASHEET_BYTES_PER_COMPLEX_SAMPLE,
     DATASHEET_CHANNELS,
+    DATASHEET_FULLRATE_COMPLEX_SPS,
     EMPIRICAL_REF_BW_HZ,
     EMPIRICAL_REF_SIZE_MB,
     EMPIRICAL_REF_TIME_S,
@@ -21,13 +27,89 @@ REF_SIZE = Decimal(EMPIRICAL_REF_SIZE_MB)
 REF_BW = Decimal(EMPIRICAL_REF_BW_HZ)
 REF_TIME = Decimal(str(EMPIRICAL_REF_TIME_S))
 
+# Measured WAVE layout on the Node 40-8: a 44-byte header plus a ~648-byte
+# trailer chunk per part, parts split at this many payload bytes, and about
+# 0.6 % more samples than the nominal time (0.06-0.6 % across 1-40 s).
+WAVE_HEADER_BYTES = 44 + 648
+WAVE_PART_PAYLOAD_BYTES = 523_776_000
+WAVE_EXTRA_TIME_RATIO = Decimal("0.006")
+MAX_IQ_SAMPLE_RATE_HZ = 62_500_000
+MIN_RATE_OVER_BANDWIDTH = Decimal("1.25")
+
 
 class SizeEstimateError(ValueError):
     """Invalid inputs for a size estimate."""
 
 
+def _positive_decimal(value, *, name: str) -> Decimal:
+    number = value if isinstance(value, Decimal) else Decimal(str(value))
+    if not number.is_finite() or number <= 0:
+        raise SizeEstimateError(f"{name} must be positive for a size estimate.")
+    return number
+
+
+def iq_sample_rate_hz(bandwidth_hz: int | Decimal) -> int:
+    """Complex sample rate the Node uses for a requested bandwidth.
+
+    125 MS/s / 2^k, the smallest value that is >= 1.25 × bandwidth, capped at
+    62.5 MS/s (so anything above 50 MHz is recorded at 62.5 MS/s).
+    Verified on hardware: 1 MHz -> 1.953125, 5 and 6 MHz -> 7.8125,
+    8/10/12.5 MHz -> 15.625, 20/21 MHz -> 31.25, 30-60 MHz -> 62.5 MS/s.
+    """
+    bw = _positive_decimal(bandwidth_hz, name="Bandwidth")
+    needed = bw * MIN_RATE_OVER_BANDWIDTH
+    rate = MAX_IQ_SAMPLE_RATE_HZ
+    while rate % 2 == 0 and Decimal(rate // 2) >= needed:
+        rate //= 2
+    return int(rate)
+
+
+@dataclass(frozen=True)
+class WaveSizeModel:
+    bandwidth_hz: int
+    duration_s: Decimal
+    sample_rate_hz: int
+    payload_bytes: int
+    parts: int
+    total_bytes: int
+
+    @property
+    def megabytes(self) -> Decimal:
+        return Decimal(self.total_bytes) / Decimal(1_000_000)
+
+
+def wave_size_model(bandwidth_hz: int | Decimal, recorded_time_seconds: Decimal | float | str) -> WaveSizeModel:
+    """Expected on-disk size of a WAVE recording, all split parts combined."""
+    bw = _positive_decimal(bandwidth_hz, name="Bandwidth")
+    seconds = _positive_decimal(recorded_time_seconds, name="Recorded time")
+    rate = iq_sample_rate_hz(bw)
+    frames = (Decimal(rate) * seconds * (Decimal(1) + WAVE_EXTRA_TIME_RATIO)).to_integral_value(rounding=ROUND_CEILING)
+    payload = int(frames) * DATASHEET_BYTES_PER_COMPLEX_SAMPLE
+    parts = max(1, -(-payload // WAVE_PART_PAYLOAD_BYTES))
+    return WaveSizeModel(
+        bandwidth_hz=int(bw),
+        duration_s=seconds,
+        sample_rate_hz=rate,
+        payload_bytes=payload,
+        parts=parts,
+        total_bytes=payload + parts * WAVE_HEADER_BYTES,
+    )
+
+
+def estimated_size_mb(bandwidth_hz: int | Decimal, recorded_time_seconds: Decimal | float | str) -> Decimal:
+    """Decimal megabytes for the GUI estimate (sample-rate model)."""
+    return wave_size_model(bandwidth_hz, recorded_time_seconds).megabytes
+
+
+def recorded_seconds_from_bytes(total_bytes: int, bandwidth_hz: int | Decimal, parts: int = 1) -> float:
+    """How many seconds of IQ a set of WAVE parts holds, from their combined size."""
+    rate = iq_sample_rate_hz(bandwidth_hz)
+    payload = max(int(total_bytes) - max(int(parts), 1) * WAVE_HEADER_BYTES, 0)
+    return payload / float(DATASHEET_BYTES_PER_COMPLEX_SAMPLE * rate)
+
+
 def empirical_size_mb(bandwidth_hz: int | Decimal, recorded_time_seconds: Decimal | float | str) -> Decimal:
-    """61.051 × (bandwidth_Hz / 10_000_000) × recorded_time_seconds."""
+    """Legacy linear reference: 61.051 × (bandwidth_Hz / 10_000_000) × recorded_time_seconds."""
     bw = Decimal(bandwidth_hz)
     t = recorded_time_seconds if isinstance(recorded_time_seconds, Decimal) else Decimal(str(recorded_time_seconds))
     if bw <= 0:

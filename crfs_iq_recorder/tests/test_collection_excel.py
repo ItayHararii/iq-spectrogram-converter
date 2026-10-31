@@ -205,6 +205,15 @@ def test_sensor_label_matches_workbook():
     assert workbook_sensor_name("Node 100-18") == "CRFS 100-18"
 
 
+def test_sensor_label_reuses_the_workbooks_spelling_for_the_same_device():
+    # The field workbook names the R40-8 "CRFS-R408"; 1.8.8 wrote "40-8" next to it.
+    assert workbook_sensor_name("R40-8", ["CRFS-R408", "CRFS-R408"]) == "CRFS-R408"
+    assert workbook_sensor_name("RFeye Node R40-8", ["crfs-r408"]) == "crfs-r408"
+    # A different device keeps the fallback rule.
+    assert workbook_sensor_name("R100-18", ["CRFS-R408"]) == "100-18"
+    assert workbook_sensor_name("R40-8", []) == "CRFS 40-8"
+
+
 def test_append_does_not_overwrite_empty_iq_template(tmp_path):
     path = build_sample_workbook(tmp_path / "sample.xlsx")
     before = load_workbook(path)
@@ -566,3 +575,59 @@ def test_flush_with_empty_queue_does_not_rewrite_store(tmp_path):
     store = ExcelLogStore(tmp_path / "queue.json")
     assert flush_excel_queue(store) == (0, 0)
     assert not (tmp_path / "queue.json").exists()
+
+
+def test_new_row_keeps_the_sheets_row_height(tmp_path):
+    # The user's TETRA sheet uses 22 pt rows; a one-part row must not shrink to 20.
+    path = build_sample_workbook(tmp_path / "tall.xlsx")
+    wb = load_workbook(path)
+    for r in range(2, wb["SATCOM"].max_row + 1):
+        wb["SATCOM"].row_dimensions[r].height = 22
+    wb.save(path)
+    wb.close()
+    mapping = haifa_mappings()[1]
+    row = ExcelRow(
+        worksheet="SATCOM",
+        collection_event="Haifa Port",
+        target_class="Iridium",
+        start_hz=mapping.start_hz,
+        end_hz=mapping.end_hz,
+        start_style=mapping.start_style,
+        stop_style=mapping.stop_style,
+        sensor="CRFS 100-18",
+        filename="iq_tall_0001.wav",
+        remote_path="/mnt/1/remdata/20261031/iq_tall_0001.wav",
+        sensor_id="rfeyeDEMO",
+        duration_s=2.0,
+    )
+    from crfs_iq_recorder.excel_writer import append_rows_openpyxl
+
+    (written,) = append_rows_openpyxl(path, [row])
+    wb = load_workbook(path)
+    assert wb["SATCOM"].row_dimensions[written].height == 22
+    # Three parts still get the taller row.
+    (same,) = append_rows_openpyxl(
+        path,
+        [row.__class__(**{**row.__dict__, "filename": "iq_tall_0001.wav\niq_tall_0002.wav\niq_tall_0003.wav"})],
+    )
+    wb = load_workbook(path)
+    assert same == written
+    assert wb["SATCOM"].row_dimensions[written].height == 16 * 3 + 4
+
+def test_hidden_sheets_are_not_log_targets(tmp_path):
+    # Field workbook: a hidden "TETRA" sheet sat next to the live "TETRA)" sheet with the
+    # same frequency mappings, and the suggestion sent every new row into the hidden one.
+    from crfs_iq_recorder.collection_catalog import load_workbook_catalog
+
+    path = build_sample_workbook(tmp_path / "hidden.xlsx")
+    wb = load_workbook(path)
+    ws = wb.copy_worksheet(wb["SATCOM"])
+    ws.title = "SATCOM)"
+    wb["SATCOM"].sheet_state = "hidden"
+    wb.active = wb.sheetnames.index("SATCOM)")
+    wb.save(path)
+    wb.close()
+    catalog = load_workbook_catalog(path)
+    assert "SATCOM" not in catalog.worksheets
+    assert "SATCOM)" in catalog.worksheets
+    assert {m.worksheet for m in catalog.mappings if m.target_class == "Iridium"} == {"SATCOM)"}

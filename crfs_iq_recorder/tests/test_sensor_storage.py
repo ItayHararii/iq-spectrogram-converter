@@ -136,9 +136,10 @@ def test_demo_delete_frees_space():
     assert after == before + size
 
 
-def test_estimated_bytes_match_empirical_mb():
-    bytes_ = estimated_recording_bytes(10_000_000, 1)
-    assert bytes_ == 61_051_000
+def test_estimated_bytes_follow_the_sample_rate_model():
+    # 10 MHz -> 15.625 MS/s x 4 bytes: a 2 s capture measured 125,706,804 bytes on the Node 40-8.
+    bytes_ = estimated_recording_bytes(10_000_000, 2)
+    assert abs(bytes_ / 125_706_804 - 1) < 0.01
 
 
 def test_gui_shows_demo_storage_and_blocks_when_full(qapp, monkeypatch):

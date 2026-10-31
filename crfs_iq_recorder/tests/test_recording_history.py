@@ -4,6 +4,7 @@ from crfs_iq_recorder.recording_history import (
     add_recording,
     format_columns,
     iq_group_key,
+    live_capture_files,
     load_recordings,
     match_recordings_to_entries,
     new_recording,
@@ -349,3 +350,120 @@ def test_match_time_only_filename_with_folder_date():
     )
     matched = match_recordings_to_entries([entry], [record], host="192.0.2.12")
     assert matched[entry.path] == record
+
+
+def _record(started: datetime, *, stem: str = "", seconds: float = 3.0):
+    from dataclasses import replace
+
+    record = new_recording(
+        host="192.0.2.10",
+        start_hz=410_000_000,
+        end_hz=412_000_000,
+        center_hz=411_000_000,
+        bandwidth_hz=2_000_000,
+        duration_s=seconds,
+        started_at=started,
+    )
+    return replace(record, iq_stem=stem) if stem else record
+
+
+def _wav(name: str, when: datetime, size: int = 12_571_192) -> RemoteEntry:
+    return RemoteEntry(name, f"/mnt/1/remdata/20261031/{name}", False, size, when)
+
+
+def test_live_watch_does_not_adopt_a_file_owned_by_an_earlier_recording():
+    # Seen on hardware: the POST was black-holed, yet a file from a recording
+    # 178 s earlier fell inside the +-180 s window and was declared "finished".
+    earlier = _record(datetime(2026, 10, 31, 21, 22, 5), stem="file_192206")
+    current = _record(datetime(2026, 10, 31, 21, 25, 4))
+    old_file = _wav("file_192206_0001.wav", datetime(2026, 10, 31, 21, 22, 6))
+    assert live_capture_files([old_file], current, known=[earlier, current]) == []
+    # Without the owner in the history the file still predates the request by far.
+    assert live_capture_files([old_file], current, known=[current]) == []
+
+
+def test_live_watch_uses_the_names_the_sensor_reported():
+    current = _record(datetime(2026, 10, 31, 21, 3, 6), seconds=20)
+    parts = [
+        _wav("file_190307_0001.wav", datetime(2026, 10, 31, 21, 3, 15), 523_776_564),
+        _wav("file_190307_0002.wav", datetime(2026, 10, 31, 21, 3, 23), 523_776_692),
+        _wav("file_190307_0003.wav", datetime(2026, 10, 31, 21, 3, 27), 205_320_884),
+    ]
+    stranger = _wav("file_190218_0001.wav", datetime(2026, 10, 31, 21, 2, 20), 125_706_804)
+    mine = live_capture_files([stranger, *parts], current, known=[current], sensor_parts=["file_190307_0001.wav"])
+    assert [entry.name for entry in mine] == [entry.name for entry in parts]
+    # Fallback (no stream): a file written a few seconds after the request is accepted.
+    assert live_capture_files(parts, current, known=[current]) == parts
+
+
+def test_live_watch_tolerates_a_sensor_clock_slightly_behind():
+    current = _record(datetime(2026, 10, 31, 21, 25, 4))
+    slightly_early = _wav("file_192434_0001.wav", datetime(2026, 10, 31, 21, 24, 34))  # -30 s
+    much_earlier = _wav("file_192300_0001.wav", datetime(2026, 10, 31, 21, 23, 0))  # -124 s
+    assert live_capture_files([slightly_early], current, known=[current]) == [slightly_early]
+    assert live_capture_files([much_earlier], current, known=[current]) == []
+
+def test_pinned_recording_is_not_reassigned_when_its_file_is_deleted():
+    """Seen on an RFeye Node (2026-10-31): after deleting file_205734_0001.wav the
+    listing showed its 410-412 MHz metadata on file_185751_0001.wav, a file
+    recorded two hours earlier, because the +4 h guess landed 20 s from the start."""
+    started = datetime(2026, 10, 31, 22, 57, 31)
+    record = new_recording(
+        host="192.0.2.12",
+        start_hz=410_000_000,
+        end_hz=412_000_000,
+        center_hz=411_000_000,
+        bandwidth_hz=2_000_000,
+        duration_s=2,
+        started_at=started,
+        iq_stem="file_205734",
+    )
+    stranger = RemoteEntry(
+        "file_185751_0001.wav",
+        "/mnt/1/remdata/20261031/file_185751_0001.wav",
+        False,
+        91_900_000,
+        datetime(2026, 10, 31, 20, 57, 59),
+    )
+    assert match_recordings_to_entries([stranger], [record], host="192.0.2.12") == {}
+    # The pinned file itself still matches by stem.
+    own = RemoteEntry(
+        "file_205734_0001.wav",
+        "/mnt/1/remdata/20261031/file_205734_0001.wav",
+        False,
+        33_522_232,
+        datetime(2026, 10, 31, 22, 57, 40),
+    )
+    matched = match_recordings_to_entries([stranger, own], [record], host="192.0.2.12")
+    assert matched == {own.path: record}
+
+
+def test_hour_offset_guesses_must_agree_with_the_files_mtime():
+    """An unpinned record must not adopt a file whose mtime is hours away."""
+    started = datetime(2026, 10, 31, 22, 57, 31)
+    record = new_recording(
+        host="192.0.2.12",
+        start_hz=410_000_000,
+        end_hz=412_000_000,
+        center_hz=411_000_000,
+        bandwidth_hz=2_000_000,
+        duration_s=2,
+        started_at=started,
+    )
+    stranger = RemoteEntry(
+        "file_185751_0001.wav",
+        "/mnt/1/remdata/20261031/file_185751_0001.wav",
+        False,
+        91_900_000,
+        datetime(2026, 10, 31, 20, 57, 59),
+    )
+    assert match_recordings_to_entries([stranger], [record], host="192.0.2.12") == {}
+    # Without an mtime the offset guesses are all we have, and they still work.
+    unknown = RemoteEntry(
+        "file_205734_0001.wav",
+        "/mnt/1/remdata/20261031/file_205734_0001.wav",
+        False,
+        33_522_232,
+        None,
+    )
+    assert match_recordings_to_entries([unknown], [record], host="192.0.2.12") == {unknown.path: record}

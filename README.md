@@ -1,6 +1,6 @@
 # CRFS IQ Spectrogram Converter
 
-Sister app of the CRFS IQ Recorder (same Sensorz look, light and dark theme, status bar). Current version: 1.5.0.
+Sister app of the CRFS IQ Recorder (same Sensorz look, light and dark theme, status bar). Current version: 1.5.1.
 
 Turns a stereo IQ WAV into a PNG. I must be on the left channel and Q on the right. Mono files and ordinary audio are not supported.
 
@@ -10,6 +10,8 @@ The PNG has two plots that share a frequency axis, centered at 0 Hz:
 - Spectrogram (bottom): frequency vs time. Color is dBFS/bin.
 
 Large files are read in chunks, so the whole capture does not have to sit in RAM.
+
+Split recordings (`name_0001.wav`, `name_0002.wav`, ...) are converted one part per PNG. When the earlier parts sit in the same folder, a later part's time axis continues from where they ended and the title says so (for example `part 2 from 8.38 s`); otherwise the time axis starts at 0 and the title notes that the earlier parts were not found.
 
 The CRFS IQ Recorder lives in [`crfs_iq_recorder/`](crfs_iq_recorder/). Use that app to start a recording on a sensor and download WAVE files. System layout, recording flow, and how the two apps hand off WAVE files are in [CRFS IQ Recorder architecture](crfs_iq_recorder/docs/ARCHITECTURE.md).
 

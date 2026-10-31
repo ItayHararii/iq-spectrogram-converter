@@ -55,7 +55,7 @@ Recordings are consecutive tasks, not gapless IQ. If Excel has the workbook open
 
 Settings remembers the HTTP and SFTP usernames and passwords on this computer (protected). Password fields stay masked. They are not written as plaintext and they are not copied into the activity log. Do not put real IPs or passwords in Git, screenshots, or docs.
 
-In Sensor Files, select one or more remote files and press Delete to remove them from the sensor. Selecting a split-recording parent deletes every listed part. Local downloads and Excel rows are left in place.
+In Sensor Files, select one or more remote files and press Delete to remove them from the sensor; the app asks for confirmation first, because the files cannot be recovered. Selecting a split-recording parent deletes every listed part. Local downloads and Excel rows are left in place.
 
 ## Run from source
 

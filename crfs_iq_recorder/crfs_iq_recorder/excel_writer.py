@@ -161,8 +161,11 @@ def _set_iq_cell(cell, filename: str, local_path: str) -> None:
 
 
 def _fit_iq_row(ws: Worksheet, row: int, filename: str) -> None:
+    """Make the row tall enough for one line per part, never shorter than the
+    sheet's own rows (the template row copied into it may be taller)."""
     lines = max(1, len(split_iq_filenames(filename) or [filename]))
-    ws.row_dimensions[row].height = max(18, 16 * lines + 4)
+    current = ws.row_dimensions[row].height or 0
+    ws.row_dimensions[row].height = max(18, 16 * lines + 4, current)
 
 
 def format_playback_duration(duration_s: float | None) -> str | None:

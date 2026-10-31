@@ -76,6 +76,10 @@ def build_payload_for_recording_time(
     from .constants import DEFAULT_RECORDING_FORMAT, DEFAULT_TASK_ID
 
     seconds = float(recording_seconds)
+    if not seconds > 0:
+        # Measured on an RFeye Node 40-8 (2.25-325): duration 0 is accepted and
+        # records until the client disconnects (618 MB in 40 s at 2 MHz).
+        raise RequestBuildError("Recording time must be greater than zero.")
     duration = rate = capture_length = seconds
     fmt = (recording_format or DEFAULT_RECORDING_FORMAT).strip() or DEFAULT_RECORDING_FORMAT
     return build_recording_payload(

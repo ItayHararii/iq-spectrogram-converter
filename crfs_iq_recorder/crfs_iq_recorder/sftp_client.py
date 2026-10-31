@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import stat
 import threading
 from dataclasses import dataclass
@@ -88,6 +89,16 @@ def _raise_if_cancelled(cancel: threading.Event | None) -> None:
 
 SFTP_CONNECT_TIMEOUT_S = 8.0
 SFTP_READ_TIMEOUT_S = 20.0
+# The Node's SSH server finishes one key exchange in ~2.4 s and starves when
+# several run at once: on an RFeye Node 40-8, 4 simultaneous handshakes with
+# other sessions open left 2 of them timing out at 8 s (measured). Handshakes
+# are gated process-wide; open sessions are not limited.
+SSH_HANDSHAKE_SLOTS = 2
+_handshake_gate = threading.BoundedSemaphore(SSH_HANDSHAKE_SLOTS)
+# paramiko's transport thread logs a full traceback when a socket is closed
+# under it (our cancel path). Without a handler Python prints that to the
+# console; the app reports the outcome itself. A configured logger still gets it.
+logging.getLogger("paramiko").addHandler(logging.NullHandler())
 
 
 def _close_ssh_client(client) -> None:
@@ -315,8 +326,12 @@ def connect_sftp(
     if cancel is not None:
         threading.Thread(target=_watch_cancel, name="sftp-cancel", daemon=True).start()
     client = _new_client()
+    gate_held = False
     try:
         _raise_if_cancelled()
+        while not _handshake_gate.acquire(timeout=0.2):
+            _raise_if_cancelled()
+        gate_held = True
         try:
             _connect(client)
         except paramiko.AuthenticationException as exc:
@@ -343,6 +358,8 @@ def connect_sftp(
             raise SftpError("SFTP cancelled.") from exc
         raise SftpError(f"SFTP connection failed: {exc}") from exc
     finally:
+        if gate_held:
+            _handshake_gate.release()
         done.set()
 
 

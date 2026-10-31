@@ -353,3 +353,59 @@ def test_pcm16_and_float32_encodings_give_the_same_spectrum(tmp_path):
     assert abs(pcm_stats["peak_db"] - float_stats["peak_db"]) < 0.01
     assert pcm_stats["peak_freq_hz"] == float_stats["peak_freq_hz"]
     assert pcm_stats["n_samples"] == float_stats["n_samples"]
+
+
+# --- Split parts and the peak label (found on real RFeye Node files, 2026-10-31) ---
+
+
+def test_split_parts_continue_the_recordings_time_axis(tmp_path):
+    """file_x_0002.wav starts where _0001 ended; its PNG must not restart at 0 s."""
+    i1, q1 = _tone(40 * DF, 0.30)
+    i2, q2 = _tone(40 * DF, 0.20)
+    _write_iq_float(tmp_path / "file_190307_0001.wav", i1, q1)
+    _write_iq_float(tmp_path / "file_190307_0002.wav", i2, q2)
+    assert iq_data.part_time_offset(tmp_path / "file_190307_0001.wav") == (1, 0.0)
+    part, offset = iq_data.part_time_offset(tmp_path / "file_190307_0002.wav")
+    assert part == 2
+    assert offset == pytest.approx(0.30, abs=1e-9)
+    assert iq_data.part_time_offset(tmp_path / "tone.wav") == (None, None)
+    stats: dict = {}
+    iq_data.process_file(str(tmp_path / "file_190307_0002.wav"), str(tmp_path), RBW, cmap="gray", stats=stats)
+    assert stats["part_no"] == 2
+    assert stats["time_offset_s"] == pytest.approx(0.30, abs=1e-9)
+    assert stats["duration_s"] == pytest.approx(0.20, abs=1e-9)
+
+
+def test_split_part_without_its_earlier_parts_keeps_time_from_zero(tmp_path):
+    i, q = _tone(40 * DF, 0.2)
+    _write_iq_float(tmp_path / "file_190307_0003.wav", i, q)  # parts 1-2 absent
+    assert iq_data.part_time_offset(tmp_path / "file_190307_0003.wav") == (3, None)
+    stats: dict = {}
+    iq_data.process_file(str(tmp_path / "file_190307_0003.wav"), str(tmp_path), RBW, cmap="gray", stats=stats)
+    assert stats["part_no"] == 3
+    assert stats["time_offset_s"] == 0.0
+
+
+def test_peak_label_stays_inside_the_spectrum_axes():
+    """The y-limit ends 4 dB above the peak; the label used to spill over the title."""
+    plt = iq_data._plt()
+    fig, ax = plt.subplots(figsize=(8, 1.6), dpi=100)
+    try:
+        peak_db = -65.5
+        ax.set_xlim(-7.8, 7.8)
+        ax.set_ylim(-124.0, peak_db + 4.0)
+        ax.set_title("file_190307_0002.wav  ·  RBW 7.646 kHz  ·  requested 15 kHz")
+        iq_data._annotate_peak_marker(ax, 2.9, 2.9e6, peak_db)
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        axes_box = ax.get_window_extent(renderer)
+        labels = [t for t in ax.texts if "MHz" in t.get_text()]
+        assert len(labels) == 1
+        label_box = labels[0].get_window_extent(renderer)
+        assert label_box.y1 <= axes_box.y1 + 0.5, "peak label rises above the axes into the title"
+        assert label_box.y0 >= axes_box.y0 - 0.5
+        assert label_box.x0 >= axes_box.x0 - 0.5 and label_box.x1 <= axes_box.x1 + 0.5
+        title_box = ax.title.get_window_extent(renderer)
+        assert not label_box.overlaps(title_box)
+    finally:
+        plt.close(fig)

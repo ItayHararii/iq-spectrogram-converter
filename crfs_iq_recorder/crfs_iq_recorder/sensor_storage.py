@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal
 
 from .constants import SFTP_REMDATA_ROOT
-from .size_estimate import empirical_size_mb
+from .size_estimate import wave_size_model
 
 STORAGE_WARN_RATIO = 0.10
 STORAGE_CRITICAL_RATIO = 0.05
@@ -117,9 +117,8 @@ def snapshot_from_df_text(text: str, path: str) -> StorageSnapshot | None:
 
 
 def estimated_recording_bytes(bandwidth_hz: int, duration_s: float | Decimal | str) -> int:
-    mb = empirical_size_mb(bandwidth_hz, duration_s)
-    raw = (mb * Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING)
-    return max(int(raw), 0)
+    """Expected bytes for all split parts together (sample-rate model)."""
+    return max(int(wave_size_model(bandwidth_hz, duration_s).total_bytes), 0)
 
 
 def needed_bytes_with_margin(estimated_bytes: int) -> int:

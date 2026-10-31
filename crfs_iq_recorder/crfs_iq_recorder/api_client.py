@@ -8,6 +8,7 @@ Recording still uses only POST /emp/. Connection tests use TCP plus GET /.
 from __future__ import annotations
 
 import socket
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -28,6 +29,54 @@ from .validation import ConnectionTarget
 
 # Bound how much of a non-JSON / error body we keep in the GUI.
 _MAX_BODY_CHARS = 16_384
+
+
+def _response_socket(response: Any) -> Any:
+    """The TCP socket under a streaming `requests` response, or None."""
+    try:
+        raw = response.raw
+        conn = getattr(raw, "_connection", None) or getattr(raw, "connection", None)
+        sock = getattr(conn, "sock", None)
+        if sock is None:
+            fp = getattr(raw, "_fp", None)
+            inner = getattr(fp, "fp", None)
+            sock = getattr(getattr(inner, "raw", None), "_sock", None)
+        return sock
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _close_quietly(closable: Any) -> None:
+    try:
+        closable.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def connection_failure_reason(exc: BaseException) -> str:
+    """Short, plain-language cause for a `requests` ConnectionError.
+
+    urllib3 wraps the socket error in "HTTPConnectionPool(...): Max retries
+    exceeded with url ..." even though this client never retries; the user
+    needs the cause, not the wrapper.
+    """
+    text = str(exc)
+    lowered = text.casefold()
+    if "10061" in text or "connection refused" in lowered or "errno 111" in lowered:
+        return "the sensor refused the connection (nothing is listening on that port)"
+    if "11001" in text or "getaddrinfo" in lowered or "name or service not known" in lowered or "nodename" in lowered:
+        return "the host name could not be resolved"
+    if "10060" in text or "timed out" in lowered:
+        return "the connection attempt timed out"
+    if "10065" in text or "10051" in text or "unreachable" in lowered:
+        return "the network reports the host as unreachable"
+    if "10054" in text or "reset by peer" in lowered:
+        return "the sensor closed the connection"
+    if "remotedisconnected" in lowered or "connection aborted" in lowered:
+        return "the sensor closed the connection without a reply"
+    # Fall back to the innermost message without the pool/retry wrapper.
+    inner = text.rsplit("Caused by", 1)[-1].strip(" :()") if "Caused by" in text else text
+    return redact_text(inner)[:200] or "connection error"
 
 # `requests` costs ~0.3 s to import and is only needed once the first HTTP call
 # runs on a worker thread. Importing it here at module load would delay the
@@ -77,12 +126,53 @@ class Transport(Protocol):
 
 
 @dataclass
+class SseEvent:
+    """One Server-Sent Events block (`event:` name plus parsed `data:`)."""
+
+    event: str
+    data: Any
+    received_s: float
+
+
+# Why the stream ended. "finished" = the sensor said the recording is done.
+STREAM_FINISHED = "finished"
+STREAM_ERROR = "error"
+STREAM_BUDGET = "budget"
+STREAM_CANCELLED = "cancelled"
+STREAM_CLOSED = "closed"
+STREAM_LOST = "lost"
+
+# EMP event names seen on RFeye Node firmware 2.25 (CRFS.MissionProcessor 1.11).
+SSE_EVENT_MESSAGE = "message.MessageData"
+SSE_EVENT_REMOTE_TIME = "time.RemoteTimeData"
+# Synthetic event this client raises once the response headers have arrived.
+SSE_EVENT_HTTP_ACCEPTED = "crfs_iq_recorder.http_accepted"
+SSE_FINISHED_TEXT = "remote recording is now finished"
+_SSE_ERROR_LEVELS = {"ERROR", "FATAL", "CRITICAL"}
+# Noise the Node repeats several times a second; not worth a log line each.
+_SSE_IGNORED_MESSAGE_FRAGMENTS = ("gps reference",)
+_MAX_STREAM_EVENTS = 2000
+
+
+@dataclass
+class StreamOptions:
+    """How long to follow an event-stream reply and how to stop early."""
+
+    budget_s: float
+    cancel: Any = None  # threading.Event-like; set() ends the stream
+    on_event: Any = None  # callable(SseEvent) -> bool (True = stop reading)
+    read_timeout_s: float = 30.0
+
+
+@dataclass
 class RawResponse:
     status_code: int
     text: str
     headers: dict[str, str]
     elapsed_s: float
     url: str
+    stream_events: list[SseEvent] | None = None
+    stream_ended: str = ""
 
 
 @dataclass
@@ -100,6 +190,13 @@ class HttpOutcome:
     demo: bool = False
     accepted: bool = False
     headers: dict[str, str] = field(default_factory=dict)
+    # Filled from the EMP event stream when the sensor replies with text/event-stream.
+    stream_ended: str = ""
+    sensor_finished: bool = False
+    sensor_parts: list[str] = field(default_factory=list)
+    sensor_file_dir: str = ""
+    sensor_task_id: str = ""
+    sensor_messages: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         parts = [self.title]
@@ -110,6 +207,91 @@ class HttpOutcome:
         return " — ".join(parts)
 
 
+def parse_sse_blocks(buffer: str) -> tuple[list[tuple[str, str]], str]:
+    """Split complete SSE blocks out of `buffer`; return (event, data) pairs and the remainder."""
+    blocks: list[tuple[str, str]] = []
+    text = buffer.replace("\r\n", "\n").replace("\r", "\n")
+    while "\n\n" in text:
+        block, text = text.split("\n\n", 1)
+        name = "message"
+        data_lines: list[str] = []
+        for line in block.split("\n"):
+            if line.startswith(":"):
+                continue  # comment / keepalive
+            if line.startswith("event:"):
+                name = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].lstrip(" "))
+        if data_lines:
+            blocks.append((name, "\n".join(data_lines)))
+    return blocks, text
+
+
+def sse_event_from_block(name: str, data: str, received_s: float) -> SseEvent:
+    import json
+
+    parsed: Any = data
+    try:
+        parsed = json.loads(data)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return SseEvent(event=name, data=parsed, received_s=received_s)
+
+
+def _message_items(event: SseEvent) -> list[dict]:
+    if event.event != SSE_EVENT_MESSAGE:
+        return []
+    items = event.data if isinstance(event.data, list) else [event.data]
+    return [item for item in items if isinstance(item, dict)]
+
+
+def sse_message_is_noise(item: dict) -> bool:
+    text = str(item.get("message", "")).casefold()
+    return any(fragment in text for fragment in _SSE_IGNORED_MESSAGE_FRAGMENTS)
+
+
+def sse_message_is_finished(item: dict) -> bool:
+    return SSE_FINISHED_TEXT in str(item.get("message", "")).casefold()
+
+
+def sse_message_is_error(item: dict) -> bool:
+    return str(item.get("level", "")).upper() in _SSE_ERROR_LEVELS
+
+
+def sse_part_filename(event: SseEvent) -> tuple[str, str]:
+    """(file_dir, filename) from a time.RemoteTimeData event, or ('', '')."""
+    if event.event != SSE_EVENT_REMOTE_TIME:
+        return "", ""
+    items = event.data if isinstance(event.data, list) else [event.data]
+    for item in items:
+        if isinstance(item, dict) and item.get("first_filename"):
+            return str(item.get("file_dir") or ""), str(item.get("first_filename") or "")
+    return "", ""
+
+
+def sse_task_id(event: SseEvent) -> str:
+    if event.event != SSE_EVENT_REMOTE_TIME:
+        return ""
+    items = event.data if isinstance(event.data, list) else [event.data]
+    for item in items:
+        if isinstance(item, dict) and item.get("task_id"):
+            return str(item["task_id"])
+    return ""
+
+
+def recording_stream_budget_s(duration_s: float) -> float:
+    """How long to keep the sensor's event stream open after the POST.
+
+    Hardware measurements (RFeye Node 40-8, firmware 2.25): the completion
+    message arrives about 1.5-2.5 s after the nominal end of the capture, and
+    the last WAVE part can take another 20 s to reach the disk at 62.5 MS/s.
+    The GUI holds the stream until the files are confirmed and then closes it;
+    this budget is the safety net when that confirmation never comes.
+    """
+    seconds = max(float(duration_s), 0.0)
+    return seconds + max(60.0, seconds)
+
+
 class RequestsTransport:
     """One-shot requests calls. No retries (a timed-out POST must not be replayed)."""
 
@@ -117,6 +299,8 @@ class RequestsTransport:
         # The session is created on first request so that `requests` is
         # imported on the worker thread, not while the window is opening.
         self._session = session
+        self._active_response: Any = None
+        self._aborted = False
 
     def _get_session(self) -> requests.Session:
         if self._session is None:
@@ -124,14 +308,37 @@ class RequestsTransport:
             self._session = requests.Session()
         return self._session
 
+    def abort(self) -> None:
+        """Stop an event-stream read that another thread is blocked on.
+
+        Shutting the socket down makes the blocked `recv()` return at once; the
+        reading thread then closes the response itself. Closing the response
+        from here instead stalled the caller for over a second on Windows.
+        """
+        self._aborted = True
+        response = self._active_response
+        if response is None:
+            return
+        sock = _response_socket(response)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        else:
+            threading.Thread(target=_close_quietly, args=(response,), daemon=True, name="emp-stream-close").start()
+
     def close(self) -> None:
+        self.abort()
         session = self._session
+        self._session = None
         if session is None:
             return
-        try:
-            session.close()
-        except Exception:
-            pass
+        if self._active_response is not None:
+            # A reader is still unwinding; let it finish before the pool is torn down.
+            threading.Thread(target=_close_quietly, args=(session,), daemon=True, name="emp-session-close").start()
+            return
+        _close_quietly(session)
 
     def request(
         self,
@@ -142,22 +349,133 @@ class RequestsTransport:
         json_body: dict | None = None,
         auth: HTTPBasicAuth | None = None,
         timeout: float = 30.0,
+        stream: StreamOptions | None = None,
     ) -> RawResponse:
+        if stream is None:
+            response = self._get_session().request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=json_body,
+                auth=auth,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            return RawResponse(
+                status_code=int(response.status_code),
+                text=response.text or "",
+                headers={str(k): str(v) for k, v in response.headers.items()},
+                elapsed_s=float(response.elapsed.total_seconds()) if response.elapsed else 0.0,
+                url=str(response.url),
+            )
+        return self._request_streaming(method, url, headers=headers, json_body=json_body, auth=auth,
+                                       timeout=timeout, options=stream)
+
+    def _request_streaming(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None,
+        json_body: dict | None,
+        auth: HTTPBasicAuth | None,
+        timeout: float,
+        options: StreamOptions,
+    ) -> RawResponse:
+        """Fetch headers, then follow a text/event-stream body until it is done.
+
+        The EMP endpoint on RFeye Nodes answers the recording POST with an
+        endless Server-Sent Events stream (keepalive every 10 s). A plain
+        `response.text` read never returns, so the body is consumed block by
+        block until the caller's `on_event` says stop, the time budget runs
+        out, the stream is cancelled, or the sensor closes it.
+        """
+        import time
+
+        self._aborted = False
+        read_timeout = max(1.0, float(options.read_timeout_s or timeout))
+        started = time.monotonic()
         response = self._get_session().request(
             method=method,
             url=url,
             headers=headers,
             json=json_body,
             auth=auth,
-            timeout=timeout,
+            timeout=(timeout, read_timeout),
             allow_redirects=True,
+            stream=True,
         )
+        content_type = str(response.headers.get("Content-Type", "")).casefold()
+        if not content_type.startswith("text/event-stream"):
+            try:
+                text = response.text or ""
+            finally:
+                response.close()
+            return RawResponse(
+                status_code=int(response.status_code),
+                text=text,
+                headers={str(k): str(v) for k, v in response.headers.items()},
+                elapsed_s=float(response.elapsed.total_seconds()) if response.elapsed else 0.0,
+                url=str(response.url),
+            )
+        self._active_response = response
+        events: list[SseEvent] = []
+        lines: list[str] = []
+        ended = STREAM_CLOSED
+        buffer = ""
+        if options.on_event is not None:
+            try:
+                options.on_event(
+                    SseEvent(
+                        event=SSE_EVENT_HTTP_ACCEPTED,
+                        data={"status": int(response.status_code)},
+                        received_s=time.monotonic() - started,
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            for chunk in response.iter_content(chunk_size=None, decode_unicode=False):
+                if self._aborted or (options.cancel is not None and options.cancel.is_set()):
+                    ended = STREAM_CANCELLED
+                    break
+                if chunk:
+                    buffer += chunk.decode("utf-8", errors="replace")
+                    blocks, buffer = parse_sse_blocks(buffer)
+                    stop = False
+                    for name, data in blocks:
+                        event = sse_event_from_block(name, data, time.monotonic() - started)
+                        if len(events) < _MAX_STREAM_EVENTS:
+                            events.append(event)
+                            lines.append(f"{name}: {data}")
+                        if options.on_event is not None and options.on_event(event):
+                            stop = True
+                            break
+                    if stop:
+                        ended = STREAM_FINISHED
+                        break
+                if time.monotonic() - started >= options.budget_s:
+                    ended = STREAM_BUDGET
+                    break
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if self._aborted or (options.cancel is not None and options.cancel.is_set()):
+                ended = STREAM_CANCELLED
+            else:
+                ended = f"{STREAM_LOST}: {type(exc).__name__}"
+        finally:
+            self._active_response = None
+            try:
+                response.close()
+            except Exception:
+                pass
         return RawResponse(
             status_code=int(response.status_code),
-            text=response.text or "",
+            text="\n".join(lines),
             headers={str(k): str(v) for k, v in response.headers.items()},
             elapsed_s=float(response.elapsed.total_seconds()) if response.elapsed else 0.0,
             url=str(response.url),
+            stream_events=events,
+            stream_ended=ended,
         )
 
 
@@ -239,6 +557,12 @@ class EmpClient:
         closer = getattr(self.transport, "close", None)
         if closer is not None:
             closer()
+
+    def abort(self) -> None:
+        """Interrupt a recording POST whose event stream is still open."""
+        aborter = getattr(self.transport, "abort", None)
+        if aborter is not None:
+            aborter()
 
     def test_connection(self, target: ConnectionTarget, password: str) -> HttpOutcome:
         """Reachability + GET /. Never POSTs a recording body."""
@@ -467,19 +791,79 @@ class EmpClient:
         target: ConnectionTarget,
         password: str,
         payload: dict[str, Any],
+        *,
+        cancel: Any = None,
+        on_event: Any = None,
+        stream_budget_s: float | None = None,
+        stop_on_finished: bool = True,
     ) -> HttpOutcome:
+        """POST the recording and, when the sensor answers with an event stream,
+        follow it until the sensor reports that the recording finished.
+
+        `on_event(SseEvent)` is called on the worker thread for every event.
+        `cancel` (threading.Event) ends the wait early. Nothing is ever retried.
+        With `stop_on_finished=False` the stream stays open after the sensor's
+        completion message until `cancel` is set or the budget runs out: the
+        Node drops the mission the moment its client disconnects, so the GUI
+        keeps the connection until the WAVE parts are confirmed on disk.
+        """
         _ensure_requests()
         url = emp_url(target)
         auth = HTTPBasicAuth(target.username, password)
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/plain;q=0.8"}
+        duration_s = _payload_duration(payload)
+        budget = stream_budget_s if stream_budget_s is not None else recording_stream_budget_s(duration_s)
+        parts: list[str] = []
+        file_dir = ""
+        task_echo = ""
+        messages: list[str] = []
+        state = {"finished": False, "error": False}
+
+        def _watch(event: SseEvent) -> bool:
+            nonlocal file_dir, task_echo
+            directory, name = sse_part_filename(event)
+            if name:
+                file_dir = directory or file_dir
+                if name not in parts:
+                    parts.append(name)
+            echo = sse_task_id(event)
+            if echo:
+                task_echo = echo
+            stop = False
+            for item in _message_items(event):
+                if sse_message_is_noise(item):
+                    continue
+                text = redact_text(str(item.get("message", "")))
+                level = str(item.get("level", "")).upper()
+                if len(messages) < 50:
+                    messages.append(f"{level}: {text}" if level else text)
+                if sse_message_is_finished(item):
+                    state["finished"] = True
+                    stop = stop or stop_on_finished
+                elif sse_message_is_error(item):
+                    state["error"] = True
+                    stop = True
+            if on_event is not None:
+                try:
+                    on_event(event)
+                except Exception:  # noqa: BLE001 - a UI callback must not kill the stream
+                    pass
+            return stop
+
+        stream = StreamOptions(
+            budget_s=budget,
+            cancel=cancel,
+            on_event=_watch,
+            read_timeout_s=max(target.timeout_s, 15.0),
+        )
         try:
-            raw = self.transport.request(
-                "POST",
+            raw = self._request_with_optional_stream(
                 url,
                 headers=headers,
-                json_body=payload,
+                payload=payload,
                 auth=auth,
                 timeout=target.timeout_s,
+                stream=stream,
             )
         except ConnectTimeout:
             return HttpOutcome(
@@ -521,7 +905,10 @@ class EmpClient:
             return HttpOutcome(
                 kind="connection_failure",
                 title="Connection failed",
-                detail=f"POST {redact_url(url)} failed: {exc}. Recording was not retried.",
+                detail=(
+                    f"Could not connect to {redact_url(url)}: {connection_failure_reason(exc)}. "
+                    "The recording request was not sent and was not retried."
+                ),
                 url=redact_url(url),
                 request_sent=False,
                 demo=self.demo,
@@ -548,6 +935,18 @@ class EmpClient:
                 headers=headers_without_auth(raw.headers),
             )
 
+        if raw.stream_events is not None:
+            return self._stream_outcome(
+                raw,
+                url=url,
+                finished=state["finished"],
+                error=state["error"],
+                parts=parts,
+                file_dir=file_dir,
+                task_echo=task_echo,
+                messages=messages,
+            )
+
         non_json_note = ""
         if (raw.text or "").strip() and body_json is None:
             non_json_note = (
@@ -572,3 +971,116 @@ class EmpClient:
             accepted=True,
             headers=headers_without_auth(raw.headers),
         )
+
+    def _request_with_optional_stream(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        auth: Any,
+        timeout: float,
+        stream: StreamOptions,
+    ) -> RawResponse:
+        """Pass `stream=` only to transports that understand it (fakes in tests may not)."""
+        try:
+            return self.transport.request(
+                "POST",
+                url,
+                headers=headers,
+                json_body=payload,
+                auth=auth,
+                timeout=timeout,
+                stream=stream,
+            )
+        except TypeError as exc:
+            if "stream" not in str(exc):
+                raise
+            return self.transport.request(
+                "POST",
+                url,
+                headers=headers,
+                json_body=payload,
+                auth=auth,
+                timeout=timeout,
+            )
+
+    def _stream_outcome(
+        self,
+        raw: RawResponse,
+        *,
+        url: str,
+        finished: bool,
+        error: bool,
+        parts: list[str],
+        file_dir: str,
+        task_echo: str,
+        messages: list[str],
+    ) -> HttpOutcome:
+        shown_url = redact_url(raw.url or url)
+        common = dict(
+            status_code=raw.status_code,
+            url=shown_url,
+            elapsed_s=raw.elapsed_s,
+            body_text=redact_text(_clip(raw.text)),
+            request_sent=True,
+            demo=self.demo,
+            headers=headers_without_auth(raw.headers),
+            stream_ended=raw.stream_ended,
+            sensor_finished=finished,
+            sensor_parts=list(parts),
+            sensor_file_dir=file_dir,
+            sensor_task_id=task_echo,
+            sensor_messages=list(messages),
+        )
+        if error:
+            last = messages[-1] if messages else "The sensor reported an error."
+            return HttpOutcome(
+                kind="sensor_error",
+                title="Sensor reported an error for this recording",
+                detail=f"POST {shown_url} was accepted (HTTP {raw.status_code}) but the sensor reported: {last}",
+                accepted=False,
+                outcome_unknown=False,
+                **common,
+            )
+        if finished:
+            count = len(parts)
+            files = f"{count} file(s): {', '.join(parts)}" if parts else "no file names were reported"
+            return HttpOutcome(
+                kind="accepted",
+                title="Sensor reported the recording finished",
+                detail=(
+                    f"POST {shown_url} returned HTTP {raw.status_code} and the sensor's event stream "
+                    f"reported 'Remote recording is now finished' ({files}). Files may still be "
+                    "flushing to the sensor disk."
+                ),
+                accepted=True,
+                **common,
+            )
+        if raw.stream_ended.startswith(STREAM_LOST):
+            reason = "the connection to the sensor dropped"
+        elif raw.stream_ended == STREAM_CANCELLED:
+            reason = "this application stopped waiting"
+        elif raw.stream_ended == STREAM_BUDGET:
+            reason = "no completion message arrived within the time budget"
+        else:
+            reason = "the sensor closed the stream"
+        return HttpOutcome(
+            kind="accepted",
+            title="HTTP request accepted — recording completion not confirmed",
+            detail=(
+                f"POST {shown_url} returned HTTP {raw.status_code}; {reason} before the sensor "
+                "reported completion. Completion is confirmed from the files instead."
+            ),
+            accepted=True,
+            outcome_unknown=not raw.stream_ended == STREAM_CANCELLED,
+            **common,
+        )
+
+
+def _payload_duration(payload: dict[str, Any]) -> float:
+    try:
+        scans = payload.get("remote_recording_scans") or []
+        return float(scans[0].get("duration", 0.0)) if scans else 0.0
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return 0.0

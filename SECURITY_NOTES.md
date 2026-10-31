@@ -1,7 +1,7 @@
 # Security notes - CRFS IQ Spectrogram Converter
 
 Why Windows warns when the EXE is opened, what was checked, what was changed,
-and what is still needed. Written for release 1.4.0; hash and version updated for 1.5.0 (30 October 2026: Defender 4.18.26100.4, signatures 1.463.34.0, custom scan of the 1.5.0 EXE clean, still unsigned - no certificate on the build PC).
+and what is still needed. Written for release 1.4.0; hash and version updated for 1.5.1 (31 October 2026; still unsigned - no certificate on the build PC).
 
 ## Why Windows shows a warning
 
@@ -95,10 +95,10 @@ Use these details for the current build:
 | --- | --- |
 | Product name | CRFS IQ Spectrogram Converter |
 | Publisher / company | Sensorz |
-| Version | 1.5.0 |
+| Version | 1.5.1 |
 | File name | IQ_Spectrogram_Converter.exe |
-| Size | 69,175,504 bytes (66 MB) |
-| SHA-256 | E6FAF5362F3C999EA15882A4E9F14FD2D76ACB6616F3EA63C1F06F3DD69D1B42 |
+| Size | 69,176,941 bytes (66 MB) |
+| SHA-256 | 24F786ECF769166E4EEACBF0A7757BB50FC87D2DEDFEDCA746B264947745977F |
 | Build tool | PyInstaller 6.22.0, Python 3.13.14, one-file, windowed, no UPX |
 | What it does | Reads a stereo IQ WAV, computes an STFT, writes a PNG spectrogram. No network access, no installer, no registry changes. Settings are stored in a JSON file next to the EXE and a matplotlib cache under %LOCALAPPDATA%\CRFS IQ Spectrogram Converter. |
 

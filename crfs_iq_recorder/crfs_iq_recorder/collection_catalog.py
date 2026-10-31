@@ -210,6 +210,11 @@ def load_workbook_catalog(path: str | Path) -> WorkbookCatalog:
         sheets: list[tuple[str, list[Any], list[list[Any]]]] = []
         for name in workbook.sheetnames:
             ws = workbook[name]
+            if getattr(ws, "sheet_state", "visible") != "visible":
+                # A hidden sheet is not where the user wants new rows; one
+                # workbook in the field had a hidden "TETRA" next to the live
+                # "TETRA)" sheet, and every row went into the hidden one.
+                continue
             rows = sheet_rows(ws)
             if not rows:
                 continue

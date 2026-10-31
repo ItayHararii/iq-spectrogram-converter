@@ -100,6 +100,24 @@ def test_connection_error():
     assert not outcome.outcome_unknown
 
 
+def test_connection_error_text_names_the_cause_not_the_retry_wrapper():
+    from crfs_iq_recorder.api_client import connection_failure_reason
+
+    wrapped = RequestsConnectionError(
+        "HTTPConnectionPool(host='192.0.2.10', port=18082): Max retries exceeded with url: /emp/ (Caused by "
+        "NewConnectionError(\"HTTPConnection(host='192.0.2.10', port=18082): Failed to establish a new connection: "
+        "[WinError 10061] No connection could be made because the target machine actively refused it\"))"
+    )
+    transport = FakeTransport(error=wrapped)
+    outcome = EmpClient(transport=transport).start_recording(_target(), "pass", default_payload())
+    assert "refused the connection" in outcome.detail
+    assert "Max retries" not in outcome.detail
+    assert "not sent" in outcome.detail
+    assert connection_failure_reason(RequestsConnectionError("[Errno 11001] getaddrinfo failed")) == (
+        "the host name could not be resolved"
+    )
+
+
 def test_connect_timeout_not_sent():
     transport = FakeTransport(error=ConnectTimeout("connect"))
     outcome = EmpClient(transport=transport).start_recording(_target(), "pass", default_payload())
