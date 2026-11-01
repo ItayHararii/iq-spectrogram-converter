@@ -54,6 +54,7 @@ from .listing_sort import (
     header_label,
     sort_listing_nodes,
 )
+from .iq_merge import human_bytes, merged_output_path, plan_merge
 from .paths import brand_icon_path, ensure_download_dir, resolved_download_dir
 from .recording_history import (
     format_columns,
@@ -61,9 +62,11 @@ from .recording_history import (
     group_total_bytes,
     iq_group_key,
     iq_part_label,
+    iq_part_number,
     load_recordings,
     match_recordings_to_entries,
     persist_matched_stems,
+    remote_directory,
 )
 from .sftp_client import RemoteEntry, SftpBrowser, SftpError, connect_sftp
 from .sftp_paths import parent_directory, resolve_today_directory, today_remdata_directory
@@ -106,14 +109,15 @@ def discovered_new_paths(previous: set[str] | None, current: set[str]) -> tuple[
     return set(current) - previous, previous | current
 
 
-def _same_remote_path(left: str, right: str) -> bool:
-    def norm(path: str) -> str:
-        text = (path or "/").replace("\\", "/")
-        if text != "/" and text.endswith("/"):
-            text = text.rstrip("/")
-        return text or "/"
+def _normalise_dir(path: str) -> str:
+    text = (path or "/").replace("\\", "/")
+    if text != "/" and text.endswith("/"):
+        text = text.rstrip("/")
+    return text or "/"
 
-    return norm(left) == norm(right)
+
+def _same_remote_path(left: str, right: str) -> bool:
+    return _normalise_dir(left) == _normalise_dir(right)
 
 
 class NewBadgeDelegate(QStyledItemDelegate):
@@ -569,6 +573,9 @@ class SftpWindow(QWidget):
         self._dl_bytes: dict[str, tuple[int, int]] = {}
         self._dl_folder: Path | None = None
         self._dl_cancel = threading.Event()
+        self._dl_saved: dict[str, str] = {}  # remote name -> local path, this batch
+        self._merge = None  # MergeController, set by the main window
+        self._merge_after_download: tuple[str, str] | None = None  # (group key, stem)
         self._seen_by_dir: dict[str, set[str]] = {}
         self._new_paths: set[str] = set()
         self._recent_record_id = ""
@@ -609,6 +616,13 @@ class SftpWindow(QWidget):
         self.up_btn.setObjectName("ghost")
         self.download_btn = QPushButton("Download")
         self.download_btn.setObjectName("accent")
+        self.merge_btn = QPushButton("Merge parts")
+        self.merge_btn.setObjectName("ghost")
+        self.merge_btn.setEnabled(False)
+        self.merge_btn.setToolTip(
+            "Join the numbered parts of the selected recording into one WAVE file in the download folder.\n"
+            "Parts that are not downloaded yet are downloaded first. The originals are kept."
+        )
         self.open_folder_btn = QPushButton("Open recordings folder")
         self.open_folder_btn.setObjectName("ghost")
         self.cancel_btn = QPushButton("Cancel")
@@ -617,12 +631,14 @@ class SftpWindow(QWidget):
         self.refresh_btn.clicked.connect(self.refresh)
         self.up_btn.clicked.connect(self._go_parent)
         self.download_btn.clicked.connect(self._download_selected)
+        self.merge_btn.clicked.connect(self._merge_selected)
         self.open_folder_btn.clicked.connect(self._open_recordings_folder)
         self.cancel_btn.clicked.connect(self._cancel_downloads)
         for btn in (
             self.refresh_btn,
             self.up_btn,
             self.download_btn,
+            self.merge_btn,
             self.open_folder_btn,
             self.cancel_btn,
         ):
@@ -631,6 +647,7 @@ class SftpWindow(QWidget):
         tools.addWidget(self.refresh_btn)
         tools.addWidget(self.up_btn)
         tools.addWidget(self.download_btn)
+        tools.addWidget(self.merge_btn)
         tools.addWidget(self.open_folder_btn)
         tools.addWidget(self.cancel_btn)
         layout.addWidget(toolbar)
@@ -865,6 +882,192 @@ class SftpWindow(QWidget):
         self.open_folder_btn.setEnabled(True)
         self._sync_up_button()
         self._update_download_button()
+        self._update_merge_button()
+
+    # ------------------------------------------------------------------ merge recording parts
+    def set_merge_controller(self, controller) -> None:
+        self._merge = controller
+        self._update_merge_button()
+
+    def _group_parts(self, stem: str, directory: str) -> list[RemoteEntry]:
+        """The numbered parts of one recording in the current listing, in part order."""
+        wanted = _normalise_dir(directory)
+        parts = [
+            entry
+            for entry in self._entries
+            if not entry.is_dir
+            and iq_part_number(entry.name) is not None
+            and iq_group_key(entry.name) == stem
+            and remote_directory(entry.path) == wanted
+        ]
+        parts.sort(key=lambda entry: (iq_part_number(entry.name) or 0, entry.name))
+        return parts
+
+    def _local_part_paths(
+        self, parts: list[RemoteEntry], folder: Path, saved: dict[str, str] | None = None
+    ) -> tuple[list[Path], list[RemoteEntry]]:
+        """(local copies that match the sensor's size, parts still to download).
+
+        `saved` maps remote names to the paths the last batch wrote (a second
+        download of the same file lands in "name (2).wav")."""
+        have: list[Path] = []
+        missing: list[RemoteEntry] = []
+        for entry in parts:
+            written = (saved or {}).get(entry.name)
+            candidates = [Path(written)] if written else []
+            candidates.append(folder / entry.name)
+            found = None
+            for candidate in candidates:
+                try:
+                    if candidate.is_file() and candidate.stat().st_size == int(entry.size or 0):
+                        found = candidate
+                        break
+                except OSError:
+                    continue
+            if found is None:
+                missing.append(entry)
+            else:
+                have.append(found)
+        return have, missing
+
+    def _merge_group_key(self, stem: str, directory: str) -> str:
+        return f"{self._state.host}|{_normalise_dir(directory)}|{stem}"
+
+    def _selected_group(self) -> tuple[str, str, list[RemoteEntry]] | None:
+        """(stem, directory, parts) when the selection is exactly one split recording."""
+        files = self._selected_files()
+        if not files:
+            return None
+        stems = {iq_group_key(entry.name) for entry in files}
+        if len(stems) != 1:
+            return None
+        if any(iq_part_number(entry.name) is None for entry in files):
+            return None
+        stem = stems.pop()
+        directory = remote_directory(files[0].path)
+        parts = self._group_parts(stem, directory)
+        return stem, directory, parts
+
+    def _update_merge_button(self) -> None:
+        if not hasattr(self, "merge_btn"):
+            return
+        group = self._selected_group()
+        locked = self._busy or bool(self._dl_pending or self._dl_active)
+        ok = self._merge is not None and group is not None and len(group[2]) >= 2 and not locked
+        self.merge_btn.setEnabled(bool(ok))
+        if group is not None and len(group[2]) >= 2:
+            self.merge_btn.setText(f"Merge {len(group[2])} parts")
+        else:
+            self.merge_btn.setText("Merge parts")
+
+    def _merge_selected(self) -> None:
+        if self._merge is None or self._busy or self._dl_active or self._closing:
+            return
+        group = self._selected_group()
+        if group is None:
+            QMessageBox.information(self, "Merge parts", "Select one split recording (its group row) to merge.")
+            return
+        stem, directory, parts = group
+        if len(parts) < 2:
+            QMessageBox.information(self, "Merge parts", f"{stem} has a single file; there is nothing to merge.")
+            return
+        try:
+            folder = ensure_download_dir(self._state.download_dir)
+        except OSError as exc:
+            QMessageBox.warning(self, "Merge parts", f"Could not create the download folder.\n{exc}")
+            return
+        have, missing = self._local_part_paths(parts, folder)
+        key = self._merge_group_key(stem, directory)
+        names = "\n".join(f"  {entry.name}  ({human_bytes(entry.size)})" for entry in parts)
+        if not missing:
+            plan = plan_merge(have)
+            if not plan.ok:
+                QMessageBox.warning(self, "Merge parts", f"{stem} cannot be merged:\n\n" + "\n".join(plan.errors))
+                return
+            output = merged_output_path(stem, folder)
+            continuity = {
+                "verified": "Each part starts where the previous one ends (verified from the sensor's time stamps).",
+                "unknown": "Continuity across the joins cannot be verified: the parts carry no time stamps.",
+            }.get(plan.continuity, plan.continuity)
+            text = (
+                f"Merge the {len(parts)} parts of {stem}:\n{names}\n\n"
+                f"Verified duration: {plan.duration_s:.3f} s ({plan.total_frames:,} samples)\n"
+                f"Output: {output.name}  ({human_bytes(plan.output_bytes)}, {plan.container})\n"
+                f"Folder: {folder}\n\n{continuity}\nThe original parts are kept."
+            )
+        else:
+            est = sum(int(entry.size or 0) for entry in parts)
+            text = (
+                f"Merge the {len(parts)} parts of {stem}:\n{names}\n\n"
+                f"{len(missing)} part(s) are not in the download folder yet and will be downloaded first "
+                f"({human_bytes(sum(int(e.size or 0) for e in missing))}).\n"
+                f"Estimated output: about {human_bytes(est)} in {folder}\n"
+                "The duration and continuity are verified from the file headers once all parts are local.\n"
+                "The original parts are kept."
+            )
+        answer = QMessageBox.question(
+            self,
+            "Merge parts",
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if missing:
+            self._merge_after_download = (key, stem)
+            self.activity.emit(f"Merge {stem}: downloading {len(missing)} missing part(s) first.")
+            self._begin_downloads(missing)
+            return
+        reason = self._merge.request(key, stem, have, folder, auto=False)
+        if reason:
+            self.status.setText(f"Merge not started: {reason}.")
+        else:
+            self.status.setText(f"Merging {stem} in the background; progress is shown in the main window.")
+
+    def _after_downloads_finished(self) -> None:
+        """Offer every fully downloaded split recording to the merge controller."""
+        saved = dict(self._dl_saved)
+        self._dl_saved = {}
+        manual = self._merge_after_download
+        self._merge_after_download = None
+        if self._merge is None or (not saved and manual is None):
+            return
+        try:
+            folder = self._dl_folder or ensure_download_dir(self._state.download_dir)
+        except OSError:
+            return
+        stems: dict[str, str] = {}
+        by_name = {entry.name: entry for entry in self._entries if not entry.is_dir}
+        for name in saved:
+            if iq_part_number(name) is None:
+                continue
+            entry = by_name.get(name)
+            if entry is not None:
+                stems.setdefault(iq_group_key(name), remote_directory(entry.path))
+        if manual is not None and manual[1] not in stems:
+            # The manual request's own parts were already local; find its folder from the listing.
+            for entry in by_name.values():
+                if iq_group_key(entry.name) == manual[1] and iq_part_number(entry.name) is not None:
+                    stems.setdefault(manual[1], remote_directory(entry.path))
+                    break
+        for stem, directory in stems.items():
+            parts = self._group_parts(stem, directory)
+            if len(parts) < 2:
+                continue
+            have, missing = self._local_part_paths(parts, folder, saved)
+            key = self._merge_group_key(stem, directory)
+            is_manual = manual is not None and manual[0] == key
+            if missing:
+                if is_manual:
+                    self.status.setText(
+                        f"Merge of {stem} not started: {len(missing)} part(s) still missing "
+                        f"({', '.join(e.name for e in missing[:3])}{'…' if len(missing) > 3 else ''})."
+                    )
+                continue
+            reason = self._merge.request(key, stem, have, folder, auto=not is_manual)
+            if is_manual and reason:
+                self.status.setText(f"Merge not started: {reason}.")
 
     def _sync_up_button(self) -> None:
         locked = self._busy or bool(self._dl_pending or self._dl_active)
@@ -1134,6 +1337,7 @@ class SftpWindow(QWidget):
             total = sum(item.size for item in files)
             self.status.setText(f"{len(files)} selected, {total:,} B.")
         self._update_download_button()
+        self._update_merge_button()
 
     def set_connection_state(self, state: ConnectionState) -> None:
         self._state = state
@@ -1203,6 +1407,7 @@ class SftpWindow(QWidget):
         self._dl_cancel_count = 0
         self._dl_total = len(jobs)
         self._dl_bytes = {}
+        self._dl_saved = {}
         self._dl_folder = Path(jobs[0][1]).parent
         self.progress.setVisible(True)
         self.progress.setRange(0, 100)
@@ -1255,6 +1460,7 @@ class SftpWindow(QWidget):
         if self._closing:
             return
         self._dl_ok += 1
+        self._dl_saved[name] = path
         done = self._dl_ok + self._dl_fail + self._dl_cancel_count
         self.status.setText(f"Saved {name} ({done}/{self._dl_total})")
 
@@ -1312,6 +1518,14 @@ class SftpWindow(QWidget):
             parts.append(f"{self._dl_cancel_count} cancelled")
         self.status.setText("; ".join(parts) + "." if parts else "Download stopped.")
         self._set_busy(False)
+        if self._dl_fail or self._dl_cancel_count:
+            # An incomplete batch never feeds a merge; the operator can retry.
+            self._dl_saved = {}
+            if self._merge_after_download is not None:
+                self._merge_after_download = None
+                self.activity.emit("Merge not started: the download did not complete.")
+        else:
+            self._after_downloads_finished()
         if self._dl_ok and self._dl_folder is not None:
             self._open_recordings_folder(self._dl_folder)
 

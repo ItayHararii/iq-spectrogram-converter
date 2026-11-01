@@ -1,6 +1,6 @@
 # CRFS IQ Recorder - architecture
 
-**Version documented:** 1.8.9
+**Version documented:** 1.8.10
 **Code:** `crfs_iq_recorder/` as of this file (21 September 2026)
 **Related app:** IQ Spectrogram Converter (`iq_gui.py`, `iq_data.py`) at the repository root
 
@@ -111,7 +111,9 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | Link monitor | HTTP reachability every 10 s; SFTP errors stay in Sensor Files | `connection_monitor.py` |
 | IQ storage | SFTP `statvfs` on `/mnt/1/remdata/`; block Start if the estimate plus margin would not fit | `sensor_storage.py` |
 | Recording history | Save requested Hz/time; match remote files to that Start | `recording_history.py` |
-| File watch | Stable SFTP size for split parts when Excel or Repeat is on | `file_watch.py` |
+| File watch | Stable SFTP size for every recording's parts, including the parts the sensor named in its EMP stream (1.8.10: always on, not only with Excel or Repeat) | `file_watch.py` |
+| Merge engine | Parse RIFF/RF64 parts and the CRFS `meta` chunk, check format/tuning/numbering/continuity, chunked byte-exact concatenation to RIFF or RF64, JSON sidecar (1.8.10) | `iq_merge.py` |
+| Merge controller | Toggle state, queue, one worker thread, dedupe via `merge_history.json` and sidecars, cancel, `.partial` sweep on start (1.8.10) | `merge_controller.py` |
 | Sensor Files window | Listing, sort, groups, download, delete, waterfall | `sftp_window.py` |
 | SFTP backend | One listing thread and one SSH session for browse/delete | `sftp_window.py` (`SftpBackend`) |
 | SFTP client | Paramiko connect (8 s), read (20 s), download via `.part` | `sftp_client.py`, `download_util.py` |
@@ -153,15 +155,12 @@ sequenceDiagram
   Note over UI: Local timer = recording seconds + 0.4 s
   Node-->>HTTP: HTTP accept or timeout
   UI->>UI: Phase Recording then Finalizing
-  alt Excel or Repeat on
-    UI->>SFTP: Poll dated remdata folders
-    SFTP-->>UI: Matching parts with stable size
+  Node-->>HTTP: SSE: file named per part, then recording finished
+  UI->>SFTP: Poll dated remdata folders (always)
+  SFTP-->>UI: Named parts present with stable size
+  UI->>UI: Confirmed; otherwise says which named file is missing
+  opt Excel logging on
     UI->>XL: Enqueue one row per new part, merge by group
-  else Sensor Files open
-    UI->>SFTP: Refresh listing
-    UI->>UI: Confirm if sizes stay the same twice
-  else Sensor Files closed and Excel off
-    UI->>User: Open Sensor Files to check
   end
   User->>SFTP: Download selected files optional
   User->>SFTP: Click WAVE for waterfall optional

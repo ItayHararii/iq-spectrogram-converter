@@ -202,26 +202,199 @@ def test_gui_marks_recording_finished_after_recording_time(qapp):
     import time
 
     from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.recording_status import CONFIRMED, FINALIZING
 
     window = MainWindow(demo=True)
     try:
+        window._settle_s = 0
         window.time_edit.setText("0.1")
         window._on_start()
         assert window.start_btn.text().startswith("Recording")
         deadline = time.time() + 3
-        while time.time() < deadline and window.start_btn.text() != "Start Recording":
+        while time.time() < deadline and window._record_phase != FINALIZING:
             qapp.processEvents()
             time.sleep(0.05)
+        # The recording time is over; the capture is now confirmed from the
+        # sensor's files, and Start is held (with an honest label) meanwhile.
+        assert window._record_phase == FINALIZING
+        assert window._http_in_flight is False
+        assert window._watching is True
+        assert window._watch_timer.isActive()
+        assert window.start_btn.text() == "Confirming files…"
+        assert not window.start_btn.isEnabled()
+        assert "elapsed" in window.msg.text().lower()
+        for _ in range(4):
+            window._poll_collection_files()
+        qapp.processEvents()
+        assert window._record_phase == CONFIRMED
         assert window.start_btn.text() == "Start Recording"
         assert window.start_btn.isEnabled()
-        text = window.msg.text().lower()
-        assert "elapsed" in text
-        assert "finished" not in text
-        assert window._http_in_flight is False
-        assert window._record_phase in {"finalizing", "unknown", "confirmed"}
         window._on_start()
         assert window.start_btn.text().startswith("Recording")
     finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_single_recording_without_excel_is_confirmed_from_the_files(qapp):
+    """Regression for 1.8.9: a plain recording (Excel off, repeat off, Sensor Files
+    closed) ended in 'Time elapsed - file not confirmed' although the sensor had
+    reported the task finished and the WAVE file was on its disk. Completion
+    must come from the file watch regardless of the Excel / repeat settings."""
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.recording_status import CONFIRMED, FINALIZING
+
+    window = MainWindow(demo=True)
+    try:
+        window._settle_s = 0
+        window._stable_needed = 2
+        window.excel_check.setChecked(False)
+        window.repeat_off.setChecked(True)
+        assert window._sftp_win is None
+        window.time_edit.setText("0.05")
+        window._on_start()
+        window._record_timer.stop()
+        window._on_recording_time_elapsed()
+        qapp.processEvents()
+        assert window._record_phase == FINALIZING
+        assert window._watching is True, "the file watch must run for a single recording too"
+        assert window._watch_timer.isActive()
+        assert "Open Sensor Files" not in window.msg.text()
+        for _ in range(4):
+            window._poll_collection_files()
+        qapp.processEvents()
+        assert window._record_phase == CONFIRMED
+        assert window.msg.text() == "Recording finished (1 file(s))."
+        assert window._files_found == 1
+        assert window._recordings_completed == 1
+        assert window._watching is False
+        assert not window._watch_timer.isActive()
+        assert window.start_btn.isEnabled()
+        log = window.log_edit.toPlainText()
+        assert "File not confirmed" not in log
+        assert "Capture finished with 1 file(s)" in log
+        assert "Recordings completed: 1" in window.collection_status.text()
+        assert "Files found: 1" in window.collection_status.text()
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_sensor_task_completion_is_shown_apart_from_file_confirmation(qapp):
+    """The sensor's 'finished' message and the file names it reports update the
+    status line at once, but only settled files move the phase to CONFIRMED."""
+    from crfs_iq_recorder.api_client import SSE_EVENT_MESSAGE, SSE_EVENT_REMOTE_TIME, SseEvent
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.recording_status import CONFIRMED, FINALIZING
+
+    window = MainWindow(demo=True)
+    try:
+        window._settle_s = 30  # without the sensor's word the watch would wait this long
+        window.excel_check.setChecked(False)
+        window.time_edit.setText("0.05")
+        window._on_start()
+        gen = window._record_gen
+        window._record_timer.stop()
+        window._on_recording_time_elapsed()
+        qapp.processEvents()
+        assert window._record_phase == FINALIZING
+        assert window.msg.text() == "Time elapsed. Waiting for files…"
+
+        # The demo transport does not stream events; feed the ones a Node sends.
+        from crfs_iq_recorder.recording_history import load_recordings
+
+        record = next(item for item in load_recordings() if item.id == window._open_record_id)
+        # The elapsed transition listed the folder once: the demo file is seen
+        # but not yet stable (two equal listings are needed).
+        assert window._watch_state.sizes and not window._watch_state.finalized
+        name = next(iter(window._watch_state.sizes)).rsplit("/", 1)[-1]
+        # Demo files are small stand-ins; make the size model agree with them so
+        # the "sensor finished + bytes complete" rule can apply as on a Node.
+        window._expected_bytes = sum(window._watch_state.sizes.values())
+        window._on_record_event((gen, SseEvent(
+            event=SSE_EVENT_REMOTE_TIME,
+            data=[{"file_dir": "/mnt/1/remdata/20261101/", "first_filename": name, "task_id": "t"}],
+            received_s=0.0,
+        )))
+        assert window._sensor_parts == [name]
+        assert record.id == window._open_record_id
+        assert window._sensor_finished is False
+        assert window._record_phase == FINALIZING
+        assert window.msg.text() == f"Time elapsed. Sensor is writing {name}…"
+
+        # Make the next listing (triggered by the sensor's word) the stable one.
+        real_poll = window._poll_collection_files
+        polls: list[str] = []
+
+        def spy_poll():
+            polls.append(window.msg.text())
+            real_poll()
+
+        window._poll_collection_files = spy_poll
+        window._on_record_event((gen, SseEvent(
+            event=SSE_EVENT_MESSAGE,
+            data={"level": "INFO", "message": "Remote recording is now finished"},
+            received_s=0.0,
+        )))
+        qapp.processEvents()
+        assert window._sensor_finished is True
+        log = window.log_edit.toPlainText()
+        assert "Sensor reported: recording finished." in log
+        # Task completion was shown first, on its own, before the file settled...
+        assert polls == [f"Sensor finished. Confirming {name}…"]
+        # ...and the listing it triggered confirmed the file without the settle wait.
+        assert window._record_phase == CONFIRMED
+        assert window.msg.text() == "Recording finished (1 file(s))."
+        assert "sensor confirmed" in window.log_edit.toPlainText()
+        assert window._recordings_completed == 1
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_sensor_finished_without_its_file_is_not_reported_as_confirmed(qapp, monkeypatch):
+    """The sensor named a file that never settles: the capture ends UNKNOWN with
+    a message that says what the sensor did and what was not found."""
+    from datetime import datetime, timedelta
+
+    from crfs_iq_recorder import gui as gui_module
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.recording_status import FINALIZING, UNKNOWN
+
+    window = MainWindow(demo=True)
+    try:
+        window.excel_check.setChecked(False)
+        window.time_edit.setText("0.05")
+        window._on_start()
+        window._record_timer.stop()
+        window._on_recording_time_elapsed()
+        qapp.processEvents()
+        assert window._record_phase == FINALIZING
+        # The sensor's file name does not match anything in the folder.
+        window._note_sensor_part("/mnt/1/remdata/20261101/", "file_999999_0001.wav")
+        window._mark_sensor_finished()
+        assert window.msg.text() == "Sensor finished. Confirming file_999999_0001.wav…"
+        assert window._record_phase == FINALIZING
+        # Jump past the watch limit instead of waiting a minute.
+        window._elapsed_at = datetime.now() - timedelta(seconds=120)
+        window._poll_collection_files()
+        qapp.processEvents()
+        assert window._record_phase == UNKNOWN
+        assert "file_999999_0001.wav was not found" in window.msg.text()
+        log = window.log_edit.toPlainText()
+        assert "File not confirmed: the sensor reported its task finished and named file_999999_0001.wav" in log
+        assert window._recordings_completed == 0
+        assert window._files_found == 0
+        assert window.start_btn.isEnabled()
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
         window.close()
         qapp.processEvents()
 

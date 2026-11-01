@@ -365,3 +365,51 @@ def test_no_files_gives_up_after_the_watch_limit_only():
     state = FileWatchState()
     assert not capture_is_settled(state, now=now + timedelta(seconds=59), elapsed=True, elapsed_at=now)
     assert capture_is_settled(state, now=now + timedelta(seconds=60), elapsed=True, elapsed_at=now)
+
+
+def test_pruning_forgets_a_neighbours_file_adopted_before_the_sensor_named_its_own():
+    from crfs_iq_recorder.file_watch import prune_file_watch
+
+    now = datetime(2026, 11, 1, 8, 36, 0)
+    state = FileWatchState()
+    for offset in (0, 2):
+        state, _ = update_file_watch(state, [_entry("file_083500_0001.wav", 500, now)], now=now + timedelta(seconds=offset))
+    assert state.finalized == {"/mnt/1/remdata/20261031/file_083500_0001.wav"}
+    # A growing neighbour would otherwise hold the watch open for a minute.
+    state, _ = update_file_watch(state, [_entry("file_083500_0001.wav", 500, now), _entry("file_083500_0002.wav", 10, now)],
+                                 now=now + timedelta(seconds=4))
+    ours = {"/mnt/1/remdata/20261031/file_083625_0001.wav"}
+    pruned, dropped = prune_file_watch(state, ours)
+    assert sorted(dropped) == ["/mnt/1/remdata/20261031/file_083500_0001.wav", "/mnt/1/remdata/20261031/file_083500_0002.wav"]
+    assert pruned.sizes == {} and pruned.finalized == set() and pruned.stable == {}
+    assert state.finalized, "the original state is left untouched"
+    same, none = prune_file_watch(pruned, ours)
+    assert none == [] and same is pruned
+
+
+def test_parts_named_by_the_sensor_are_waited_for_before_completion():
+    """The stream named three parts; two have settled and hold "enough" bytes.
+    The third is still flushing on the Node, so the capture is not complete yet."""
+    now = datetime(2026, 11, 1, 8, 36, 0)
+    state = FileWatchState()
+    two = [_entry("file_083600_0001.wav", 1000, now), _entry("file_083600_0002.wav", 1000, now)]
+    for offset in (0, 2):
+        state, _ = update_file_watch(state, two, now=now + timedelta(seconds=offset))
+    when = now + timedelta(seconds=3)
+    common = dict(now=when, elapsed=True, elapsed_at=now, sensor_finished=True, expected_bytes=2000)
+    assert capture_is_settled(state, announced_parts=2, **common)
+    assert not capture_is_settled(state, announced_parts=3, **common)
+    # The third part lands and settles: complete.
+    three = two + [_entry("file_083600_0003.wav", 500, when)]
+    for offset in (4, 6):
+        state, _ = update_file_watch(state, three, now=now + timedelta(seconds=offset))
+    assert capture_is_settled(state, announced_parts=3, now=now + timedelta(seconds=7), elapsed=True, elapsed_at=now,
+                              sensor_finished=True, expected_bytes=2000)
+    # A named part that never shows up cannot hold the application past the watch limit.
+    stuck = FileWatchState()
+    for offset in (0, 2):
+        stuck, _ = update_file_watch(stuck, two, now=now + timedelta(seconds=offset))
+    assert not capture_is_settled(stuck, announced_parts=3, now=now + timedelta(seconds=59), elapsed=True, elapsed_at=now,
+                                  sensor_finished=True, expected_bytes=2000)
+    assert capture_is_settled(stuck, announced_parts=3, now=now + timedelta(seconds=61), elapsed=True, elapsed_at=now,
+                              sensor_finished=True, expected_bytes=2000)

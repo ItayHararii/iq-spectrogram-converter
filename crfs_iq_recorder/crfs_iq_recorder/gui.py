@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -73,6 +74,7 @@ from .file_watch import (
     capture_is_settled,
     folders_for_recording,
     list_watch_entries,
+    prune_file_watch,
     update_file_watch,
 )
 from .frequency import (
@@ -135,6 +137,7 @@ from .size_estimate import (
     format_estimate,
     recorded_seconds_from_bytes,
 )
+from .merge_controller import MergeController
 from .sftp_window import SftpWindow, _open_browser
 from .theme import (
     DARK_MODE,
@@ -238,8 +241,6 @@ class MainWindow(QMainWindow):
         self._ignore_late_http = False
         self._record_gen = 0
         self._record_phase = IDLE
-        self._confirm_attempts = 0
-        self._last_match_sizes: dict[str, int] = {}
         self._record_client: EmpClient | None = None
         self._record_cancel = threading.Event()
         self._sensor_finished = False
@@ -257,6 +258,12 @@ class MainWindow(QMainWindow):
         self._log_sizes = [680, 300]
         self._catalog = None
         self._excel_store = ExcelLogStore()
+        self._merge = MergeController(self)
+        self._merge.live_stem = self._live_recording_stem
+        self._merge.log.connect(self._on_merge_log)
+        self._merge.status_changed.connect(self._on_merge_status)
+        self._merge.progress_changed.connect(self._on_merge_progress)
+        self._merge.busy_changed.connect(self._on_merge_busy)
         self._excel_flush_async = not demo
         self._excel_flush_in_flight = False
         self._excel_flush_again = False
@@ -305,6 +312,7 @@ class MainWindow(QMainWindow):
         self._link_timer.timeout.connect(self._poll_link)
         self._conn = ConnectionState.from_settings(load_settings(), demo=demo)
         self._plan = self._conn.frequency_plan()
+        self._merge.enabled = bool(self._conn.merge_parts)
 
         central = QWidget()
         central.setObjectName("central")
@@ -372,6 +380,12 @@ class MainWindow(QMainWindow):
         self._refresh_sensor_info()
         self._refresh_storage()
         self._restart_link_monitor()
+        try:
+            # A merge interrupted by a crash or power loss leaves only a
+            # "<name>.wav.partial" file; it is never shown as a result.
+            self._merge.sweep_partials(resolved_download_dir(self._conn.download_dir))
+        except Exception:  # noqa: BLE001 - housekeeping only
+            pass
         if self._conn.demo:
             self._flush_excel()
         else:
@@ -612,6 +626,37 @@ class MainWindow(QMainWindow):
         self.sftp_btn.setObjectName("ghost")
         self.sftp_btn.clicked.connect(self._open_sftp)
         layout.addWidget(self.sftp_btn)
+
+        merge_row = QHBoxLayout()
+        merge_row.setSpacing(8)
+        self.merge_check = QCheckBox("Merge recording parts")
+        self.merge_check.setToolTip(
+            "The sensor splits a recording into numbered WAVE parts (500 MB each on this Node).\n"
+            "When on, the parts of a recording are joined into one <name>_merged.wav next to\n"
+            "them as soon as all of them have been downloaded. The original parts are kept.\n"
+            "Off: nothing changes; a selected recording can still be merged from Sensor Files."
+        )
+        self.merge_check.setChecked(bool(self._conn.merge_parts))
+        self.merge_check.toggled.connect(self._on_merge_toggled)
+        self.merge_cancel_btn = QPushButton("Cancel merge")
+        self.merge_cancel_btn.setObjectName("ghost")
+        self.merge_cancel_btn.setVisible(False)
+        self.merge_cancel_btn.clicked.connect(self._cancel_merge)
+        merge_row.addWidget(self.merge_check)
+        merge_row.addStretch(1)
+        merge_row.addWidget(self.merge_cancel_btn)
+        layout.addLayout(merge_row)
+        self.merge_status = QLabel("")
+        self.merge_status.setObjectName("muted")
+        self.merge_status.setWordWrap(True)
+        self.merge_status.setVisible(False)
+        layout.addWidget(self.merge_status)
+        self.merge_progress = QProgressBar()
+        self.merge_progress.setObjectName("thin")
+        self.merge_progress.setTextVisible(False)
+        self.merge_progress.setRange(0, 100)
+        self.merge_progress.setVisible(False)
+        layout.addWidget(self.merge_progress)
         layout.addStretch(1)
 
         scroll = QScrollArea()
@@ -920,6 +965,8 @@ class MainWindow(QMainWindow):
         except ValidationError:
             pass
         self._conn.recording_format = self._recording_format()
+        if hasattr(self, "merge_check"):
+            self._conn.merge_parts = self.merge_check.isChecked()
         if hasattr(self, "excel_check"):
             self._conn.excel_enabled = self.excel_check.isChecked()
             self._conn.excel_workbook = self.workbook_edit.text().strip()
@@ -940,10 +987,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, "repeat_n") and self.repeat_n.isChecked():
             return "count"
         return "off"
-
-    def _uses_collection_watch(self) -> bool:
-        excel = hasattr(self, "excel_check") and self.excel_check.isChecked()
-        return excel or self._repeat_mode() != "off"
 
     def _sync_excel_details(self) -> None:
         if not hasattr(self, "excel_details"):
@@ -1659,7 +1702,14 @@ class MainWindow(QMainWindow):
             return
         hold = self._series_active or self._watching or self._waiting
         self.start_btn.setEnabled(not hold)
-        self.start_btn.setText("Recording series…" if hold else "Start Recording")
+        if self._series_active or self._waiting:
+            self.start_btn.setText("Recording series…")
+        elif self._watching:
+            # The capture is being confirmed from the sensor's files; starting
+            # another recording now would abandon that check half-way.
+            self.start_btn.setText("Confirming files…")
+        else:
+            self.start_btn.setText("Start Recording")
         if hasattr(self, "stop_btn"):
             self.stop_btn.setEnabled((self._series_active or self._waiting) and not self._stop_after_current)
 
@@ -1857,8 +1907,6 @@ class MainWindow(QMainWindow):
         self._capture_session_into_conn()
         save_settings(self._conn.persistable())
         self._ignore_late_http = False
-        self._last_match_sizes = {}
-        self._confirm_attempts = 0
         self._sensor_finished = False
         self._sensor_finished_at = 0.0
         self._stream_lost = False
@@ -1954,8 +2002,13 @@ class MainWindow(QMainWindow):
         self._set_phase(FINALIZING)
         self._elapsed_at = datetime.now()
         self._watch_state = FileWatchState()
-        if self._uses_collection_watch():
-            self._watching = True
+        # Completion is always confirmed from the sensor's files, whether or not
+        # Excel logging or a repeat series is on. (Before 1.8.10 a plain single
+        # recording used a fixed three-attempt check that depended on the Sensor
+        # Files window being open and ignored the sensor's own "finished"
+        # message and the file names it reported, so it ended in "file not
+        # confirmed" while the WAVE file was already on the sensor.)
+        self._watching = True
         self._set_recording_ui(False)
         if self._conn.demo and self._open_record_id:
             record = next((item for item in load_recordings() if item.id == self._open_record_id), None)
@@ -1974,80 +2027,60 @@ class MainWindow(QMainWindow):
                 if parts:
                     keyed = replace(record, iq_stem=iq_group_key(parts[0].name))
                     add_recording(keyed)
-        if self._sftp_win is None and not self._uses_collection_watch():
-            self._set_msg("Time elapsed. Open Sensor Files to check the recording.")
-            self.log("Time elapsed. Open Sensor Files to confirm the file.")
-        else:
-            self._set_msg("Time elapsed. Waiting for files…")
-            self.log("Time elapsed. Looking for recording files.")
-            if self._sftp_win is not None:
-                self._sftp_win.retry_today()
-        if self._uses_collection_watch():
-            self._watch_timer.start()
-            self._poll_collection_files()
-        else:
-            self._schedule_sftp_part_refresh()
-            self._schedule_file_confirm()
+        self._set_msg(self._finalizing_text())
+        self.log("Time elapsed. Looking for recording files.")
+        if self._sftp_win is not None:
+            self._sftp_win.retry_today()
+        self._watch_timer.start()
+        self._poll_collection_files()
         self._refresh_storage()
 
-    def _refresh_open_sftp(self) -> None:
-        if not self._alive or self._sftp_win is None:
-            return
-        self._sftp_win.refresh()
+    def _finalizing_text(self) -> str:
+        """Status line while a capture is being confirmed.
 
-    def _schedule_sftp_part_refresh(self) -> None:
-        for delay_ms in (3000, 12000):
-            timer = QTimer(self)
-            timer.setSingleShot(True)
-            timer.timeout.connect(self._refresh_open_sftp)
-            timer.start(delay_ms)
+        Keeps two facts apart: whether the sensor said its task finished, and
+        how many of its files have stopped growing on the sensor's disk.
+        """
+        found = len(self._watch_state.finalized)
+        named = len(self._sensor_parts)
+        if self._sensor_finished:
+            if found and named and found < named:
+                return f"Sensor finished. {found} of {named} file(s) confirmed; waiting for the rest…"
+            if found:
+                return f"Sensor finished. {found} file(s) confirmed; checking for more…"
+            if named:
+                return f"Sensor finished. Confirming {self._sensor_parts[-1]}…"
+            return "Sensor finished. Looking for its file…"
+        if found:
+            return f"Recording file found ({found} part(s)). Waiting for more…"
+        if named:
+            return f"Time elapsed. Sensor is writing {self._sensor_parts[-1]}…"
+        return "Time elapsed. Waiting for files…"
 
-    def _schedule_file_confirm(self) -> None:
-        self._confirm_attempts = 0
-        for delay_ms in (2000, 6000, 14000):
-            timer = QTimer(self)
-            timer.setSingleShot(True)
-            timer.timeout.connect(self._try_confirm_files)
-            timer.start(delay_ms)
-
-    def _try_confirm_files(self) -> None:
-        if not self._alive or self._record_phase not in {FINALIZING, UNKNOWN}:
-            return
-        self._confirm_attempts += 1
-        record_id = self._open_record_id
-        if not record_id:
-            return
-        win = self._sftp_win
-        if win is None:
-            if self._confirm_attempts >= 3:
-                self._set_phase(UNKNOWN)
-                self._set_msg("Time elapsed. Open Sensor Files to check the recording.")
-            return
-        entries = win.matching_entries(record_id)
-        if not entries:
-            if self._confirm_attempts >= 3:
-                self._set_phase(UNKNOWN)
-                self._set_msg("Time elapsed. No matching recording file yet.")
-                self.log("File not confirmed.")
-            return
-        sizes = {entry.path: int(entry.size or 0) for entry in entries}
-        if sizes == self._last_match_sizes and self._last_match_sizes:
-            self._set_phase(CONFIRMED)
-            self._set_msg(f"Recording file found ({len(entries)} part(s)).")
-            self.log(f"Confirmed {len(entries)} recording part(s).")
-            return
-        self._last_match_sizes = sizes
-        self._set_phase(FINALIZING)
-        self._set_msg(f"Recording file appeared ({len(entries)} part(s)). Checking size…")
+    def _refresh_finalizing_ui(self) -> None:
+        """Re-render the status line after a sensor message changed what we know."""
+        if self._record_phase == FINALIZING and self._watching:
+            self._set_msg(self._finalizing_text())
 
     def _poll_collection_files(self) -> None:
         if not self._alive or self._record_phase not in {FINALIZING, UNKNOWN}:
             return
         record_id = self._open_record_id
-        if not record_id:
-            return
-        record = next((item for item in load_recordings() if item.id == record_id), None)
+        record = next((item for item in load_recordings() if item.id == record_id), None) if record_id else None
         if record is None:
+            if self._watching:
+                # Nothing to match against (no history entry): the watch cannot
+                # confirm anything, so do not hold the Start button for it.
+                self._watch_timer.stop()
+                self._watching = False
+                self._watch_token += 1
+                self._set_phase(UNKNOWN)
+                self._set_msg("Time elapsed. Check Sensor Files for the recording.", error=True)
+                self.log("No history entry for this recording; its files cannot be confirmed automatically.", level="error")
+                if self._series_active:
+                    self._maybe_start_next()
+                else:
+                    self._set_recording_ui(False)
             return
         folders = folders_for_recording(record.started_at)
         if self._conn.demo:
@@ -2149,6 +2182,17 @@ class MainWindow(QMainWindow):
             )
         if mine and not (record.iq_stem or "").strip():
             persist_matched_stems({entry.path: record for entry in mine})
+        if self._sensor_parts:
+            # The sensor has named its file: anything adopted earlier by time
+            # proximity belongs to a neighbouring recording, not to this one.
+            self._watch_state, dropped = prune_file_watch(self._watch_state, {entry.path for entry in mine})
+            if dropped:
+                names = {path.rsplit("/", 1)[-1] for path in dropped}
+                before = len(self._pending_excel_entries)
+                self._pending_excel_entries = [e for e in self._pending_excel_entries if e.path not in set(dropped)]
+                self._files_found -= before - len(self._pending_excel_entries)
+                self.log(f"Not part of this recording after all: {', '.join(sorted(names))}.")
+                self._update_collection_status()
         if self._sftp_win is not None:
             self._sftp_win.refresh()
         self._watch_state, newly = update_file_watch(
@@ -2165,7 +2209,7 @@ class MainWindow(QMainWindow):
         if newly:
             self._update_collection_status()
             self._set_phase(FINALIZING)
-            self._set_msg(f"Recording file found ({len(self._watch_state.finalized)} part(s)). Waiting for more…")
+            self._set_msg(self._finalizing_text())
             self.log(f"{len(newly)} IQ file(s) finished writing.")
         if (
             self._sensor_finished
@@ -2189,6 +2233,7 @@ class MainWindow(QMainWindow):
             sensor_finished=self._sensor_finished,
             stream_pending=self._http_in_flight and self._record_client is not None,
             expected_bytes=self._expected_bytes,
+            announced_parts=len(self._sensor_parts),
         ):
             self._finish_current_capture()
 
@@ -2272,17 +2317,31 @@ class MainWindow(QMainWindow):
             return
         self._watch_timer.stop()
         self._watching = False
+        # A folder listing still running on the worker must not re-run this
+        # once it lands: it belongs to the capture that has just been closed.
+        self._watch_token += 1
         self._abort_record_stream()
         record = None
         if self._open_record_id:
             record = next((item for item in load_recordings() if item.id == self._open_record_id), None)
         total, parts, held_s = self._measured_capture(record)
         excel_duration: float | None = None
+        named = len(self._sensor_parts)
         if parts:
             self._set_phase(CONFIRMED)
             self._set_msg(f"Recording finished ({parts} file(s)).")
             source = "sensor confirmed" if self._sensor_finished else "files stable"
             self.log(f"Capture finished with {parts} file(s), {total / 1_000_000:,.1f} MB ({source}).")
+            if named and parts < named:
+                missing = [name for name in self._sensor_parts if name not in {
+                    path.rsplit("/", 1)[-1] for path in self._watch_state.finalized
+                }]
+                self.log(
+                    f"The sensor named {named} file(s) but {parts} finished writing; "
+                    f"not found or still growing: {', '.join(missing) or 'unknown'}. Check Sensor Files.",
+                    level="error",
+                )
+                self._set_msg(f"Recording finished ({parts} of {named} file(s) found).", error=True)
             requested = float(record.duration_s) if record is not None else 0.0
             if held_s is not None and requested > 0:
                 if held_s < 0.95 * requested:
@@ -2309,9 +2368,27 @@ class MainWindow(QMainWindow):
                         level="error",
                     )
         else:
+            # Task completion and file availability are reported separately:
+            # the sensor may have finished its task without a usable file, or we
+            # may simply not have found the file it named within the watch time.
             self._set_phase(UNKNOWN)
-            self._set_msg("Time elapsed. No matching recording file yet.")
-            self.log("File not confirmed.")
+            if self._sensor_finished and named:
+                names = ", ".join(self._sensor_parts)
+                self._set_msg(f"Sensor finished, but {names} was not found on the sensor.", error=True)
+                self.log(
+                    f"File not confirmed: the sensor reported its task finished and named {names}, "
+                    "but no such file settled in the recording folder. Check Sensor Files.",
+                    level="error",
+                )
+            elif self._sensor_finished:
+                self._set_msg("Sensor finished, but it wrote no file.", error=True)
+                self.log("File not confirmed: the sensor finished its task without naming a file.", level="error")
+            elif self._stream_lost:
+                self._set_msg("Connection to the sensor dropped. No recording file found.", error=True)
+                self.log("File not confirmed: the sensor connection dropped and no file appeared.", level="error")
+            else:
+                self._set_msg("Time elapsed. No matching recording file yet.", error=True)
+                self.log("File not confirmed: no file for this recording appeared within the watch time.", level="error")
         if record is not None:
             self._log_pending_iq_files(record, duration_s=excel_duration)
         else:
@@ -2332,6 +2409,7 @@ class MainWindow(QMainWindow):
         self._stop_after_current = False
         self._watching = False
         self._watch_timer.stop()
+        self._watch_token += 1
         if getattr(self, "_watch_cancel", None) is not None:
             self._watch_cancel.set()
         self._close_watch_browser()
@@ -2480,9 +2558,10 @@ class MainWindow(QMainWindow):
         if outcome.kind == "sensor_error":
             self.log(outcome.detail, level="error")
             self._record_timer.stop()
-            self._set_recording_ui(False)
             self._watch_timer.stop()
             self._watching = False
+            self._watch_token += 1
+            self._set_recording_ui(False)
             self._set_phase(UNKNOWN)
             self._set_msg("The sensor reported an error. Check Sensor Files.", error=True)
             self._end_series()
@@ -2490,15 +2569,7 @@ class MainWindow(QMainWindow):
         if outcome.sensor_finished:
             for name in outcome.sensor_parts:
                 self._note_sensor_part(outcome.sensor_file_dir, name)
-            if not self._sensor_finished:
-                self._sensor_finished = True
-                self._sensor_finished_at = time.monotonic()
-                if self._sensor_parts:
-                    self.log("Sensor reported: recording finished.")
-                else:
-                    self.log("Sensor reported: recording finished, but it named no file.", level="error")
-            if self._record_phase in {FINALIZING, UNKNOWN} and self._uses_collection_watch():
-                self._poll_collection_files()
+            self._mark_sensor_finished()
             return
         if outcome.stream_ended == "cancelled":
             return
@@ -2550,13 +2621,7 @@ class MainWindow(QMainWindow):
                 continue
             text = str(item.get("message", "")).strip()
             if sse_message_is_finished(item):
-                if not self._sensor_finished:
-                    self._sensor_finished = True
-                    self._sensor_finished_at = time.monotonic()
-                    if self._sensor_parts:
-                        self.log("Sensor reported: recording finished.")
-                    else:
-                        self.log("Sensor reported: recording finished, but it named no file.", level="error")
+                self._mark_sensor_finished()
             elif sse_message_is_error(item):
                 self.log(f"Sensor: {text}", level="error")
             elif text:
@@ -2564,12 +2629,30 @@ class MainWindow(QMainWindow):
                 self._sensor_warnings.append(text)
                 self.log(f"Sensor: {text}", level=level)
 
+    def _mark_sensor_finished(self) -> None:
+        """The sensor said its recording task is over (event stream or final outcome).
+
+        This is task completion only. The files are confirmed by the watch,
+        which is nudged here so the status does not wait for the next 2 s tick.
+        """
+        if not self._sensor_finished:
+            self._sensor_finished = True
+            self._sensor_finished_at = time.monotonic()
+            if self._sensor_parts:
+                self.log("Sensor reported: recording finished.")
+            else:
+                self.log("Sensor reported: recording finished, but it named no file.", level="error")
+        self._refresh_finalizing_ui()
+        if self._record_phase == FINALIZING and self._watching:
+            self._poll_collection_files()
+
     def _note_sensor_part(self, directory: str, filename: str) -> None:
         """The sensor named a file it is writing for the current task."""
         if filename in self._sensor_parts:
             return
         self._sensor_parts.append(filename)
         self.log(f"Sensor is writing {filename}" + (f" in {directory}" if directory else ""))
+        self._refresh_finalizing_ui()
         record_id = self._open_record_id
         if not record_id:
             return
@@ -2619,12 +2702,70 @@ class MainWindow(QMainWindow):
             self._sftp_win = SftpWindow(self._conn, None)
             self._sftp_win.activity.connect(self.log)
             self._sftp_win.remote_changed.connect(self._refresh_storage)
+            self._sftp_win.set_merge_controller(self._merge)
             self._sftp_win.set_recent_record_id(self._open_record_id)
             self._sftp_win.show()
             self._sftp_win.raise_()
         except Exception:
             self.log(traceback.format_exc(limit=6), level="error")
             QMessageBox.warning(self, "SFTP", "Could not open Sensor Files. See the log.")
+
+    # ------------------------------------------------------------------ merge recording parts
+    def _live_recording_stem(self) -> str | None:
+        """Stem of the recording still being captured or confirmed, if any."""
+        if self._record_phase not in {SUBMITTING, RECORDING, FINALIZING}:
+            return None
+        if self._sensor_parts:
+            from .recording_history import iq_group_key
+
+            return iq_group_key(self._sensor_parts[0])
+        if self._open_record_id:
+            record = next((item for item in load_recordings() if item.id == self._open_record_id), None)
+            if record is not None and (record.iq_stem or "").strip():
+                return record.iq_stem.strip()
+        return None
+
+    def _on_merge_toggled(self, enabled: bool) -> None:
+        self._conn.merge_parts = bool(enabled)
+        save_settings(self._conn.persistable())
+        self._merge.set_enabled(bool(enabled))
+        if not enabled and self._merge.is_busy():
+            self._set_merge_status(
+                f"{self._merge.status_text}  (Merging is off for new recordings; use Cancel merge to stop this one.)",
+                error=False,
+            )
+
+    def _cancel_merge(self) -> None:
+        self._merge.cancel()
+
+    def _on_merge_log(self, message: str, level: str) -> None:
+        self.log(message, level=level if level in {"info", "error"} else "info")
+
+    def _set_merge_status(self, text: str, *, error: bool) -> None:
+        if not hasattr(self, "merge_status"):
+            return
+        self.merge_status.setText(text)
+        self.merge_status.setVisible(bool(text))
+        self.merge_status.setObjectName("error" if error and text else "muted")
+        restyle(self.merge_status)
+
+    def _on_merge_status(self, text: str, error: bool) -> None:
+        self._set_merge_status(text, error=error)
+
+    def _on_merge_progress(self, percent: int) -> None:
+        if not hasattr(self, "merge_progress"):
+            return
+        if percent < 0:
+            self.merge_progress.setVisible(False)
+            return
+        self.merge_progress.setVisible(True)
+        self.merge_progress.setValue(max(0, min(100, int(percent))))
+
+    def _on_merge_busy(self, busy: bool) -> None:
+        if hasattr(self, "merge_cancel_btn"):
+            self.merge_cancel_btn.setVisible(bool(busy))
+        if not busy and hasattr(self, "merge_progress"):
+            self.merge_progress.setVisible(False)
 
 
 def _install_exception_hook() -> None:

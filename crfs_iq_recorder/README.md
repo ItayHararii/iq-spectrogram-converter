@@ -40,6 +40,23 @@ The main window shows IQ Storage for the sensor disk that holds `/mnt/1/remdata/
 
 The sensor writes the IQ files first. This app copies them here when you download.
 
+After the recording time has passed, Start Recording reads **Confirming files…** while the app listens to the sensor's task stream and watches the sensor folder. The two things are reported separately: **Sensor finished. Confirming file_063625_0001.wav…** means the sensor has reported its task complete but the file is still being checked; **Recording confirmed** means the named file(s) were found and stopped growing. If the sensor finishes but its file never appears, the status says so (**Sensor finished, but … was not found on the sensor**) instead of claiming completion.
+
+## Merge recording parts
+
+The sensor writes one WAVE file per 500 MB (see [Why the sensor splits recordings](#why-the-sensor-splits-recordings)). The optional merge joins those parts back into one file on this PC.
+
+- **Merge recording parts** (main window, next to Sensor Files) is off by default and remembered between sessions. While it is on, every split recording that has been downloaded completely is merged in the background; downloads that fail or are cancelled are never merged. Turning it off stops new automatic merges; a merge that is already running keeps going until **Cancel merge** is pressed.
+- **Merge parts** in Sensor Files merges the selected recording on demand (select the parent row or any of its parts). Parts that are not in the download folder yet are downloaded first through the normal download, then merged. The confirmation lists the parts, the verified sample duration, the output size, and the output folder. Manual merges do not need the toggle.
+- The result is `<recording>_merged.wav` next to the parts, with a `<recording>_merged.wav.merge.json` sidecar (parts, sizes, start times, join checks). The original parts are kept. An existing merged file is never overwritten; a second manual merge writes `… (2).wav`.
+- Before writing, every part is checked: same encoding, channel count, sample rate, centre frequency, bandwidth and receiver (from the CRFS `meta` chunk), numbered parts in order with none missing or duplicated, no truncated or still-growing file, and the next part starting where the previous one ends (CRFS `signaltime`, 1.5 ms tolerance). A gap, an overlap, a mixed frequency window or an unreadable part stops the merge with the reason in the log. Parts without time stamps are merged with **continuity unknown** noted in the log and sidecar. Samples are copied byte for byte; nothing is resampled, filled or dropped.
+- Outputs up to 4 GiB are plain RIFF/WAVE. Larger outputs use RF64 (`ds64` chunk), which the Converter reads without changes. The sensor's `meta` chunk is carried over, and a `LIST/INFO` note records which parts were joined.
+- A merge runs after the recording, independently of recording and download status: a failed merge never marks a recording failed. Progress and the result are shown under the toggle and in the log. A merge interrupted by a crash leaves only `… .wav.partial`, which the app removes on the next start.
+
+## Why the sensor splits recordings
+
+Measured on an RFeye Node 40-8 (firmware 2.25) and checked against the RFeye Site user guide: the Node's recording service writes IQ to `/mnt/1/remdata/{date}/file_{time}_{n:4}` with `filesize: 500MB` (`/etc/node/ncpd/ncpd.conf`, storage section; the factory default is `iq_{date}_{time}_{n:4}` with 100 MB). `filesize` is "the maximum size of a file": the Node closes a part after 1023 blocks of 512,000 bytes (523,776,000 bytes of IQ) and opens the next number, whatever the sample rate. At 31.25 MS/s (25 MHz bandwidth) that is 4.19 s per part; at 62.5 MS/s, 2.1 s. The `duration`/`rate`/`capture_length` request values do not cause the split; the app sends the same number of seconds for all three, and the parts' `signaltime` stamps are contiguous to within 1 ms, so a split recording is one continuous capture. The limit is set on the Node, not in this app; the app does not change it. See the QA report for the per-part measurements.
+
 ## Log recordings to Excel
 
 Use this for field collection into an existing `.xlsm` workbook (macros stay in the file).
@@ -92,7 +109,7 @@ The app sends `POST http://{sensor_ip}/emp/` with HTTP Basic Auth. Use the usern
 
 If you enter `2.5` seconds, all three timing fields are `2.5`. Format defaults to WAVE. Each Start Recording click uses a timestamped `task_id` such as `iq-20260910-213005`.
 
-A successful HTTP response means the request was accepted. It does not prove the file has finished writing. After the requested time, the app looks for matching WAVE files over SFTP (if that window is open). There is no EMP completion URL in public CRFS docs.
+A successful HTTP response means the request was accepted. It does not prove the file has finished writing. The app keeps the EMP response stream open: the sensor names each file it opens (`time.RemoteTimeData`) and reports "Remote recording is now finished". After the requested time the app also watches the sensor folder over SFTP (whether or not Sensor Files is open) until every file the sensor named is present and has stopped growing. There is no EMP completion URL in public CRFS docs.
 
 Estimated size uses `61.051 * (bandwidth_Hz / 10_000_000) * recording_seconds` MB. That number is an estimate for the whole capture. The file list shows each part's size separately.
 

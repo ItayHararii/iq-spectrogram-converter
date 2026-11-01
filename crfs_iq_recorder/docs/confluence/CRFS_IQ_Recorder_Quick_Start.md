@@ -4,10 +4,10 @@ CRFS IQ Recorder is a Windows app for CRFS sensors. It starts an IQ recording, d
 
 ## Download and run
 
-**Version:** 1.8.9
+**Version:** 1.8.10
 **File:** `CRFS_IQ_Recorder.exe` - one file, no Python, no install. `CRFS_IQ_Recorder_Setup.exe` - installer for company-managed PCs (installs to Program Files, Start-menu shortcut). With the installer, keep the default folder: do not install into Documents, Desktop or Pictures - Windows ransomware protection guards those folders and can block the uninstaller there.
 
-> Windows EXE: [CRFS IQ Recorder 1.8.9](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.9)
+> Windows EXE: [CRFS IQ Recorder 1.8.10](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.8.10)
 
 1. Save the exe on this PC (Desktop or a local folder).
 2. Double-click **CRFS_IQ_Recorder.exe**. The window opens in a few seconds; sensor details fill in afterwards.
@@ -27,7 +27,7 @@ Do not put real sensor IPs, logins, or passwords on this page or in screenshots.
 2. Check **Model**, **Firmware**, **Serial**, and **Status** in the header. Status should read **Connected**. The same text is shown at the bottom left. The app checks the sensor every 10 seconds. After one missed check the badge turns amber **Reconnecting...**; after two it turns red **Disconnected**. It returns to green **Connected** on its own when the sensor answers. SFTP problems stay in Sensor Files and are not treated as an API disconnect.
 3. Choose **Start / End** or **Center / Bandwidth** (values in MHz).
 4. Enter **Recording time (s)** and check **Estimate**.
-5. Click **Start Recording**. Status goes **Sending request...**, then **Recording...**, then **WAVE file found** when files appear.
+5. Click **Start Recording**. Status goes **Sending request...**, then **Recording...**, then **Confirming files...** while the app waits for the sensor's files. **Sensor finished. Confirming file_063625_0001.wav...** means the sensor has reported the task complete and the app is checking that the file has stopped growing; **Recording confirmed** means every file the sensor named is there. If the sensor finishes but no file appears, the status says so instead of reporting a completed recording.
 
 To log into a collection workbook: tick **Log recordings to Excel**, choose the `.xlsm` file, and check the collection event and target class. When a recording finishes, the app adds that capture to the Excel log automatically (class, frequencies, filename, and Playback Start as `N seconds`). Split parts stay on the same row.
 
@@ -56,6 +56,15 @@ Change it in **Settings -> Download folder**. The choice is remembered. Files st
 
 *Sensor Files - file list, recording details, Download, and the local save path.*
 
+## Merge split recordings (optional)
+
+The sensor closes a recording file every 500 MB and continues in the next numbered part (`_0001.wav`, `_0002.wav`, ...). At 25 MHz bandwidth that is about 4.2 seconds per part. The parts are one continuous capture; this is a setting on the sensor, not in the app.
+
+- Tick **Merge recording parts** in the main window to have every fully downloaded split recording joined into one file automatically. The option is off by default and is remembered. Untick it to stop new merges; **Cancel merge** stops the one that is running.
+- Or select a recording in Sensor Files and click **Merge parts**. Parts that are not on this PC yet are downloaded first. The confirmation shows the parts, the verified duration, the output size, and the folder.
+- The result is `<recording>_merged.wav` in the download folder, next to the original parts, which are kept. A `.merge.json` file next to it lists what was joined and the join checks. Open the merged file in IQ Spectrogram Converter like any other WAVE file; files over 4 GB are written as RF64, which the Converter reads.
+- The app checks that the parts belong together (same frequency window, sample rate and format, numbered without gaps, each part starting where the previous one ends) before it writes anything. If something does not match, the merge is refused and the reason is in the log; the recording and the downloads are not affected.
+
 ## Preview the captured signal
 
 Click a WAVE file. A short waterfall of the first portion appears under the list (frequency on X, time on Y, color in dBFS/bin). Use it as a quick visual check.
@@ -69,6 +78,6 @@ Click a WAVE file. A short waterfall of the first portion appears under the list
 - Recordings are saved on the sensor first. **Download** copies them to this computer.
 - Status in the header and at the bottom left is the sensor API link. SFTP errors are shown in Sensor Files.
 - Today's sensor folder is created after the first recording task is submitted.
-- Large recordings may be split into numbered files. The parent row represents the whole capture; download or delete that parent if you need every listed part.
+- Recordings over 500 MB are split into numbered files by the sensor. The parent row represents the whole capture; download or delete that parent if you need every listed part, and use **Merge recording parts** or **Merge parts** to join them on this PC.
 - With Excel logging on, each finished recording is added to the workbook automatically.
 - The waterfall preview is a short overview of the start of the file.

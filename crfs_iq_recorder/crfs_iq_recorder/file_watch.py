@@ -100,6 +100,24 @@ def update_file_watch(
     return next_state, newly
 
 
+def prune_file_watch(state: FileWatchState, keep_paths: set[str]) -> tuple[FileWatchState, list[str]]:
+    """Forget tracked files that are no longer part of the capture.
+
+    Used once the sensor has named its file: anything adopted earlier by time
+    proximity (a neighbour's recording) must not hold the watch open or be
+    counted as a part of this capture. Returns (state, dropped paths).
+    """
+    dropped = [path for path in state.sizes if path not in keep_paths]
+    if not dropped:
+        return state, []
+    next_state = state.copy()
+    for path in dropped:
+        next_state.sizes.pop(path, None)
+        next_state.stable.pop(path, None)
+        next_state.finalized.discard(path)
+    return next_state, dropped
+
+
 def capture_is_settled(
     state: FileWatchState,
     *,
@@ -111,6 +129,7 @@ def capture_is_settled(
     sensor_finished: bool = False,
     stream_pending: bool = False,
     expected_bytes: int | None = None,
+    announced_parts: int = 0,
 ) -> bool:
     """True when the capture can be treated as complete.
 
@@ -122,6 +141,8 @@ def capture_is_settled(
       changed for `max_watch_s` ends the wait anyway, so a stalled writer cannot
       hold the application forever.
     - No file at all after `max_watch_s`: give up (caller reports UNKNOWN).
+    - The sensor named more parts (`announced_parts`) than have settled: a late
+      part is still flushing, keep watching (bounded by `max_watch_s` of quiet).
     - All known parts stable: done once the sensor said finished and the parts
       hold at least 98 % of the expected bytes, otherwise after `settle_s` of
       quiet so a late part can still be picked up.
@@ -146,6 +167,10 @@ def capture_is_settled(
         return elapsed_at is not None and since_elapsed >= max_watch_s
     if quiet_s is None:
         return False
+    if sensor_finished and announced_parts > len(state.finalized):
+        # e.g. the stream named file_..._0003.wav but only two parts have
+        # settled: the last part is still being flushed to the sensor's disk.
+        return quiet_s >= max_watch_s
     if sensor_finished and expected_bytes and expected_bytes > 0:
         total = sum(size for path, size in state.sizes.items() if path in state.finalized)
         if total >= 0.98 * expected_bytes:

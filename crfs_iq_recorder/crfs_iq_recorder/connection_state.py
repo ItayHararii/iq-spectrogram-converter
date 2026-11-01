@@ -93,6 +93,9 @@ class ConnectionState:
     repeat_count: int = 2
     repeat_wait_s: float = DEFAULT_REPEAT_WAIT_S
     repeat_wait_unit: str = DEFAULT_REPEAT_WAIT_UNIT
+    # Off by default: the sensor's split WAVE parts are left as they are unless
+    # the operator asks for one merged file per recording.
+    merge_parts: bool = False
 
     def sftp_user(self) -> str:
         return (self.sftp_username or DEFAULT_SFTP_USERNAME).strip()
@@ -141,6 +144,7 @@ class ConnectionState:
             "repeat_count": int(self.repeat_count) if int(self.repeat_count) > 0 else 2,
             "repeat_wait_s": wait_s,
             "repeat_wait_unit": wait_unit,
+            "merge_parts": bool(self.merge_parts),
             "http_secret": protect_secret(self.http_password),
             "sftp_secret": protect_secret(self.sftp_password),
         }
@@ -210,4 +214,5 @@ class ConnectionState:
         state.repeat_wait_s = _as_wait_s(data, "repeat_wait_s", DEFAULT_REPEAT_WAIT_S)
         wait_unit = str(data.get("repeat_wait_unit") or DEFAULT_REPEAT_WAIT_UNIT).strip().casefold()
         state.repeat_wait_unit = wait_unit if wait_unit in {"seconds", "minutes"} else DEFAULT_REPEAT_WAIT_UNIT
+        state.merge_parts = bool(data.get("merge_parts", False))
         return state
