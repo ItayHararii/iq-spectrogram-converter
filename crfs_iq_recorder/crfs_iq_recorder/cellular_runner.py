@@ -48,6 +48,8 @@ from .cellular_manifest import (
     write_manifest,
 )
 from .cellular_plan import CellularPlan, PlannedTask, format_bytes, format_seconds
+from .cellular_protocol import ColumnMapping
+from .cellular_protocol_results import result_rows, sensor_text, sync_round_sheet
 from .cellular_scheduler import (
     MODE_NOW,
     ROUND_DELAYED,
@@ -140,6 +142,11 @@ class CampaignSettings:
     scenario: dict[str, Any] = field(default_factory=dict)
     protocol_path: str = ""
     protocol_sheet: str = ""
+    # Fill the protocol workbook with one results sheet per round (needs the
+    # header row and column mapping the protocol was imported with).
+    protocol_results: bool = False
+    protocol_header_row: int = 1
+    protocol_mapping: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +171,9 @@ class CampaignSettings:
             "scenario": dict(self.scenario),
             "protocol_path": self.protocol_path,
             "protocol_sheet": self.protocol_sheet,
+            "protocol_results": self.protocol_results,
+            "protocol_header_row": self.protocol_header_row,
+            "protocol_mapping": dict(self.protocol_mapping),
         }
 
     @classmethod
@@ -196,6 +206,9 @@ class CampaignSettings:
             scenario={str(k): v for k, v in (data.get("scenario") or {}).items()},
             protocol_path=str(data.get("protocol_path") or ""),
             protocol_sheet=str(data.get("protocol_sheet") or ""),
+            protocol_results=bool(data.get("protocol_results", False)),
+            protocol_header_row=max(int(data.get("protocol_header_row") or 1), 1),
+            protocol_mapping={str(k): v for k, v in (data.get("protocol_mapping") or {}).items()},
         )
         return settings
 
@@ -467,6 +480,13 @@ class CellularRunner(QObject):
         self._quality_pending: list[QObject] = []
         self._refreshes = 0  # listings scheduled before a capture's downloads start
         self._excel_retry: set[tuple[str, str]] = set()
+        # Protocol workbook results: rounds whose sheet must be (re)written,
+        # a version per round so a change during a write schedules another.
+        self._protocol_dirty: dict[str, int] = {}
+        self._protocol_writing: tuple[str, int] | None = None
+        self._protocol_not_before = 0.0
+        self._protocol_busy_logged = False
+        self._protocol_backup_done = False
         self._status_text = "Idle"
         self._timer = QTimer(self)
         self._timer.setInterval(TICK_MS)
@@ -650,6 +670,7 @@ class CellularRunner(QObject):
             return
         self._drain_downloads()
         self._refresh_excel_status()
+        self._sync_protocol_results()
         if self.state in {S_IDLE, S_DONE, S_INTERRUPTED, S_PAUSED}:
             self._emit_status()
             return
@@ -708,6 +729,7 @@ class CellularRunner(QObject):
             text += f" {format_seconds(late)} after its scheduled time (delayed by the previous round)"
         self._log(text + f": {len(self.session.plan.tasks)} capture(s).")
         self._save()
+        self._mark_protocol_dirty(record.round_id)
         self._start_next_task()
 
     def _next_queued(self) -> tuple[TaskState, PlannedTask] | None:
@@ -779,6 +801,7 @@ class CellularRunner(QObject):
                 self._log(f"{planned.label()}: not sent ({error}).", "error")
                 self._write_task_manifest(state, planned)
                 self._save()
+                self._mark_protocol_dirty(state.round_id)
                 self._after_task(state, planned)
                 return
             # Connection settings or another condition the operator must fix:
@@ -866,6 +889,7 @@ class CellularRunner(QObject):
         if state.status != T_QUEUED:
             self._write_task_manifest(state, planned)
         self._save()
+        self._mark_protocol_dirty(state.round_id)
         self._drain_downloads()
         self._after_task(state, planned)
 
@@ -931,6 +955,7 @@ class CellularRunner(QObject):
         self.state = S_WAITING_SCHEDULE
         self._write_handover()
         self._save()
+        self._mark_protocol_dirty(record.round_id)
         self.round_finished.emit(record.round_id)
 
     def _finish_session(self, *, stopped: bool = False) -> None:
@@ -1050,6 +1075,7 @@ class CellularRunner(QObject):
                 if item.get("download_status") == DL_PENDING and not any(entry[2] is item for entry in self._downloads_pending):
                     self._downloads_pending.append((current.task_key, current.round_id, item))
             self._save()
+            self._mark_protocol_dirty(current.round_id)
             self._drain_downloads()
             if self.state == S_DONE and self.background_jobs() == 0:
                 self._write_handover()
@@ -1137,6 +1163,7 @@ class CellularRunner(QObject):
             item["download_status"] = DL_VERIFIED
             self._log(f"Downloaded {name} (size verified).")
             self._after_file_verified(state)
+            self._mark_protocol_dirty(state.round_id)
         self._save()
 
     @Slot(str, str)
@@ -1155,6 +1182,7 @@ class CellularRunner(QObject):
             state.notes.append(f"Download failed for {name}: {detail}")
             self._log(f"Download of {name} failed after {item['attempts']} attempts: {detail}. The file stays on the sensor.", "error")
             self._rewrite_manifest(state)
+            self._mark_protocol_dirty(state.round_id)
         self._save()
 
     @Slot()
@@ -1204,6 +1232,7 @@ class CellularRunner(QObject):
                             self._log(f"{name}: checksum could not be computed.", "error")
                         self._after_file_verified(state)
                         self._save()
+                        self._mark_protocol_dirty(state.round_id)
                         return
 
     @Slot()
@@ -1293,6 +1322,7 @@ class CellularRunner(QObject):
             self._log(f"{label}: quality check did not complete.", "error")
         self._rewrite_manifest(state)
         self._save()
+        self._mark_protocol_dirty(state.round_id)
         self.session_changed.emit()
 
     @Slot()
@@ -1419,6 +1449,130 @@ class CellularRunner(QObject):
                 if state.excel_status == "queued" and state.files:
                     if all(store.is_logged(sensor_id, item.get("remote_path", "")) for item in state.files):
                         state.excel_status = "saved"
+
+    # ------------------------------------------------------------------ protocol workbook results
+    def protocol_results_enabled(self) -> bool:
+        settings = self.session.settings if self.session is not None else None
+        return bool(settings and settings.protocol_results and settings.protocol_path and settings.protocol_sheet)
+
+    def _mark_protocol_dirty(self, round_id: str | None) -> None:
+        """The round's results sheet must be rewritten (coalesced, one write at a time)."""
+        if not round_id or not self.protocol_results_enabled():
+            return
+        self._protocol_dirty[round_id] = self._protocol_dirty.get(round_id, 0) + 1
+        self._sync_protocol_results()
+
+    def _sync_protocol_results(self) -> None:
+        if self.session is None or self._protocol_writing is not None or not self._protocol_dirty:
+            return
+        now = time.monotonic()
+        if now < self._protocol_not_before:
+            # Bound to this object so a timer that outlives the runner is dropped.
+            QTimer.singleShot(int((self._protocol_not_before - now) * 1000) + 50, self, self._sync_protocol_results)
+            return
+        round_id = next(iter(self._protocol_dirty))
+        version = self._protocol_dirty[round_id]
+        record = self.session.round(round_id)
+        if record is None:
+            self._protocol_dirty.pop(round_id, None)
+            return
+        settings = self.session.settings
+        path = Path(settings.protocol_path)
+        if not path.is_file():
+            self._protocol_dirty.pop(round_id, None)
+            if record.protocol_status != "failed":
+                record.protocol_status = "failed"
+                self._log(f"Protocol workbook not found ({path}); the results sheet for round {round_id} was not written.", "error")
+            return
+        mapping = ColumnMapping.from_dict(settings.protocol_mapping) if settings.protocol_mapping else None
+        if mapping is None:
+            self._protocol_dirty.pop(round_id, None)
+            record.protocol_status = "failed"
+            self._log("The session has no column mapping for the protocol workbook; results are not written to it.", "error")
+            return
+        tasks = {task.task_key: task.to_dict() for task in self.session.tasks.get(round_id, [])}
+        rows = result_rows(
+            [task.to_dict() for task in self.session.plan.tasks],
+            tasks,
+            round_id=round_id,
+            round_finished=record.finished,
+            sensor_text=sensor_text(self.session.sensor or self._sensor_dict()),
+        )
+        sheet_name = record.protocol_sheet or None
+        scheduled_local = record.scheduled_local
+        header_row = settings.protocol_header_row
+        protocol_sheet = settings.protocol_sheet
+        make_backup = not self._protocol_backup_done
+        self._protocol_writing = (round_id, version)
+        # Coalesce bursts (download finished, checksum done, quality done…) into one write every few seconds.
+        self._protocol_not_before = now + 3.0
+
+        def work():
+            try:
+                result = sync_round_sheet(
+                    path,
+                    protocol_sheet=protocol_sheet,
+                    header_row=header_row,
+                    mapping=mapping,
+                    sheet_name=sheet_name,
+                    rows=rows,
+                    scheduled_local=scheduled_local,
+                    make_backup=make_backup,
+                )
+                return {"sheet": result.sheet, "created": result.created, "backup": result.backup, "warnings": result.warnings, "rows": result.rows}
+            except ExcelBusyError as exc:
+                return {"busy": str(exc)}
+            except Exception as exc:  # noqa: BLE001 - reported to apply(), never raised across threads
+                return {"error": f"{type(exc).__name__}: {exc}"}
+
+        def apply(result) -> None:
+            self._protocol_writing = None
+            if self.session is None:
+                return
+            current = self.session.round(round_id)
+            if isinstance(result, dict) and result.get("sheet"):
+                if current is not None:
+                    current.protocol_sheet = str(result["sheet"])
+                    current.protocol_status = "saved"
+                if result.get("backup"):
+                    self._protocol_backup_done = True
+                    self._log(f"Backup of the protocol workbook written before the first results: {Path(str(result['backup'])).name}.")
+                if result.get("created"):
+                    self._log(f"Results sheet '{result['sheet']}' created in {path.name} for round {round_id} ({result.get('rows', 0)} planned capture(s)); the protocol sheet is unchanged.")
+                for warning in result.get("warnings") or []:
+                    self._log(f"Results sheet '{result['sheet']}': {warning}", "error")
+                self._protocol_busy_logged = False
+                if self._protocol_dirty.get(round_id) == version:
+                    self._protocol_dirty.pop(round_id, None)
+            elif isinstance(result, dict) and result.get("busy"):
+                if current is not None:
+                    current.protocol_status = "deferred"
+                if not self._protocol_busy_logged:
+                    self._log(f"Results sheet deferred: {result['busy']} It is written when the workbook is free; nothing is lost.")
+                    self._protocol_busy_logged = True
+                self._protocol_not_before = time.monotonic() + 15.0
+            else:
+                detail = result.get("error") if isinstance(result, dict) else "no result"
+                if current is not None:
+                    current.protocol_status = "failed"
+                self._protocol_dirty.pop(round_id, None)
+                self._log(
+                    f"Results sheet for round {round_id} could not be written to {path.name}: {detail}. "
+                    "The manifests and the handover summary still hold every result.",
+                    "error",
+                )
+            self._save()
+            self._emit_status()
+            if self.state == S_DONE and self.background_jobs() == 0:
+                self._write_handover()
+            if self._protocol_dirty:
+                self._sync_protocol_results()
+
+        runner = getattr(self.host, "_start_job", None)
+        if runner is None:
+            apply(work())
+        else:
+            runner(work, apply)
 
     # ------------------------------------------------------------------ manifests
     def _write_task_manifest(self, state: TaskState, planned: PlannedTask) -> None:
@@ -1586,6 +1740,7 @@ class CellularRunner(QObject):
                     state.status = T_UNKNOWN
                     state.notes.append(f"Reconciliation after restart found no file for this capture ({note or 'none on the sensor'}).")
                 self._write_task_manifest(state, planned)
+                self._mark_protocol_dirty(state.round_id)
             self._save()
             self._drain_downloads()
             text = f"Reconciled with the sensor: {confirmed} capture(s) confirmed from files, {len(self.uncertain_tasks())} still uncertain."
@@ -1654,6 +1809,7 @@ class CellularRunner(QObject):
         if planned is not None:
             self._write_task_manifest(state, planned)
         self._save()
+        self._mark_protocol_dirty(round_id)
         self._emit_status()
 
     def retry_task(self, round_id: str, task_key: str) -> str | None:
@@ -1682,6 +1838,7 @@ class CellularRunner(QObject):
             self.state = S_RUNNING
             self._timer.start()
         self._save()
+        self._mark_protocol_dirty(round_id)
         self._tick()
         return None
 
@@ -1739,6 +1896,7 @@ class CellularRunner(QObject):
         pending_dl = len(self._downloads_pending) + len(self._downloads_active)
         store = getattr(self.host, "_excel_store", None)
         pending_excel = store.pending_count() if store is not None else 0
+        sheet_round = record or next((r for r in reversed(session.rounds) if r.protocol_sheet or r.protocol_status), None)
         confirmed_total = sum(1 for items in session.tasks.values() for t in items if t.status == T_CONFIRMED)
         failed_total = sum(1 for items in session.tasks.values() for t in items if t.status in {T_FAILED, T_NOT_SENT, T_SENSOR_ERROR})
         uncertain_total = sum(1 for items in session.tasks.values() for t in items if t.status in UNCERTAIN)
@@ -1798,6 +1956,13 @@ class CellularRunner(QObject):
             "uncertain_total": uncertain_total,
             "pause_reason": session.pause_reason,
             "timezone": session.timezone_label,
+            "protocol_results": self.protocol_results_enabled(),
+            "protocol_sheet": sheet_round.protocol_sheet if sheet_round else "",
+            "protocol_status": (
+                "writing" if self._protocol_writing is not None and sheet_round and self._protocol_writing[0] == sheet_round.round_id
+                else (sheet_round.protocol_status if sheet_round else "")
+            ),
+            "protocol_pending": len(self._protocol_dirty),
         }
 
     def _emit_status(self) -> None:
@@ -1824,7 +1989,7 @@ class CellularRunner(QObject):
             thread.quit()
 
     def background_jobs(self) -> int:
-        """Downloads, checksums and quality checks still running off the UI thread."""
+        """Downloads, checksums, quality checks and workbook writes still running off the UI thread."""
         return (
             len(self._downloads_active)
             + len(self._downloads_pending)
@@ -1832,6 +1997,7 @@ class CellularRunner(QObject):
             + len(self._checksums)
             + len(self._quality_jobs)
             + len(self._quality_pending)
+            + (1 if self._protocol_writing is not None else 0)
         )
 
 

@@ -238,6 +238,9 @@ class RoundRecord:
     tasks_uncertain: int = 0
     tasks_skipped: int = 0
     note: str = ""
+    # Results sheet of this round in the protocol workbook, and its last write state.
+    protocol_sheet: str = ""
+    protocol_status: str = ""
 
     @property
     def finished(self) -> bool:
@@ -257,6 +260,8 @@ class RoundRecord:
             "tasks_uncertain": self.tasks_uncertain,
             "tasks_skipped": self.tasks_skipped,
             "note": self.note,
+            "protocol_sheet": self.protocol_sheet,
+            "protocol_status": self.protocol_status,
         }
 
     @classmethod
@@ -287,6 +292,8 @@ class RoundRecord:
             tasks_uncertain=int(data.get("tasks_uncertain") or 0),
             tasks_skipped=int(data.get("tasks_skipped") or 0),
             note=str(data.get("note") or ""),
+            protocol_sheet=str(data.get("protocol_sheet") or ""),
+            protocol_status=str(data.get("protocol_status") or ""),
         )
 
 

@@ -213,6 +213,96 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         qapp.processEvents()
 
 
+def _protocol_book(path: Path) -> Path:
+    """The collection protocol's layout: result columns the collection fills, a Sensor column."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Cellular Protocol"
+    ws.append(["Band", "Direction", "Duplex", "Freq Start (MHz)", "Freq Stop (MHz)", "Sensor", "IQ Recording", "IQ Duration (s)", "Recording Date & Time"])
+    ws.append(["700 MHz (B68 / B28)", "DL", "FDD", 758, 768, "CRFS 100-18", None, None, None])
+    ws.append(["700 MHz (B68 / B28)", "UL", "FDD", 703, 713, "CRFS 100-18", None, None, None])
+    wb.create_sheet("Reference").append(["Save each round separately; do not overwrite previous results."])
+    wb.save(path)
+    return path
+
+
+def test_panel_fills_the_protocol_workbook_through_the_demo_window(qapp, tmp_path):
+    from datetime import datetime
+
+    from openpyxl import load_workbook
+
+    from crfs_iq_recorder.gui import MainWindow
+
+    book = _protocol_book(tmp_path / "Cellular_IQ_Collection_Protocol.xlsx")
+    window = MainWindow(demo=True)
+    try:
+        window._settle_s = 0
+        window._stable_needed = 2
+        window._demo_parts = 1
+        panel = window.cellular_panel
+        panel._set_expanded(True)
+        panel.workbook_edit.setText(str(book))
+        panel._fill_sheets("")
+        panel._import(force=True)
+        assert panel.imported is not None and panel.plan is not None
+        assert panel.imported.mapping.result == "IQ Recording" and panel.imported.mapping.result_time == "Recording Date & Time"
+        assert panel.protocol_results_check.isEnabled() and panel.protocol_results_check.isChecked()
+        assert "results → one sheet per round in the workbook" in panel.import_label.text()
+        panel.protocol_results_check.setChecked(False)
+        assert "results not written to the workbook" in panel.import_label.text()
+        assert panel._campaign_settings().protocol_results is False
+        assert panel._protocol_results_check().level == "info"
+        panel.protocol_results_check.setChecked(True)
+        panel.duration_edit.setText("0.05")
+        panel.wait_unit.setCurrentText("Seconds")
+        panel.wait_spin.setValue(0)
+        settings = panel._campaign_settings()
+        assert settings.protocol_results is True and settings.protocol_header_row == 1
+        assert settings.protocol_mapping["result"] == "IQ Recording" and settings.protocol_path == str(book)
+        check = panel._protocol_results_check()
+        assert check.level == "ok" and "'IQ Recording'" in check.message and "one 'Round <date> <time>' sheet per round" in check.message
+        assert any(c.name == "protocol_results" for c in panel._pre_run_checks())
+        panel.run_now.setChecked(True)
+        schedule, error = panel._schedule()
+        assert error is None
+        started = datetime.now()
+        panel._start(schedule)
+        assert window._external_owner == OWNER
+        for _ in range(2):
+            assert _pump_until(qapp, lambda: window._http_in_flight is False)
+            _drive_capture(window, qapp)
+            window._cellular._tick()
+        assert _pump_until(qapp, lambda: window._cellular.state == S_DONE, timeout=8.0), window._cellular.status()
+        assert _pump_until(qapp, lambda: window._cellular.background_jobs() == 0 and not window._cellular._protocol_dirty, timeout=30.0)
+        record = window._cellular.session.rounds[0]
+        assert record.protocol_status == "saved" and record.protocol_sheet.startswith("Round ")
+        assert "Protocol workbook:" in panel.detail_label.text() and "up to date" in panel.detail_label.text()
+        wb = load_workbook(book)
+        try:
+            assert wb.sheetnames == ["Cellular Protocol", "Reference", record.protocol_sheet]
+            ws = wb[record.protocol_sheet]
+            rows = [list(r) for r in ws.iter_rows(values_only=True)]
+            assert rows[0] == ["Band", "Direction", "Duplex", "Freq Start (MHz)", "Freq Stop (MHz)", "Sensor", "IQ Recording", "IQ Duration (s)", "Recording Date & Time", "Window", "Status", "Notes", "Round"]
+            assert len(rows) == 3 and [r[1] for r in rows[1:]] == ["DL", "UL"], "plan order: DL first"
+            for row in rows[1:]:
+                assert row[6] and row[6].endswith(".wav"), row
+                assert row[5] not in (None, "", "CRFS 100-18"), "the demo sensor that recorded is named"
+                assert isinstance(row[8], datetime) and row[8] >= started.replace(microsecond=0)
+                assert row[10].startswith("confirmed; downloaded, SHA-256 verified; files checked"), row[10]
+            # Protocol sheet untouched; a backup exists next to the workbook.
+            assert [list(r) for r in wb["Cellular Protocol"].iter_rows(values_only=True)][1][:5] == ["700 MHz (B68 / B28)", "DL", "FDD", 758, 768]
+        finally:
+            wb.close()
+        assert len([p for p in tmp_path.iterdir() if ".crfs-backup-" in p.name]) == 1
+        window._cellular.discard_session()
+        qapp.processEvents()
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
 def test_collapsed_panel_builds_nothing_until_opened_and_opens_for_a_saved_session(qapp, tmp_path):
     from PySide6.QtWidgets import QWidget
     from crfs_iq_recorder.cellular_plan import build_plan

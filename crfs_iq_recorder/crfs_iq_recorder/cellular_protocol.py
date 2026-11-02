@@ -75,7 +75,7 @@ _ALIASES: dict[str, tuple[str, ...]] = {
         "duration", "recording duration", "record duration", "recording time", "record time",
         "capture duration", "capture time", "capture length", "duration s", "duration sec",
         "duration seconds", "time s", "seconds", "recording length", "length", "iq duration",
-        "iq recording duration", "iq time", "iq length",
+        "iq duration s", "iq duration sec", "iq duration seconds", "iq recording duration", "iq time", "iq length",
     ),
     "network": ("network", "operator", "carrier", "mno", "provider", "company", "licensee", "ran", "plmn"),
     "technology": ("technology", "tech", "rat", "system", "generation", "standard", "technologies"),
@@ -105,14 +105,22 @@ _ALIASES: dict[str, tuple[str, ...]] = {
         HEADER_IQ.casefold(), "iq recording", "iq file", "recording file", "capture id", "recording id",
         "recorded file", "result", "iq filename",
     ),
+    # When the recording was made: filled with the capture's start time in the results.
+    "result_time": (
+        "recording date & time", "recording date and time", "recording date time", "recording datetime",
+        "date & time", "date and time", "date time", "datetime", "timestamp", "time stamp", "recorded at",
+        "captured at", "capture date", "recording date", "recording start", "start date time",
+    ),
     "status": ("status", "state", "collection status", "progress"),
 }
 
 _ROLE_ORDER = (
     "band", "nominal", "duplex", "direction", "start", "stop", "unit", "duration", "network",
     "technology", "target_class", "channel_bw", "notes", "repeat",
-    "dl_start", "dl_stop", "ul_start", "ul_stop", "result", "status",
+    "dl_start", "dl_stop", "ul_start", "ul_stop", "result", "result_time", "status",
 )
+# Columns the collection fills in the results; the protocol leaves them empty.
+RESULT_ROLES = ("result", "result_time")
 
 # Status texts that mean "this row is a finished result", not an instruction.
 _DONE_STATUS = {"collected", "done", "recorded", "complete", "completed", "captured", "finished", "ok"}
@@ -125,6 +133,8 @@ _DURATION_CELL = re.compile(
     re.IGNORECASE,
 )
 _BAND_NUMBER = re.compile(r"^\s*(?:band|b|n|lte|nr)?\s*[-_ ]?\s*(\d{1,3})\s*$", re.IGNORECASE)
+# A band label that starts with its nominal frequency: "700 MHz (B68 / B28)", "3.5 GHz n78", "1800 - DCS".
+_BAND_LEADING_FREQ = re.compile(r"^\s*(\d+(?:[.,]\d+)?)\s*(hz|khz|mhz|ghz)?(?=\s|[(\[\-–—/:,]|$)", re.IGNORECASE)
 
 _DIRECTION_WORDS = {
     DIR_DL: {"dl", "downlink", "down link", "down", "d", "forward", "bts tx", "base tx", "tx"},
@@ -138,6 +148,20 @@ _DIRECTION_WORDS = {
 
 class ProtocolError(ValueError):
     """The workbook or worksheet cannot be read."""
+
+
+def _mentions_frequency(text: str, nominal_hz: int | None) -> bool:
+    """True when the band text already starts with its nominal frequency ("700 MHz (B28)")."""
+    if not nominal_hz:
+        return False
+    match = _BAND_LEADING_FREQ.match(text)
+    if not match:
+        return False
+    number = _decimal_from_number_text(match.group(1))
+    if number is None:
+        return False
+    unit = _UNIT_CANON.get((match.group(2) or "").casefold()) if match.group(2) else ("MHz" if number >= 300 else None)
+    return unit is not None and number * UNIT_TO_HZ[unit] == nominal_hz
 
 
 def _normalise_header(text: str) -> tuple[str, str | None]:
@@ -229,7 +253,7 @@ class ProtocolEntry:
                 return nominal
         if _BAND_NUMBER.match(text) and not re.search(r"[a-z]", text, re.IGNORECASE):
             text = f"Band {text}"
-        if nominal and nominal.casefold() != text.casefold():
+        if nominal and nominal.casefold() != text.casefold() and not _mentions_frequency(text, self.nominal_hz):
             return f"{text} ({nominal})"
         return text
 
@@ -319,12 +343,23 @@ class ColumnMapping:
     ul_start: str | None = None
     ul_stop: str | None = None
     result: str | None = None
+    result_time: str | None = None
     status: str | None = None
     # Unit for bare numbers when neither the cell nor the header names one.
     default_unit: str | None = None
     # Units named in the headers themselves, by role.
     header_units: dict[str, str] = field(default_factory=dict)
     extra: list[str] = field(default_factory=list)
+
+    def result_columns(self) -> dict[str, str]:
+        """Header per result role the collection can fill (file names, capture time, duration)."""
+        columns = {role: getattr(self, role) for role in RESULT_ROLES if getattr(self, role)}
+        if self.duration:
+            columns["duration"] = self.duration
+        return columns
+
+    def has_result_columns(self) -> bool:
+        return any(getattr(self, role) for role in RESULT_ROLES)
 
     def layout(self) -> str:
         """'rows' (one allocation per row), 'paired' (DL and UL columns) or 'incomplete'."""
@@ -566,7 +601,7 @@ def parse_band_cell(value: Any, *, unit_hint: str | None = None) -> tuple[str, i
     text = str(value).strip()
     if not text:
         return "", None
-    match = _FREQ_CELL.match(text)
+    match = _FREQ_CELL.match(text) or _BAND_LEADING_FREQ.match(text)
     if match:
         number = _decimal_from_number_text(match.group(1))
         unit = _UNIT_CANON.get((match.group(2) or "").casefold()) if match.group(2) else None
@@ -736,7 +771,13 @@ def list_worksheets(path: str | Path) -> list[tuple[str, bool]]:
         workbook.close()
 
 
-def _row_values(ws, max_rows: int) -> list[tuple[int, list[Any]]]:
+def _row_values(ws, max_rows: int | None) -> list[tuple[int, list[Any]]]:
+    """Rows as value lists. `max_rows=None` streams to the end of the sheet.
+
+    Workbooks written by some tools carry no `<dimension>` element, so a
+    read-only worksheet reports `max_row` as None; the sheet is then read
+    to its end and the blank-run limit bounds the scan.
+    """
     rows: list[tuple[int, list[Any]]] = []
     blank_run = 0
     for index, row in enumerate(ws.iter_rows(min_row=1, max_row=max_rows, values_only=True), start=1):
@@ -823,7 +864,8 @@ def import_protocol(
             raise ProtocolError(f"Worksheet {worksheet!r} is not in {file.name}.")
         ws = workbook[worksheet]
         hidden = getattr(ws, "sheet_state", "visible") != "visible"
-        rows = _row_values(ws, max(ws.max_row or 1, 1))
+        declared_rows = getattr(ws, "max_row", None)
+        rows = _row_values(ws, max(int(declared_rows), 1) if declared_rows else None)
     finally:
         workbook.close()
     header_row = _find_header_row(rows)

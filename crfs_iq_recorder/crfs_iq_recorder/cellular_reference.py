@@ -22,6 +22,9 @@ TEMPLATE_HEADERS = (
     "Stop (MHz)",
     "Duration (s)",
     "Notes",
+    # Filled by the collection in the per-round results sheets; leave empty.
+    "IQ Recording",
+    "Recording Date & Time",
 )
 
 VERIFY_NOTE = "Reference chart 29 Oct 2026 - verify before use"
@@ -99,8 +102,8 @@ def write_template_workbook(path: str | Path, *, duration_s: float | None = None
     rows = REFERENCE_ALLOCATIONS if include_reference else REFERENCE_ALLOCATIONS[:1]
     note = VERIFY_NOTE if include_reference else "Example row - replace with your allocation"
     for band, nominal, duplex, direction, network, technology, start, stop in rows:
-        ws.append([band, nominal, duplex, direction, network, technology, start, stop, duration_s, note])
-    widths = {"A": 8, "B": 14, "C": 8, "D": 10, "E": 14, "F": 12, "G": 12, "H": 12, "I": 12, "J": 48}
+        ws.append([band, nominal, duplex, direction, network, technology, start, stop, duration_s, note, None, None])
+    widths = {"A": 8, "B": 14, "C": 8, "D": 10, "E": 14, "F": 12, "G": 12, "H": 12, "I": 12, "J": 48, "K": 40, "L": 22}
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "A2"
@@ -114,6 +117,8 @@ def write_template_workbook(path: str | Path, *, duration_s: float | None = None
         "Units: MHz in the headers shown here; a unit written in the cell (e.g. '3.5 GHz') wins.",
         "Duration (s): optional; when empty the campaign duration in the application is used.",
         "Network / Technology: labels copied into the manifests. Nothing is inferred from the frequency.",
+        "IQ Recording / Recording Date & Time: leave empty. The collection fills them in a separate",
+        "'Round <date> <time>' sheet per round (file names, seconds held, local date and time); this sheet is never changed.",
         "",
         "Reference rows come from the allocation chart of 29 Oct 2026 and must be verified before use.",
         "Rows whose Status is 'Collected' (if you add such a column) are treated as results, not instructions.",

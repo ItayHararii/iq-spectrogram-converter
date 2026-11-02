@@ -123,6 +123,7 @@ _ROLE_LABELS = (
     ("repeat", "Repeat count"),
     ("notes", "Notes"),
     ("result", "Result (recording name)"),
+    ("result_time", "Result (recording date & time)"),
     ("status", "Status"),
 )
 
@@ -157,6 +158,8 @@ class PanelSettings:
     local_reserve_gb: float = 2.0
     # EMP recording_format for the captures; "" follows the recorder's own Format box.
     recording_format: str = ""
+    # Fill the protocol workbook's result columns (one sheet per round).
+    protocol_results: bool = True
     scenario: dict[str, str] = field(default_factory=dict)
     sites: dict[str, dict[str, Any]] = field(default_factory=dict)
     expanded: bool = False
@@ -794,6 +797,15 @@ class CellularPanel(QFrame):
         self.quality_check.setChecked(bool(self.settings.quality_checks))
         self.preview_check = QCheckBox("Draw sampled previews")
         self.preview_check.setChecked(bool(self.settings.previews))
+        self.protocol_results_check = QCheckBox("Fill the protocol workbook (one results sheet per round)")
+        self.protocol_results_check.setChecked(bool(self.settings.protocol_results))
+        self.protocol_results_check.setToolTip(
+            "Writes a 'Round <date> <time>' sheet into the protocol workbook with one row per capture window: "
+            "the window recorded, the sensor, the recording file names, the seconds held and the local date & time. "
+            "The protocol sheet itself and earlier round sheets are never changed. Needs a result column such as "
+            "'IQ Recording' or 'Recording Date & Time' in the protocol."
+        )
+        self.protocol_results_check.toggled.connect(lambda _on: self._rebuild_plan())
         self.backlog_spin = QSpinBox()
         self.backlog_spin.setRange(1, 200)
         self.backlog_spin.setValue(int(self.settings.backlog_limit))
@@ -831,14 +843,15 @@ class CellularPanel(QFrame):
         adv.addWidget(self.quality_check, 7, 0, 1, 2)
         adv.addWidget(self.preview_check, 8, 0, 1, 2)
         adv.addWidget(self.merge_check, 9, 0, 1, 2)
-        adv.addWidget(QLabel("Download backlog limit"), 10, 0)
-        adv.addWidget(self.backlog_spin, 10, 1)
-        adv.addWidget(QLabel("Local reserve"), 11, 0)
-        adv.addWidget(self.reserve_spin, 11, 1)
+        adv.addWidget(self.protocol_results_check, 10, 0, 1, 2)
+        adv.addWidget(QLabel("Download backlog limit"), 11, 0)
+        adv.addWidget(self.backlog_spin, 11, 1)
+        adv.addWidget(QLabel("Local reserve"), 12, 0)
+        adv.addWidget(self.reserve_spin, 12, 1)
         scenario_title = QLabel("Scenario (optional; nothing is inferred from the frequency)")
         scenario_title.setObjectName("muted")
         scenario_title.setWordWrap(True)
-        adv.addWidget(scenario_title, 12, 0, 1, 2)
+        adv.addWidget(scenario_title, 13, 0, 1, 2)
         self.scenario_fields: dict[str, QComboBox | QLineEdit] = {}
         combos = (
             ("network", "Network", NETWORKS),
@@ -849,7 +862,7 @@ class CellularPanel(QFrame):
             ("path", "Path", PATHS),
             ("dominance", "Cells", DOMINANCE),
         )
-        row = 13
+        row = 14
         for key, label, options in combos:
             combo = _compact(QComboBox(), 8)
             combo.setEditable(True)
@@ -913,6 +926,7 @@ class CellularPanel(QFrame):
         s.merge_parts = self.merge_check.isChecked()
         s.quality_checks = self.quality_check.isChecked()
         s.previews = self.preview_check.isChecked()
+        s.protocol_results = self.protocol_results_check.isChecked()
         s.backlog_limit = int(self.backlog_spin.value())
         s.local_reserve_gb = float(self.reserve_spin.value())
         s.recording_format = str(self.format_combo.currentData() or "")
@@ -1121,6 +1135,14 @@ class CellularPanel(QFrame):
             parts.append(f"{errors} error(s) — see Preview")
         if warnings:
             parts.append(f"{warnings} warning(s)")
+        has_result_columns = self.imported.mapping.has_result_columns()
+        self.protocol_results_check.setEnabled(has_result_columns)
+        if has_result_columns:
+            parts.append(
+                "results → one sheet per round in the workbook" if self.protocol_results_check.isChecked() else "results not written to the workbook"
+            )
+        else:
+            parts.append("no result column in the protocol (results stay in manifests)")
         needs_duration = any(i.code == "duration_missing" for i in self.plan.issues)
         self.duration_label.setText("Campaign duration (required)" if needs_duration else "Campaign duration")
         self.duration_label.setStyleSheet("color: #c0392b; font-weight: 600;" if needs_duration else "")
@@ -1199,7 +1221,46 @@ class CellularPanel(QFrame):
             scenario=self.scenario(),
             protocol_path=self.workbook_edit.text().strip(),
             protocol_sheet=self._current_sheet(),
+            protocol_results=self.protocol_results_enabled(),
+            protocol_header_row=int(self.imported.header_row) if self.imported is not None else 1,
+            protocol_mapping=self.imported.mapping.to_dict() if self.imported is not None else {},
         )
+
+    def protocol_results_enabled(self) -> bool:
+        """True when the results go into the protocol workbook (ticked and the protocol has result columns)."""
+        return bool(
+            self.protocol_results_check.isChecked()
+            and self.imported is not None
+            and self.imported.mapping.has_result_columns()
+        )
+
+    def _protocol_results_check(self):
+        """Pre-run line about the protocol workbook results."""
+        path = self.workbook_edit.text().strip()
+        name = Path(path).name if path else "the protocol workbook"
+        if self.imported is None or not self.imported.mapping.has_result_columns():
+            return Check(
+                "protocol_results",
+                Q_INFO,
+                f"{name} has no result column (such as 'IQ Recording' or 'Recording Date & Time'); results go to the "
+                "manifests, the handover summary and the collection workbook only.",
+            )
+        if not self.protocol_results_check.isChecked():
+            return Check("protocol_results", Q_INFO, f"Results are not written to {name} (Advanced → Fill the protocol workbook is off).")
+        columns = ", ".join(f"'{header}'" for header in self.imported.mapping.result_columns().values())
+        text = (
+            f"Results are written to {name}: one 'Round <date> <time>' sheet per round filling {columns}; "
+            "the protocol sheet is never changed and a backup copy is made before the first write."
+        )
+        try:
+            from .excel_com import excel_has_workbook
+
+            busy = bool(path) and excel_has_workbook(Path(path))
+        except Exception:  # noqa: BLE001 - the check is advisory
+            busy = False
+        if busy:
+            return Check("protocol_results", Q_WARNING, f"{name} is open in Excel: close it, or the results sheet is deferred until it is closed. " + text)
+        return Check("protocol_results", Q_OK, text)
 
     def _pre_run_checks(self):
         info = getattr(self.host, "_sensor_info", None)
@@ -1214,6 +1275,7 @@ class CellularPanel(QFrame):
         )
         fmt, _source = self._effective_format()
         checks.append(Check("recording_format", Q_OK if fmt.upper() == "WAVE" else Q_INFO, self.format_text()))
+        checks.append(self._protocol_results_check())
         return checks
 
     def _show_preview(self, *, start: bool) -> None:
@@ -1356,6 +1418,13 @@ class CellularPanel(QFrame):
                 details.append(f"{len(status['delayed_rounds'])} round(s) delayed because the previous one was still running")
             if status.get("pending_downloads") or status.get("pending_excel"):
                 details.append(f"Pending: {status.get('pending_downloads', 0)} download(s), {status.get('pending_excel', 0)} Excel row(s)")
+            if status.get("protocol_results"):
+                sheet = status.get("protocol_sheet") or "(sheet not created yet)"
+                written = {
+                    "saved": "up to date", "writing": "writing…", "deferred": "deferred — the workbook is open in Excel; it is written when closed",
+                    "failed": "could not be written (see log; manifests hold the results)",
+                }.get(str(status.get("protocol_status") or ""), "pending")
+                details.append(f"Protocol workbook: {sheet} — {written}")
             if status.get("remaining_s"):
                 details.append(f"Remaining this round ≈ {format_seconds(status['remaining_s'])}, {format_bytes(status.get('remaining_bytes', 0))} (estimate)")
             details.append(f"Confirmed {status.get('confirmed_total', 0)} · uncertain {status.get('uncertain_total', 0)} · failed {status.get('failed_total', 0)}")

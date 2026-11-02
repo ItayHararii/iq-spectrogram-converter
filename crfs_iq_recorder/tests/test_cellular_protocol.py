@@ -98,6 +98,63 @@ def test_rows_layout_imports_every_allocation_exactly(tmp_path):
     assert len(imported.protocol_version()) == 12
 
 
+def _strip_dimension_tags(path: Path) -> None:
+    """Rewrite the workbook without the sheets' <dimension> elements, as some writers do."""
+    import re
+    import shutil
+    import zipfile
+
+    tmp = path.with_suffix(".tmp.xlsx")
+    with zipfile.ZipFile(path) as src, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename.startswith("xl/worksheets/sheet"):
+                data = re.sub(rb"<dimension[^>]*/>", b"", data)
+                assert b"<dimension" not in data
+            dst.writestr(item, data)
+    shutil.move(tmp, path)
+
+
+PROTOCOL_LAYOUT = [
+    ["Band", "Direction", "Duplex", "Freq Start (MHz)", "Freq Stop (MHz)", "Sensor", "IQ Recording", "IQ Duration (s)", "Recording Date & Time"],
+    ["700 MHz (B68 / B28)", "DL", "FDD", 753, 803, "CRFS 100-18", None, None, None],
+    ["700 MHz (B68 / B28)", "UL", "FDD", 698, 748, "CRFS 100-18", None, None, None],
+    ["1800 MHz (B3)", "DL", "FDD", 1805, 1880, "CRFS 100-18", None, None, None],
+    ["1800 MHz (B3)", "UL", "FDD", 1710, 1785, "CRFS 100-18", None, None, None],
+    ["3500 MHz (n78)", "UL/DL", "TDD", 3300, 3800, "CRFS 100-18", None, None, None],
+]
+
+
+def test_workbook_without_dimension_tags_imports_every_row_and_band_labels_carry_their_nominal(tmp_path):
+    """A protocol written by a tool that omits <dimension> made openpyxl report no rows;
+    every allocation was silently dropped. The sheet is now read to its end."""
+    path = _book(tmp_path / "protocol.xlsx", {"Cellular Protocol": PROTOCOL_LAYOUT, "Reference": [["Notes"], ["x"]]})
+    _strip_dimension_tags(path)
+    headers, header_row = read_headers(path, "Cellular Protocol")
+    assert header_row == 1 and headers[:5] == ["Band", "Direction", "Duplex", "Freq Start (MHz)", "Freq Stop (MHz)"]
+    imported = import_protocol(path, "Cellular Protocol")
+    assert imported.errors == [] and imported.rows_scanned == 5
+    entries = imported.valid_entries()
+    assert [(e.direction, e.start_hz // MHZ, e.stop_hz // MHZ) for e in entries] == [
+        (DIR_DL, 753, 803), (DIR_UL, 698, 748), (DIR_DL, 1805, 1880), (DIR_UL, 1710, 1785), (DIR_SHARED, 3300, 3800),
+    ]
+    # The band text keeps its label, and the leading frequency is its nominal (for ordering).
+    assert entries[0].band == "700 MHz (B68 / B28)" and entries[0].nominal_hz == 700 * MHZ
+    assert entries[2].nominal_hz == 1800 * MHZ and entries[4].nominal_hz == 3500 * MHZ
+    assert entries[0].label() == "700 MHz (B68 / B28) DL 753–803 MHz"
+    # The result columns are recognised, and empty ones leave the row an instruction. The empty
+    # duration column means "campaign duration"; the collection fills it with the held seconds.
+    mapping = imported.mapping
+    assert mapping.result == "IQ Recording" and mapping.result_time == "Recording Date & Time"
+    assert mapping.duration == "IQ Duration (s)" and mapping.extra == ["Sensor"]
+    assert mapping.has_result_columns()
+    assert mapping.result_columns() == {"result": "IQ Recording", "result_time": "Recording Date & Time", "duration": "IQ Duration (s)"}
+    assert all(e.duration_s is None for e in entries)
+    assert imported.ready
+    # A protocol without result columns says so.
+    assert not suggest_mapping(ROWS_LAYOUT[0]).has_result_columns()
+
+
 def test_units_in_cells_header_and_default_are_all_understood():
     assert parse_frequency_cell("713 MHz", unit_hint=None, field_name="f") == (713 * MHZ, None)
     assert parse_frequency_cell("0.713GHz", unit_hint=None, field_name="f") == (713 * MHZ, None)

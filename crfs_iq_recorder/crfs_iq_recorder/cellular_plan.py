@@ -302,10 +302,11 @@ def order_entries(entries: list[ProtocolEntry]) -> tuple[list[ProtocolEntry], li
 def split_windows(start_hz: int, stop_hz: int, window_hz: int, *, edge_margin_hz: int = 0) -> list[tuple[int, int, int]]:
     """(start, stop, overlap_with_previous) windows whose union covers [start, stop].
 
-    Each window is `window_hz` wide; when the allocation is wider the windows
-    are spaced so the last one ends exactly at `stop_hz`, which makes the
-    overlap between neighbours explicit instead of leaving a gap. An edge
-    margin shrinks the step (more overlap) without changing the window width.
+    Each window is `window_hz` wide. Windows step from `start_hz` by the
+    usable width (the window less any edge margin on both sides), so their
+    edges stay on the allocation's own grid (whole MHz for whole-MHz edges);
+    the last window is moved back to end exactly at `stop_hz`, and the extra
+    overlap this gives it is reported instead of leaving a gap.
     """
     width = stop_hz - start_hz
     if width <= 0:
@@ -316,15 +317,10 @@ def split_windows(start_hz: int, stop_hz: int, window_hz: int, *, edge_margin_hz
     # so the trusted centre parts tile the allocation without a gap.
     usable = max(window_hz - 2 * max(edge_margin_hz, 0), window_hz // 2)
     count = math.ceil((width - window_hz) / usable) + 1
-    # Spread the windows so that the first starts at start_hz and the last ends at stop_hz.
-    step = (width - window_hz) / (count - 1)
     windows: list[tuple[int, int, int]] = []
     previous_stop: int | None = None
     for index in range(count):
-        if index == count - 1:
-            w_start = stop_hz - window_hz
-        else:
-            w_start = start_hz + int(round(index * step))
+        w_start = min(start_hz + index * usable, stop_hz - window_hz)
         w_stop = w_start + window_hz
         overlap = (previous_stop - w_start) if previous_stop is not None else 0
         windows.append((w_start, w_stop, max(overlap, 0)))

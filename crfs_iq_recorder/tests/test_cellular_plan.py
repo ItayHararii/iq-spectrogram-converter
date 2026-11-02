@@ -98,12 +98,18 @@ def test_split_windows_cover_the_allocation_without_gaps():
         (3660 * MHZ, 3680 * MHZ, 0),
         (3680 * MHZ, 3700 * MHZ, 0),
     ]
+    # Windows step by the full width from the start and the last one is moved back to the
+    # stop edge: edges stay whole MHz and the extra overlap is reported on the last window.
     windows = split_windows(3500 * MHZ, 3550 * MHZ, 20 * MHZ)
-    assert [(a // MHZ, b // MHZ, o // MHZ) for a, b, o in windows] == [(3500, 3520, 0), (3515, 3535, 5), (3530, 3550, 5)]
+    assert [(a // MHZ, b // MHZ, o // MHZ) for a, b, o in windows] == [(3500, 3520, 0), (3520, 3540, 0), (3530, 3550, 10)]
     # Union covers exactly the allocation, no gap between neighbours.
     for (a, b, _o), (c, d, _p) in zip(windows, windows[1:]):
         assert c <= b
     assert windows[0][0] == 3500 * MHZ and windows[-1][1] == 3550 * MHZ
+    # A 75 MHz band (B3) keeps whole-MHz edges instead of thirds of a MHz.
+    b3 = split_windows(1805 * MHZ, 1880 * MHZ, 20 * MHZ)
+    assert [(a // MHZ, b // MHZ, o // MHZ) for a, b, o in b3] == [(1805, 1825, 0), (1825, 1845, 0), (1845, 1865, 0), (1860, 1880, 5)]
+    assert all(a % MHZ == 0 and b % MHZ == 0 for a, b, _o in b3)
     # An edge margin only increases the overlap; the window width stays the same.
     margin = split_windows(3600 * MHZ, 3700 * MHZ, 20 * MHZ, edge_margin_hz=2 * MHZ)
     assert len(margin) == 6 and all(b - a == 20 * MHZ for a, b, _o in margin)
