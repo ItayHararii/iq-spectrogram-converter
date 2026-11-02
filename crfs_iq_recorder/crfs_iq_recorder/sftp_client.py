@@ -29,6 +29,10 @@ class SftpError(Exception):
     """SFTP operation failed."""
 
 
+class SftpNotFoundError(SftpError):
+    """The remote path does not exist (as opposed to the session failing)."""
+
+
 def _mtime(value: float | int | None) -> datetime | None:
     if value is None:
         return None
@@ -51,6 +55,10 @@ class SftpBrowser:
 
     def abort(self) -> None:
         self.close()
+
+    def is_alive(self) -> bool:
+        """False once the underlying connection is known to be gone."""
+        return True
 
     def directory_exists(self, path: str) -> bool:
         raise NotImplementedError
@@ -145,6 +153,18 @@ class ParamikoSftpBrowser(SftpBrowser):
             pass
         _close_ssh_client(self._client)
 
+    def is_alive(self) -> bool:
+        try:
+            transport = self._client.get_transport()
+        except Exception:
+            return False
+        if transport is None:
+            return False
+        try:
+            return bool(transport.is_active())
+        except Exception:
+            return False
+
     def directory_exists(self, path: str) -> bool:
         try:
             mode = self._sftp.stat(path).st_mode
@@ -156,7 +176,7 @@ class ParamikoSftpBrowser(SftpBrowser):
         try:
             attrs = self._sftp.listdir_attr(path)
         except FileNotFoundError as exc:
-            raise SftpError(f"Folder not found: {path}") from exc
+            raise SftpNotFoundError(f"Folder not found: {path}") from exc
         except OSError as exc:
             raise SftpError(str(exc)) from exc
         except Exception as exc:
@@ -552,7 +572,7 @@ class DemoSftpBrowser(SftpBrowser):
         with self._lock:
             key = _demo_dir_key(path)
             if key not in self._dirs:
-                raise SftpError(f"Folder not found: {path}")
+                raise SftpNotFoundError(f"Folder not found: {path}")
             return sort_remote_entries(list(self._dirs[key]))
 
     def read_prefix(self, remote_path: str, local_path: Path, max_bytes: int) -> int:

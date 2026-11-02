@@ -314,6 +314,224 @@ def test_gui_mode_holds_the_stream_after_finished_until_cancelled(sensor):
     assert script.disconnected.wait(3)
 
 
+CLOCK = (
+    'event: message.MessageData\ndata: [{"level":"WARNING","message":"Using internal clock because of '
+    'ncpd.conf settings","timestamp":"2026-11-02T16:44:10+00:00"}]\n\n'
+)
+SCHEDULE_ERROR = (
+    'event: message.MessageData\ndata: [{"level":"ERROR","message":"Unable to schedule the command",'
+    '"timestamp":"2026-11-02T16:45:03+00:00"}]\n\n'
+)
+
+
+def test_repeated_warning_is_counted_once_and_never_hides_the_real_error(sensor):
+    """Root cause (a), Node 100-18 at 18:44: the clock WARNING arrived several times a second,
+    filled the message window and the ERROR that ended the stream was invisible."""
+    script = _Script([(0.02, CLOCK * 60), (0.02, remote_time("file_164410_0001.wav")), (0.02, SCHEDULE_ERROR)])
+    outcome = EmpClient(demo=False).start_recording(sensor(script), "pw", _payload(), stream_budget_s=10)
+    assert outcome.kind == "sensor_error", "a WARNING is not fatal; the ERROR is what ended this recording"
+    assert outcome.sensor_messages == [
+        "WARNING: Using internal clock because of ncpd.conf settings (×60)",
+        "ERROR: Unable to schedule the command",
+    ]
+    assert outcome.sensor_error == "ERROR: Unable to schedule the command"
+    assert "Unable to schedule the command" in outcome.detail
+    assert outcome.sensor_parts == ["file_164410_0001.wav"]
+
+
+def test_warning_only_stream_finishes_normally(sensor):
+    """A WARNING alone (internal clock) must never be treated as a failed recording."""
+    script = _Script([(0.02, CLOCK), (0.02, remote_time("file_164410_0001.wav")), (0.05, CLOCK), (0.05, FINISHED)])
+    outcome = EmpClient(demo=False).start_recording(sensor(script), "pw", _payload(), stream_budget_s=10)
+    assert outcome.kind == "accepted" and outcome.accepted and outcome.sensor_finished
+    assert outcome.sensor_error == ""
+    assert outcome.sensor_messages == [
+        "WARNING: Using internal clock because of ncpd.conf settings (×2)",
+        "INFO: Remote recording is now finished",
+    ]
+
+
+def test_error_after_finished_keeps_the_recording_confirmed(sensor):
+    """Root cause (b): 'Unable to schedule the command' arrived ~45 s after 'finished' while the
+    GUI still held the stream. The recording is done; the late error is reported, not fatal."""
+    script = _Script([(0.02, remote_time("file_164410_0001.wav")), (0.05, FINISHED), (0.2, SCHEDULE_ERROR)])
+    cancel = threading.Event()
+    client = EmpClient(demo=False)
+    outcome = client.start_recording(sensor(script), "pw", _payload(), cancel=cancel, stream_budget_s=10, stop_on_finished=False)
+    assert outcome.kind == "accepted" and outcome.accepted is True
+    assert outcome.sensor_finished is True and outcome.outcome_unknown is False
+    assert outcome.sensor_error == "ERROR: Unable to schedule the command"
+    assert "confirmed from the files" in outcome.detail and "Unable to schedule the command" in outcome.detail
+    assert outcome.sensor_parts == ["file_164410_0001.wav"]
+
+
+def test_refused_request_names_no_file_and_is_not_finished(sensor):
+    """Root cause (d): a POST refused by the sensor because the previous mission was still open.
+    Nothing was recorded: no file, no 'finished'; the caller must not count it."""
+    outcome = EmpClient(demo=False).start_recording(sensor(_Script([(0.02, SCHEDULE_ERROR)])), "pw", _payload(), stream_budget_s=10)
+    assert outcome.kind == "sensor_error" and outcome.accepted is False and outcome.request_sent is True
+    assert outcome.sensor_parts == [] and outcome.sensor_finished is False
+    # What the runner sees for that POST (the window's capture summary) is "refused".
+    from crfs_iq_recorder.capture_api import OUTCOME_CONFIRMED, OUTCOME_SENSOR_ERROR, CaptureSummary
+    from crfs_iq_recorder.cellular_runner import request_refused
+
+    def summary(http):
+        confirmed = http.kind == "accepted" and http.sensor_finished
+        return CaptureSummary(
+            outcome=OUTCOME_CONFIRMED if confirmed else OUTCOME_SENSOR_ERROR,
+            sensor_finished=http.sensor_finished,
+            sensor_parts=list(http.sensor_parts),
+            parts=len(http.sensor_parts),
+            finalized_paths=[f"/mnt/1/remdata/20261031/{n}" for n in http.sensor_parts],
+        )
+
+    assert request_refused(summary(outcome)) is True
+    finished = EmpClient(demo=False).start_recording(
+        sensor(_Script([(0.02, remote_time("f.wav")), (0.02, FINISHED)])), "pw", _payload(), stream_budget_s=10
+    )
+    assert request_refused(summary(finished)) is False
+    # An error that arrives after a part was named is a failed recording, not a refusal:
+    # the sensor did start, so the files decide and the request is never re-sent blindly.
+    partial = EmpClient(demo=False).start_recording(
+        sensor(_Script([(0.02, remote_time("f.wav")), (0.02, SCHEDULE_ERROR)])), "pw", _payload(), stream_budget_s=10
+    )
+    assert partial.kind == "sensor_error" and request_refused(summary(partial)) is False
+
+
+MISSIONS_HTML = (
+    '<div class="item">Periodic Sweep [1 MHz-6 GHz]</div>\n'
+    '<div class="item active">EMP Remote Recording [Center:1.0 GHz,Span:20 MHz]</div>\n'
+    '<div class="item"><span>Standby</span></div>'
+)
+
+
+def test_mission_list_parsing_and_recording_detection():
+    from crfs_iq_recorder.api_client import MissionList, parse_emp_missions, remote_recording_missions
+
+    missions = parse_emp_missions(MISSIONS_HTML)
+    assert missions == ["Periodic Sweep [1 MHz-6 GHz]", "EMP Remote Recording [Center:1.0 GHz,Span:20 MHz]", "Standby"]
+    assert remote_recording_missions(missions) == ["EMP Remote Recording [Center:1.0 GHz,Span:20 MHz]"]
+    assert parse_emp_missions("") == [] and parse_emp_missions("<div></div>") == []
+    assert parse_emp_missions("Standby\nEMP Remote Recording [x]") == ["Standby", "EMP Remote Recording [x]"]
+    assert MissionList(available=True, missions=missions, recording=remote_recording_missions(missions)).recording_open
+    assert not MissionList(available=True).recording_open
+    assert not MissionList(available=False, error="HTTP 401").recording_open
+
+
+def test_list_missions_is_a_read_only_get(monkeypatch):
+    from crfs_iq_recorder.api_client import EMP_MISSIONS_PATH, EmpClient, RawResponse
+
+    calls = []
+
+    class Transport:
+        def request(self, method, url, **kwargs):
+            calls.append((method, url))
+            return RawResponse(status_code=200, headers={}, text=MISSIONS_HTML, url=url, elapsed_s=0.01)
+
+    target = ConnectionTarget(host="sensor.local", port=80, use_https=False, username="admin", timeout_s=5.0)
+    listing = EmpClient(demo=False, transport=Transport()).list_missions(target, "pw")
+    assert calls == [("GET", f"{target.origin}{EMP_MISSIONS_PATH}")]
+    assert listing.available and listing.recording_open
+    assert listing.recording == ["EMP Remote Recording [Center:1.0 GHz,Span:20 MHz]"]
+
+    class Refusing:
+        def request(self, method, url, **kwargs):
+            return RawResponse(status_code=401, headers={}, text="", url=url, elapsed_s=0.01)
+
+    denied = EmpClient(demo=False, transport=Refusing()).list_missions(target, "pw")
+    assert denied.available is False and denied.error == "HTTP 401" and not denied.recording_open
+    assert EmpClient(demo=True).list_missions(target, "pw").available is True
+
+
+class _Browser:
+    """An SFTP session fake: `folders` maps path -> entries, None = raises SftpError."""
+
+    def __init__(self, folders, *, alive=True):
+        self.folders = folders
+        self.alive = alive
+        self.calls: list[str] = []
+
+    def is_alive(self):
+        return self.alive
+
+    def listdir(self, path):
+        from crfs_iq_recorder.sftp_client import SftpError, SftpNotFoundError
+
+        self.calls.append(path)
+        if path not in self.folders:
+            raise SftpNotFoundError(f"Folder not found: {path}")
+        if self.folders[path] is None:
+            raise SftpError("Socket is closed")
+        return list(self.folders[path])
+
+
+def test_dead_watch_session_raises_instead_of_looking_like_an_empty_folder():
+    """Root cause (c), Node 100-18: the watch session went silent during a download, every
+    listing came back empty and a recording that was on the disk was never confirmed."""
+    from crfs_iq_recorder.file_watch import list_watch_entries
+    from crfs_iq_recorder.sftp_client import SftpError
+
+    when = datetime(2026, 11, 2, 18, 44, 0)
+    folders = ["/mnt/1/remdata/20261102/", "/mnt/1/remdata/20261103/"]
+    # Missing date folders are skipped (the day's first file has not been written yet).
+    assert list_watch_entries(_Browser({}), folders) == []
+    # A present folder lists; a missing sibling does not matter.
+    live = _Browser({folders[0]: [_entry("file_184400_0001.wav", 10, when)]})
+    assert [e.name for e in list_watch_entries(live, folders)] == ["file_184400_0001.wav"]
+    # Every folder failing (not "missing") is a failing session, not an empty folder.
+    with pytest.raises(SftpError, match="Could not list"):
+        list_watch_entries(_Browser({folders[0]: None, folders[1]: None}), folders)
+    # One failing folder with another listed fine is tolerated.
+    partial = _Browser({folders[0]: None, folders[1]: [_entry("file_000100_0001.wav", 10, when)]})
+    assert [e.name for e in list_watch_entries(partial, folders)] == ["file_000100_0001.wav"]
+    # A closed transport is rejected before any listing is attempted.
+    dead = _Browser({folders[0]: [_entry("x.wav", 10, when)]}, alive=False)
+    with pytest.raises(SftpError, match="closed"):
+        list_watch_entries(dead, folders)
+    assert dead.calls == []
+
+
+def test_paramiko_browser_reports_a_dead_transport_and_distinguishes_missing_folders():
+    from crfs_iq_recorder.sftp_client import ParamikoSftpBrowser, SftpError, SftpNotFoundError
+
+    class Transport:
+        def __init__(self, active):
+            self.active = active
+
+        def is_active(self):
+            return self.active
+
+    class Client:
+        def __init__(self, transport):
+            self.transport = transport
+
+        def get_transport(self):
+            return self.transport
+
+    class Sftp:
+        def listdir_attr(self, path):
+            if path.endswith("missing/"):
+                raise FileNotFoundError(path)
+            raise OSError("Socket is closed")
+
+        def close(self):
+            return None
+
+    browser = ParamikoSftpBrowser.__new__(ParamikoSftpBrowser)
+    browser._client = Client(Transport(True))
+    browser._sftp = Sftp()
+    assert browser.is_alive() is True
+    browser._client = Client(Transport(False))
+    assert browser.is_alive() is False
+    browser._client = Client(None)
+    assert browser.is_alive() is False
+    with pytest.raises(SftpNotFoundError):
+        browser.listdir("/mnt/1/remdata/missing/")
+    with pytest.raises(SftpError) as info:
+        browser.listdir("/mnt/1/remdata/20261102/")
+    assert not isinstance(info.value, SftpNotFoundError)
+
+
 def _entry(name, size, when):
     return RemoteEntry(name, f"/mnt/1/remdata/20261031/{name}", False, size, when)
 

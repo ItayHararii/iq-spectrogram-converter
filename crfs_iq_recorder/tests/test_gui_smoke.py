@@ -1910,7 +1910,7 @@ def test_gui_gives_up_quickly_when_the_sensor_finishes_without_a_file(qapp, tmp_
         )
         assert time.time() - started < 8, "must not wait the full 60 s watch"
         log = window.log_edit.toPlainText()
-        assert "Sensor: No suitable antenna found" in log
+        assert "Sensor warning: No suitable antenna found" in log
         assert "finished, but it named no file" in log
         assert "finished without writing a file (No suitable antenna found)" in log
         assert window._recordings_completed == 0

@@ -47,11 +47,11 @@ from .cellular_manifest import (
     sha256_of_file,
     write_manifest,
 )
+from .cellular_capabilities import readable_sensor_name
 from .cellular_plan import CellularPlan, PlannedTask, format_bytes, format_seconds
-from .cellular_protocol import ColumnMapping
-from .cellular_protocol_results import result_rows, sensor_text, sync_round_sheet
 from .cellular_scheduler import (
     MODE_NOW,
+    MODE_TIMES,
     ROUND_DELAYED,
     ROUND_DONE,
     ROUND_DUE,
@@ -68,6 +68,15 @@ from .cellular_scheduler import (
     materialise_rounds,
     next_due,
     next_pending,
+)
+from .cellular_workbook import (
+    FlushReport,
+    PlanRow,
+    SheetLayout,
+    WorkbookQueue,
+    build_row_result,
+    flush_queue,
+    queue_path,
 )
 from .excel_writer import ExcelBusyError
 from .sensor_label import workbook_sensor_name
@@ -116,6 +125,19 @@ DEFAULT_LOCAL_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 # downloads (the sensor finishes headers and sidecars after reporting done).
 FINALIZE_SETTLE_S = 5.0
 TICK_MS = 500
+# When the sensor still lists the previous remote-recording mission after the
+# bounded poll, the next request waits this long before the list is read again.
+IDLE_RETRY_WAIT_S = 10.0
+IDLE_RETRIES = 3
+# A gap between two ticks longer than this means the computer slept or the
+# application was frozen; the schedule is checked again and the user is told.
+SLEEP_GAP_S = 120.0
+# Bursts of workbook results (several rows in a few seconds) are written together.
+WORKBOOK_COALESCE_S = 3.0
+WORKBOOK_BUSY_RETRY_S = 15.0
+# A write that failed for another reason (file missing, backup folder full) is retried too,
+# more slowly; the queue is on disk and every write reconciles, so nothing is duplicated.
+WORKBOOK_ERROR_RETRY_S = 60.0
 
 
 @dataclass
@@ -142,11 +164,32 @@ class CampaignSettings:
     scenario: dict[str, Any] = field(default_factory=dict)
     protocol_path: str = ""
     protocol_sheet: str = ""
-    # Fill the protocol workbook with one results sheet per round (needs the
-    # header row and column mapping the protocol was imported with).
+    # Fill the protocol worksheet's own result columns (needs the layout and
+    # the plan rows read at import time; appended result blocks are never
+    # read back as instructions).
     protocol_results: bool = False
-    protocol_header_row: int = 1
-    protocol_mapping: dict[str, Any] = field(default_factory=dict)
+    protocol_layout: dict[str, Any] = field(default_factory=dict)
+    plan_rows: list[dict[str, Any]] = field(default_factory=list)
+    # Sensor the plan and its capability figures were made for.
+    sensor_model: str = ""
+    sensor_serial: str = ""
+
+    def layout(self) -> SheetLayout | None:
+        if not self.protocol_layout:
+            return None
+        try:
+            return SheetLayout.from_dict(self.protocol_layout)
+        except (TypeError, ValueError):
+            return None
+
+    def rows(self) -> list[PlanRow]:
+        out: list[PlanRow] = []
+        for item in self.plan_rows:
+            try:
+                out.append(PlanRow.from_dict(item))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -172,8 +215,10 @@ class CampaignSettings:
             "protocol_path": self.protocol_path,
             "protocol_sheet": self.protocol_sheet,
             "protocol_results": self.protocol_results,
-            "protocol_header_row": self.protocol_header_row,
-            "protocol_mapping": dict(self.protocol_mapping),
+            "protocol_layout": dict(self.protocol_layout),
+            "plan_rows": [dict(item) for item in self.plan_rows],
+            "sensor_model": self.sensor_model,
+            "sensor_serial": self.sensor_serial,
         }
 
     @classmethod
@@ -207,8 +252,10 @@ class CampaignSettings:
             protocol_path=str(data.get("protocol_path") or ""),
             protocol_sheet=str(data.get("protocol_sheet") or ""),
             protocol_results=bool(data.get("protocol_results", False)),
-            protocol_header_row=max(int(data.get("protocol_header_row") or 1), 1),
-            protocol_mapping={str(k): v for k, v in (data.get("protocol_mapping") or {}).items()},
+            protocol_layout={str(k): v for k, v in (data.get("protocol_layout") or {}).items()},
+            plan_rows=[dict(item) for item in data.get("plan_rows") or [] if isinstance(item, dict)],
+            sensor_model=str(data.get("sensor_model") or ""),
+            sensor_serial=str(data.get("sensor_serial") or ""),
         )
         return settings
 
@@ -480,13 +527,19 @@ class CellularRunner(QObject):
         self._quality_pending: list[QObject] = []
         self._refreshes = 0  # listings scheduled before a capture's downloads start
         self._excel_retry: set[tuple[str, str]] = set()
-        # Protocol workbook results: rounds whose sheet must be (re)written,
-        # a version per round so a change during a write schedules another.
-        self._protocol_dirty: dict[str, int] = {}
-        self._protocol_writing: tuple[str, int] | None = None
-        self._protocol_not_before = 0.0
-        self._protocol_busy_logged = False
-        self._protocol_backup_done = False
+        # Protocol workbook results: a persistent queue flushed on a worker,
+        # one flush at a time, bursts coalesced.
+        self._workbook_queue: WorkbookQueue | None = None
+        self._workbook_flushing = False
+        self._workbook_flush_again = False
+        self._workbook_not_before = 0.0
+        self._workbook_busy_logged = False
+        self._workbook_status = ""
+        self._workbook_note = ""
+        # Pre-request check of the sensor's mission list (one at a time).
+        self._idle_check_pending = False
+        self._idle_retries = 0
+        self._last_tick_wall = 0.0
         self._status_text = "Idle"
         self._timer = QTimer(self)
         self._timer.setInterval(TICK_MS)
@@ -502,6 +555,11 @@ class CellularRunner(QObject):
                 self.state = S_INTERRUPTED
             else:
                 self.state = self.session.runner_state if self.session.runner_state == S_DONE else S_IDLE
+        # Results that could not be written before the last exit (Excel had the
+        # workbook, the application was closed) are written now, whether or not
+        # the collection itself is finished; a busy workbook is retried.
+        if queue_path(self._config_dir).is_file() and self.workbook_pending() > 0:
+            QTimer.singleShot(1500, self, self._flush_workbook)
 
     # ------------------------------------------------------------------ helpers
     def _log(self, message: str, level: str = "info") -> None:
@@ -524,12 +582,49 @@ class CellularRunner(QObject):
         info = getattr(self.host, "_sensor_info", None)
         conn = getattr(self.host, "_conn", None)
         host_text = getattr(conn, "host", "") if conn is not None else ""
+        model = _identity_text(getattr(info, "model", ""))
         return {
-            "model": getattr(info, "model", "") or "",
-            "serial": getattr(info, "serial", "") or "",
-            "firmware": getattr(info, "firmware", "") or "",
+            "model": model,
+            "serial": _identity_text(getattr(info, "serial", "")),
+            "firmware": _identity_text(getattr(info, "firmware", "")),
+            "name": readable_sensor_name(model),
             "host_label": "sensor" if host_text else "",
         }
+
+    def _sensor_name(self) -> str:
+        """Readable sensor name for the worksheet ('CRFS 100-18'), from the verified identity."""
+        sensor = (self.session.sensor if self.session is not None else None) or self._sensor_dict()
+        return str(sensor.get("name") or readable_sensor_name(str(sensor.get("model") or "")) or "")
+
+    def identity_mismatch(self, settings: CampaignSettings | None = None) -> str | None:
+        """Text when the connected sensor is not the one the plan was made for; None when it is."""
+        settings = settings or (self.session.settings if self.session is not None else None)
+        if settings is None:
+            return None
+        info = getattr(self.host, "_sensor_info", None)
+        model = _identity_text(getattr(info, "model", ""))
+        serial = _identity_text(getattr(info, "serial", ""))
+        connected = bool(getattr(info, "connected", False)) or bool(model or serial)
+        wanted_model, wanted_serial = settings.sensor_model.strip(), settings.sensor_serial.strip()
+        if not (wanted_model or wanted_serial):
+            return None
+        if not connected:
+            return (
+                f"The sensor's identity could not be read. The plan was made for {readable_sensor_name(wanted_model) or wanted_model}"
+                + (f" (serial {wanted_serial})" if wanted_serial else "")
+                + "; check the connection and open the preview again."
+            )
+        if wanted_serial and serial and wanted_serial.casefold() != serial.casefold() or (
+            wanted_model and model and wanted_model.casefold() != model.casefold()
+        ):
+            return (
+                f"The connected sensor is {readable_sensor_name(model) or model or 'unknown'}"
+                + (f" (serial {serial})" if serial else "")
+                + f", but the plan and its recording settings were made for {readable_sensor_name(wanted_model) or wanted_model}"
+                + (f" (serial {wanted_serial})" if wanted_serial else "")
+                + ". Open the preview again so the plan is rebuilt for this sensor."
+            )
+        return None
 
     def current_round(self) -> RoundRecord | None:
         if self.session is None:
@@ -558,6 +653,9 @@ class CellularRunner(QObject):
             return "A cellular collection is already running."
         if not plan.ready:
             return "The plan has errors; fix them in the preview before starting."
+        mismatch = self.identity_mismatch(settings)
+        if mismatch:
+            return mismatch
         reserve = getattr(self.host, "set_external_owner", None)
         if reserve is not None:
             error = reserve(OWNER)
@@ -579,7 +677,9 @@ class CellularRunner(QObject):
             record.status = ROUND_DUE
             session.rounds = [record]
         else:
-            session.rounds = materialise_rounds(schedule, [], campaign=settings.campaign, tasks_total=len(plan.tasks), now=now)
+            session.rounds = self._cap_rounds(
+                materialise_rounds(schedule, [], campaign=settings.campaign, tasks_total=len(plan.tasks), now=now), schedule
+            )
             if not session.rounds:
                 self._release()
                 return "The schedule has no rounds."
@@ -587,15 +687,75 @@ class CellularRunner(QObject):
         self.session = session
         self.state = S_WAITING_SCHEDULE
         self._capture_in_flight = False
+        self._idle_check_pending = False
+        self._idle_retries = 0
+        self._last_tick_wall = time.time()
+        if self.protocol_results_enabled():
+            # Every session backs the workbook up once more before its first change.
+            self.workbook_queue().forget_backup(Path(settings.protocol_path))
+        elif settings.protocol_path:
+            missing = (
+                "no worksheet selected" if not settings.protocol_sheet
+                else "no result columns in this worksheet" if settings.layout() is None or not settings.protocol_results
+                else "no stored plan rows"
+            )
+            self._log(f"The workbook is not updated this session ({missing}); results stay in the log and the manifests.", "error")
+        rows = len(settings.rows()) or len({task.row for task in plan.tasks})
+        windows = len(plan.tasks)
+        passes = "until stopped" if schedule.repeat == 0 else f"{schedule.repeat} pass(es)"
         self._log(
-            f"Session started: {len(plan.tasks)} capture(s) per round, {len(session.rounds)} round(s), "
-            f"wait {format_seconds(settings.wait_s)} after each confirmed capture. {schedule.describe()} — "
-            f"{session.timezone_label}."
+            f"Started: {rows} protocol row(s)"
+            + (f" recorded as {windows} capture(s) per pass" if windows != rows else "")
+            + f", wait {format_seconds(settings.wait_s)} between recordings, {passes}. {schedule.describe()}."
+            + (f" Sensor: {session.sensor.get('name') or session.sensor.get('model')} {session.sensor.get('serial')}".rstrip() + "." if session.sensor.get("model") else "")
         )
         self._save()
         self._timer.start()
         self._tick()
         return None
+
+    def _cap_rounds(self, rounds: list[RoundRecord], schedule: Schedule) -> list[RoundRecord]:
+        """Timed schedules: keep at most `schedule.repeat` passes when a count above one is set.
+
+        0 and 1 mean "every listed time" (a daily schedule then runs until it
+        is stopped or its end date passes).
+        """
+        if schedule.repeat <= 1:
+            return rounds
+        return rounds[: schedule.repeat]
+
+    def _extend_schedule(self, now: datetime) -> None:
+        """Materialise further daily rounds as the horizon moves (bounded by the repeat count)."""
+        session = self.session
+        if session is None or session.schedule.mode != MODE_TIMES or not session.schedule.daily:
+            return
+        if session.schedule.repeat > 1 and len(session.rounds) >= session.schedule.repeat:
+            return
+        before = len(session.rounds)
+        extended = materialise_rounds(
+            session.schedule, session.rounds, campaign=session.settings.campaign, tasks_total=len(session.plan.tasks), now=now
+        )
+        session.rounds = self._cap_rounds(extended, session.schedule)
+        if len(session.rounds) != before:
+            self._save()
+
+    def _next_pass_after(self, now: datetime) -> None:
+        """Run-now mode: queue the next pass after the wait interval (repeat count or until stopped)."""
+        session = self.session
+        if session is None or session.schedule.mode != MODE_NOW:
+            return
+        finished = sum(1 for r in session.rounds if r.finished)
+        if session.schedule.repeat > 0 and finished >= session.schedule.repeat:
+            return
+        from datetime import timedelta
+
+        when = now + timedelta(seconds=max(session.settings.wait_s, 1.0))
+        record = make_round(when, session.settings.campaign, len(session.plan.tasks))
+        if any(r.round_id == record.round_id for r in session.rounds):
+            record.round_id += f"-{finished + 1}"
+        session.rounds.append(record)
+        total = "" if session.schedule.repeat == 0 else f" of {session.schedule.repeat}"
+        self._log(f"Pass {finished} done; pass {finished + 1}{total} starts at {when:%H:%M:%S}.")
 
     def pause(self) -> None:
         if self.state in {S_RUNNING}:
@@ -670,7 +830,8 @@ class CellularRunner(QObject):
             return
         self._drain_downloads()
         self._refresh_excel_status()
-        self._sync_protocol_results()
+        self._flush_workbook()
+        self._note_sleep_gap()
         if self.state in {S_IDLE, S_DONE, S_INTERRUPTED, S_PAUSED}:
             self._emit_status()
             return
@@ -686,7 +847,9 @@ class CellularRunner(QObject):
                 return
         now = self._clock()
         if self.current_round() is None:
+            self._extend_schedule(now)
             classify_pending(self.session.rounds, now=now, busy=False)
+            self._note_missed_rounds()
             due = next_due(self.session.rounds)
             if due is not None:
                 self._start_round(due, now)
@@ -724,12 +887,12 @@ class CellularRunner(QObject):
         ]
         self.state = S_RUNNING
         late = (record.actual_start_utc - record.scheduled_utc).total_seconds()
-        text = f"Round {record.round_id} started"
+        index = self.session.rounds.index(record) + 1 if record in self.session.rounds else len(self.session.rounds)
+        text = f"Pass {index} started"
         if delayed:
-            text += f" {format_seconds(late)} after its scheduled time (delayed by the previous round)"
+            text += f" {format_seconds(late)} after its scheduled time (the previous pass was still running)"
         self._log(text + f": {len(self.session.plan.tasks)} capture(s).")
         self._save()
-        self._mark_protocol_dirty(record.round_id)
         self._start_next_task()
 
     def _next_queued(self) -> tuple[TaskState, PlannedTask] | None:
@@ -764,6 +927,65 @@ class CellularRunner(QObject):
             self.session.pause_reason = reason
             self._log(reason, "error")
             self._save()
+            return
+        if self._idle_check_pending:
+            return
+        verify = getattr(self.host, "verify_sensor_idle", None)
+        if verify is None:
+            self._submit_task(state, planned)
+            return
+        # The Node keeps the previous remote-recording mission open for a
+        # moment after the stream closes and refuses a new one meanwhile
+        # ("Unable to schedule the command"). Read its mission list first.
+        self._idle_check_pending = True
+        round_id, task_key = state.round_id, state.task_key
+
+        def on_result(ok: bool, detail: str) -> None:
+            self._idle_check_pending = False
+            if self.session is None or self._capture_in_flight:
+                return
+            current = self.session.task_by_key(round_id, task_key)
+            if current is None or current.status != T_QUEUED or self.session.current_round_id != round_id:
+                return
+            if self.state not in {S_RUNNING, S_PAUSE_REQUESTED, S_STOP_REQUESTED}:
+                return
+            if self.state != S_RUNNING:
+                # Pause/Stop arrived while the list was read: honour it now.
+                self._start_next_task()
+                return
+            if not ok:
+                self._idle_retries += 1
+                if self._idle_retries > IDLE_RETRIES:
+                    self.state = S_PAUSED
+                    self.session.pause_reason = (
+                        f"The sensor still lists a remote recording ({detail}). Check the sensor, then Resume."
+                    )
+                    self._log(f"Paused: {self.session.pause_reason}", "error")
+                    self._save()
+                    self._emit_status()
+                    return
+                self._log(
+                    f"The sensor still lists the previous remote recording ({detail}); "
+                    f"the next request waits {IDLE_RETRY_WAIT_S:g} s and the list is read again.",
+                    "error",
+                )
+                self._begin_wait(IDLE_RETRY_WAIT_S)
+                self._emit_status()
+                return
+            self._idle_retries = 0
+            if detail:
+                self._log(f"Sensor idle check: {detail}.")
+            self._submit_task(current, planned)
+
+        try:
+            verify(on_result)
+        except Exception as exc:  # noqa: BLE001 - the check is advisory; the request itself is verified by the files
+            self._idle_check_pending = False
+            self._log(f"Sensor idle check skipped: {exc}")
+            self._submit_task(state, planned)
+
+    def _submit_task(self, state: TaskState, planned: PlannedTask) -> None:
+        if self._capture_in_flight or self.session is None:
             return
         settings = self.session.settings
         request = CaptureRequest(
@@ -801,7 +1023,7 @@ class CellularRunner(QObject):
                 self._log(f"{planned.label()}: not sent ({error}).", "error")
                 self._write_task_manifest(state, planned)
                 self._save()
-                self._mark_protocol_dirty(state.round_id)
+                self._note_row_progress(state, planned)
                 self._after_task(state, planned)
                 return
             # Connection settings or another condition the operator must fix:
@@ -851,7 +1073,7 @@ class CellularRunner(QObject):
         if summary.outcome == OUTCOME_CONFIRMED and summary.parts > 0:
             state.status = T_CONFIRMED
             state.short = summary.short
-            held = f"{summary.held_s:.1f} s" if summary.held_s is not None else "duration not measured"
+            held = f"{summary.held_s:.3f} s" if summary.held_s is not None else "duration not measured"
             self._log(
                 f"{planned.label()}: confirmed, {summary.parts} file(s), {format_bytes(summary.total_bytes)}, {held}"
                 + (" — SHORT capture" if summary.short else "")
@@ -860,7 +1082,7 @@ class CellularRunner(QObject):
             )
             if summary.short:
                 state.notes.append(
-                    f"Short capture: files hold {summary.held_s:.1f} s of {summary.requested_s:g} s requested."
+                    f"Short capture: files hold {summary.held_s:.3f} s of {summary.requested_s:g} s requested."
                 )
             self._queue_excel(state, planned, summary)
             if self.session.settings.auto_download:
@@ -874,6 +1096,49 @@ class CellularRunner(QObject):
                 state.status = T_NOT_SENT
                 state.notes.append(f"Not sent after {state.attempts} attempts: {summary.detail}")
                 self._log(f"{planned.label()}: not sent ({summary.detail}).", "error")
+        elif summary.outcome == OUTCOME_SENSOR_ERROR and failed_before_finished(summary):
+            # The sensor reported an ERROR before "finished" and no file was
+            # confirmed: either it refused the request (no file named - nothing
+            # recorded) or the recording broke off (a partial file may remain,
+            # seen on the Node 100-18: "Collection was modified; enumeration
+            # operation may not execute" 0.2 s into a capture, 58 MB of 251 MB
+            # on the disk). The request is sent once more, after the mission
+            # list confirms the sensor is idle; never on a timer alone.
+            refused = request_refused(summary)
+            partial = ", ".join(summary.sensor_parts)
+            if state.attempts <= NOT_SENT_RETRIES:
+                state.status = T_QUEUED
+                if refused:
+                    state.notes.append(
+                        f"Attempt {state.attempts} refused by the sensor before recording ({summary.detail}); "
+                        "no file was named, so nothing was recorded. Sent once more after the sensor's mission list showed it idle."
+                    )
+                    self._log(
+                        f"{planned.label()}: refused by the sensor before recording ({summary.detail}). "
+                        "No file was named and nothing finished, so nothing was recorded. "
+                        "The sensor's mission list is checked, then the request is sent once more.",
+                        "error",
+                    )
+                else:
+                    state.notes.append(
+                        f"Attempt {state.attempts} broke off with a sensor error ({summary.detail}) before the recording finished; "
+                        f"a partial file ({partial}) may remain on the sensor and is not counted. "
+                        "Sent once more after the sensor's mission list showed it idle."
+                    )
+                    self._log(
+                        f"{planned.label()}: the sensor reported an error before the recording finished ({summary.detail}). "
+                        f"A partial file ({partial}) may remain on the sensor; it is not counted and not deleted. "
+                        "The sensor's mission list is checked, then the request is sent once more.",
+                        "error",
+                    )
+            else:
+                state.status = T_SENSOR_ERROR
+                if refused:
+                    state.notes.append(f"Refused by the sensor {state.attempts} times: {summary.detail}. Not recorded.")
+                    self._log(f"{planned.label()}: refused again by the sensor ({summary.detail}); not recorded.", "error")
+                else:
+                    state.notes.append(f"Sensor error {state.attempts} times before the recording finished: {summary.detail}. Not recorded; partial file(s) {partial} may remain on the sensor.")
+                    self._log(f"{planned.label()}: the sensor reported an error again ({summary.detail}); not recorded.", "error")
         elif summary.outcome == OUTCOME_SENSOR_ERROR:
             state.status = T_SENSOR_ERROR
             state.notes.append(f"Sensor error: {summary.detail}")
@@ -889,7 +1154,10 @@ class CellularRunner(QObject):
         if state.status != T_QUEUED:
             self._write_task_manifest(state, planned)
         self._save()
-        self._mark_protocol_dirty(state.round_id)
+        if state.status == T_CONFIRMED:
+            self._queue_row_result(state.round_id, planned)
+        if state.status != T_QUEUED:
+            self._note_row_progress(state, planned)
         self._drain_downloads()
         self._after_task(state, planned)
 
@@ -943,19 +1211,26 @@ class CellularRunner(QObject):
         else:
             record.status = ROUND_FAILED
         short = sum(1 for t in tasks if t.short)
+        index = self.session.rounds.index(record) + 1 if record in self.session.rounds else len(self.session.rounds)
+        rows_done, rows_total, incomplete = self._row_coverage(record.round_id)
         self._log(
-            f"Round {record.round_id} {record.status}: {record.tasks_confirmed} of {len(tasks)} confirmed"
+            f"Pass {index} {record.status}: {rows_done} of {rows_total} protocol row(s) complete"
+            + (f", {record.tasks_confirmed} of {len(tasks)} capture(s) confirmed" if len(tasks) != rows_total else "")
             + (f", {short} short" if short else "")
             + (f", {record.tasks_uncertain} uncertain" if record.tasks_uncertain else "")
             + (f", {record.tasks_failed} failed" if record.tasks_failed else "")
             + (f", {record.tasks_skipped} not recorded" if record.tasks_skipped else "")
-            + "."
+            + ".",
+            "error" if incomplete else "info",
         )
+        if incomplete:
+            self._log("Incomplete coverage this pass: " + "; ".join(incomplete) + ".", "error")
         self.session.current_round_id = None
         self.state = S_WAITING_SCHEDULE
+        if not stopped:
+            self._next_pass_after(self._clock())
         self._write_handover()
         self._save()
-        self._mark_protocol_dirty(record.round_id)
         self.round_finished.emit(record.round_id)
 
     def _finish_session(self, *, stopped: bool = False) -> None:
@@ -963,9 +1238,12 @@ class CellularRunner(QObject):
         self._timer.stop()
         if self.session is not None:
             pending = sum(1 for item in self._downloads_pending) + len(self._downloads_active)
-            text = "Session stopped." if stopped else "Session complete: no more scheduled rounds."
+            text = "Stopped." if stopped else "Finished: no more passes scheduled."
             if pending:
                 text += f" {pending} download(s) still running; they finish in the background."
+            queued = self._workbook_queue.pending_count() if self._workbook_queue is not None else 0
+            if queued:
+                text += f" {queued} Excel update(s) still pending; they are written when the workbook is free (also after a restart)."
             self._log(text)
             self._write_handover()
         self._save()
@@ -1075,7 +1353,6 @@ class CellularRunner(QObject):
                 if item.get("download_status") == DL_PENDING and not any(entry[2] is item for entry in self._downloads_pending):
                     self._downloads_pending.append((current.task_key, current.round_id, item))
             self._save()
-            self._mark_protocol_dirty(current.round_id)
             self._drain_downloads()
             if self.state == S_DONE and self.background_jobs() == 0:
                 self._write_handover()
@@ -1163,7 +1440,6 @@ class CellularRunner(QObject):
             item["download_status"] = DL_VERIFIED
             self._log(f"Downloaded {name} (size verified).")
             self._after_file_verified(state)
-            self._mark_protocol_dirty(state.round_id)
         self._save()
 
     @Slot(str, str)
@@ -1182,7 +1458,6 @@ class CellularRunner(QObject):
             state.notes.append(f"Download failed for {name}: {detail}")
             self._log(f"Download of {name} failed after {item['attempts']} attempts: {detail}. The file stays on the sensor.", "error")
             self._rewrite_manifest(state)
-            self._mark_protocol_dirty(state.round_id)
         self._save()
 
     @Slot()
@@ -1232,7 +1507,6 @@ class CellularRunner(QObject):
                             self._log(f"{name}: checksum could not be computed.", "error")
                         self._after_file_verified(state)
                         self._save()
-                        self._mark_protocol_dirty(state.round_id)
                         return
 
     @Slot()
@@ -1322,7 +1596,6 @@ class CellularRunner(QObject):
             self._log(f"{label}: quality check did not complete.", "error")
         self._rewrite_manifest(state)
         self._save()
-        self._mark_protocol_dirty(state.round_id)
         self.session_changed.emit()
 
     @Slot()
@@ -1415,7 +1688,7 @@ class CellularRunner(QObject):
             sensor_id=sensor_id,
             record_id=state.record_id or "",
             files=state.files,
-            duration_s=round(duration, 1) if duration is not None else None,
+            duration_s=round(duration, 3) if duration is not None else None,
             local_dir=Path(self._download_dir()),
         )
         state.excel_status = "queued" if queued else "already_logged"
@@ -1453,126 +1726,227 @@ class CellularRunner(QObject):
     # ------------------------------------------------------------------ protocol workbook results
     def protocol_results_enabled(self) -> bool:
         settings = self.session.settings if self.session is not None else None
-        return bool(settings and settings.protocol_results and settings.protocol_path and settings.protocol_sheet)
+        return bool(
+            settings and settings.protocol_results and settings.protocol_path and settings.protocol_sheet
+            and settings.layout() is not None and settings.plan_rows
+        )
 
-    def _mark_protocol_dirty(self, round_id: str | None) -> None:
-        """The round's results sheet must be rewritten (coalesced, one write at a time)."""
-        if not round_id or not self.protocol_results_enabled():
-            return
-        self._protocol_dirty[round_id] = self._protocol_dirty.get(round_id, 0) + 1
-        self._sync_protocol_results()
+    def workbook_queue(self) -> WorkbookQueue:
+        if self._workbook_queue is None:
+            self._workbook_queue = WorkbookQueue(queue_path(self._config_dir))
+        return self._workbook_queue
 
-    def _sync_protocol_results(self) -> None:
-        if self.session is None or self._protocol_writing is not None or not self._protocol_dirty:
+    def _plan_index_for(self, planned: PlannedTask) -> int | None:
+        """Position of the task's protocol row in the stored plan (block 0)."""
+        if self.session is None:
+            return None
+        for index, row in enumerate(self.session.settings.rows()):
+            if row.sheet_row == planned.row:
+                return index
+        return None
+
+    def _row_tasks(self, round_id: str, planned: PlannedTask) -> list[tuple[TaskState, PlannedTask]]:
+        """Every capture (window, repetition) of the task's protocol row in that round."""
+        if self.session is None:
+            return []
+        out: list[tuple[TaskState, PlannedTask]] = []
+        for state in self.session.tasks.get(round_id, []):
+            other = self.session.planned(state.task_key)
+            if other is not None and other.row == planned.row:
+                out.append((state, other))
+        return out
+
+    def row_label(self, planned: PlannedTask) -> str:
+        """'700 MHz DL' — the protocol row as the user names it."""
+        band = planned.band_label or planned.band
+        direction = planned.direction if planned.duplex != "TDD" or planned.direction in {"DL", "UL"} else "TDD"
+        return " ".join(part for part in (band, direction) if part)
+
+    def _queue_row_result(self, round_id: str, planned: PlannedTask) -> None:
+        """Queue the row's result cells (files of all its windows so far, seconds held, start time)."""
+        if not self.protocol_results_enabled() or self.session is None:
             return
-        now = time.monotonic()
-        if now < self._protocol_not_before:
-            # Bound to this object so a timer that outlives the runner is dropped.
-            QTimer.singleShot(int((self._protocol_not_before - now) * 1000) + 50, self, self._sync_protocol_results)
+        index = self._plan_index_for(planned)
+        if index is None:
+            self._log(f"{planned.label()}: its protocol row is not in the stored plan; the workbook is not updated for it.", "error")
             return
-        round_id = next(iter(self._protocol_dirty))
-        version = self._protocol_dirty[round_id]
-        record = self.session.round(round_id)
-        if record is None:
-            self._protocol_dirty.pop(round_id, None)
+        tasks = [state.to_dict() for state, _planned in self._row_tasks(round_id, planned)]
+        result = build_row_result(round_id, index, tasks, sensor=self._sensor_name())
+        if not result.files:
             return
         settings = self.session.settings
-        path = Path(settings.protocol_path)
-        if not path.is_file():
-            self._protocol_dirty.pop(round_id, None)
-            if record.protocol_status != "failed":
-                record.protocol_status = "failed"
-                self._log(f"Protocol workbook not found ({path}); the results sheet for round {round_id} was not written.", "error")
+        layout = settings.layout()
+        if layout is None:
             return
-        mapping = ColumnMapping.from_dict(settings.protocol_mapping) if settings.protocol_mapping else None
-        if mapping is None:
-            self._protocol_dirty.pop(round_id, None)
-            record.protocol_status = "failed"
-            self._log("The session has no column mapping for the protocol workbook; results are not written to it.", "error")
+        self.workbook_queue().enqueue(Path(settings.protocol_path), layout, settings.rows(), result)
+        self._workbook_status = "pending"
+        self._flush_workbook()
+
+    def _row_coverage(self, round_id: str) -> tuple[int, int, list[str]]:
+        """(rows complete, rows in the plan, descriptions of incomplete rows) for one pass."""
+        if self.session is None:
+            return 0, 0, []
+        by_row: dict[int, list[TaskState]] = {}
+        labels: dict[int, str] = {}
+        for state in self.session.tasks.get(round_id, []):
+            planned = self.session.planned(state.task_key)
+            if planned is None:
+                continue
+            by_row.setdefault(planned.row, []).append(state)
+            labels.setdefault(planned.row, self.row_label(planned))
+        complete = 0
+        incomplete: list[str] = []
+        for row, states in by_row.items():
+            confirmed = sum(1 for s in states if s.status == T_CONFIRMED)
+            if confirmed == len(states):
+                complete += 1
+            elif confirmed:
+                incomplete.append(f"{labels[row]} ({confirmed} of {len(states)} windows recorded)")
+            else:
+                incomplete.append(f"{labels[row]} (not recorded)")
+        return complete, len(by_row), incomplete
+
+    def _note_row_progress(self, state: TaskState, planned: PlannedTask) -> None:
+        """Log the row once every one of its captures has ended."""
+        if self.session is None:
             return
-        tasks = {task.task_key: task.to_dict() for task in self.session.tasks.get(round_id, [])}
-        rows = result_rows(
-            [task.to_dict() for task in self.session.plan.tasks],
-            tasks,
-            round_id=round_id,
-            round_finished=record.finished,
-            sensor_text=sensor_text(self.session.sensor or self._sensor_dict()),
-        )
-        sheet_name = record.protocol_sheet or None
-        scheduled_local = record.scheduled_local
-        header_row = settings.protocol_header_row
-        protocol_sheet = settings.protocol_sheet
-        make_backup = not self._protocol_backup_done
-        self._protocol_writing = (round_id, version)
-        # Coalesce bursts (download finished, checksum done, quality done…) into one write every few seconds.
-        self._protocol_not_before = now + 3.0
+        row_tasks = self._row_tasks(state.round_id, planned)
+        if any(s.status in {T_QUEUED} | IN_FLIGHT for s, _p in row_tasks):
+            return
+        confirmed = [s for s, _p in row_tasks if s.status == T_CONFIRMED]
+        total = len(row_tasks)
+        files = sum(len(s.files) for s in confirmed)
+        seconds = sum(float((s.summary or {}).get("held_s") or 0.0) for s in confirmed)
+        label = self.row_label(planned)
+        index = self._plan_index_for(planned)
+        rows_total = len(self.session.settings.rows())
+        position = f"row {index + 1} of {rows_total}" if index is not None and rows_total else label
+        if len(confirmed) == total:
+            windows = f" in {total} sequential windows" if total > 1 else ""
+            self._log(f"{label} ({position}): complete — {files} file(s), {seconds:.3f} s of IQ{windows}.")
+        else:
+            self._log(
+                f"{label} ({position}): incomplete — {len(confirmed)} of {total} windows recorded"
+                + (f", {files} file(s), {seconds:.3f} s of IQ" if confirmed else "")
+                + ". The row keeps the files that were recorded; the missing windows are listed above.",
+                "error",
+            )
+
+    def _flush_workbook(self) -> None:
+        """Write pending row results; one flush at a time, bursts coalesced, retried while busy."""
+        if self._workbook_flushing:
+            self._workbook_flush_again = True
+            return
+        queue = self._workbook_queue
+        if queue is None:
+            # Nothing was queued in this process; a restart may have left results pending.
+            path = queue_path(self._config_dir)
+            if not path.is_file():
+                return
+            queue = self.workbook_queue()
+        if queue.pending_count() == 0:
+            return
+        now = time.monotonic()
+        if now < self._workbook_not_before:
+            QTimer.singleShot(int((self._workbook_not_before - now) * 1000) + 50, self, self._flush_workbook)
+            return
+        self._workbook_flushing = True
+        self._workbook_flush_again = False
+        self._workbook_not_before = now + WORKBOOK_COALESCE_S
+        self._workbook_status = "writing"
 
         def work():
             try:
-                result = sync_round_sheet(
-                    path,
-                    protocol_sheet=protocol_sheet,
-                    header_row=header_row,
-                    mapping=mapping,
-                    sheet_name=sheet_name,
-                    rows=rows,
-                    scheduled_local=scheduled_local,
-                    make_backup=make_backup,
-                )
-                return {"sheet": result.sheet, "created": result.created, "backup": result.backup, "warnings": result.warnings, "rows": result.rows}
-            except ExcelBusyError as exc:
-                return {"busy": str(exc)}
+                return flush_queue(queue)
             except Exception as exc:  # noqa: BLE001 - reported to apply(), never raised across threads
-                return {"error": f"{type(exc).__name__}: {exc}"}
+                report = FlushReport()
+                report.error = f"{type(exc).__name__}: {exc}"
+                report.pending = queue.pending_count()
+                return report
 
         def apply(result) -> None:
-            self._protocol_writing = None
-            if self.session is None:
-                return
-            current = self.session.round(round_id)
-            if isinstance(result, dict) and result.get("sheet"):
-                if current is not None:
-                    current.protocol_sheet = str(result["sheet"])
-                    current.protocol_status = "saved"
-                if result.get("backup"):
-                    self._protocol_backup_done = True
-                    self._log(f"Backup of the protocol workbook written before the first results: {Path(str(result['backup'])).name}.")
-                if result.get("created"):
-                    self._log(f"Results sheet '{result['sheet']}' created in {path.name} for round {round_id} ({result.get('rows', 0)} planned capture(s)); the protocol sheet is unchanged.")
-                for warning in result.get("warnings") or []:
-                    self._log(f"Results sheet '{result['sheet']}': {warning}", "error")
-                self._protocol_busy_logged = False
-                if self._protocol_dirty.get(round_id) == version:
-                    self._protocol_dirty.pop(round_id, None)
-            elif isinstance(result, dict) and result.get("busy"):
-                if current is not None:
-                    current.protocol_status = "deferred"
-                if not self._protocol_busy_logged:
-                    self._log(f"Results sheet deferred: {result['busy']} It is written when the workbook is free; nothing is lost.")
-                    self._protocol_busy_logged = True
-                self._protocol_not_before = time.monotonic() + 15.0
+            self._workbook_flushing = False
+            report = result if isinstance(result, FlushReport) else None
+            if report is None:
+                self._workbook_status = "error"
+                self._workbook_note = "no result"
             else:
-                detail = result.get("error") if isinstance(result, dict) else "no result"
-                if current is not None:
-                    current.protocol_status = "failed"
-                self._protocol_dirty.pop(round_id, None)
-                self._log(
-                    f"Results sheet for round {round_id} could not be written to {path.name}: {detail}. "
-                    "The manifests and the handover summary still hold every result.",
-                    "error",
-                )
-            self._save()
+                for backup in report.backups:
+                    self._log(f"Backup of the protocol workbook written before its first change: {Path(backup).name}.")
+                for round_id, ordinal, first_row in report.blocks_created:
+                    if ordinal == 0:
+                        self._log("Results go into the protocol rows themselves (first pass).")
+                    else:
+                        self._log(f"Pass results appended as a new block of the protocol rows from worksheet row {first_row} (block {ordinal + 1}).")
+                for note in report.notes:
+                    self._log(f"Workbook: {note}", "error" if "not written" in note or "unchanged" in note or "could not" in note else "info")
+                if report.written:
+                    self._log(f"Workbook: {report.written} row(s) updated in the protocol worksheet.")
+                if report.busy:
+                    self._workbook_status = "busy"
+                    self._workbook_note = report.busy
+                    if not self._workbook_busy_logged:
+                        self._log(f"Excel update pending: {report.busy} It is written when the workbook is free; nothing is lost.")
+                        self._workbook_busy_logged = True
+                    self._workbook_not_before = time.monotonic() + WORKBOOK_BUSY_RETRY_S
+                    QTimer.singleShot(int(WORKBOOK_BUSY_RETRY_S * 1000) + 50, self, self._flush_workbook)
+                elif report.error:
+                    self._workbook_status = "error"
+                    if report.error != self._workbook_note:
+                        self._log(f"Excel update failed: {report.error} Tried again every {WORKBOOK_ERROR_RETRY_S:g} s while results are pending.", "error")
+                    self._workbook_note = report.error
+                    self._workbook_not_before = time.monotonic() + WORKBOOK_ERROR_RETRY_S
+                    if report.pending:
+                        QTimer.singleShot(int(WORKBOOK_ERROR_RETRY_S * 1000) + 50, self, self._flush_workbook)
+                else:
+                    self._workbook_busy_logged = False
+                    self._workbook_status = "pending" if report.pending else "saved"
+                    self._workbook_note = ""
             self._emit_status()
             if self.state == S_DONE and self.background_jobs() == 0:
                 self._write_handover()
-            if self._protocol_dirty:
-                self._sync_protocol_results()
+            if self._workbook_flush_again:
+                self._flush_workbook()
 
         runner = getattr(self.host, "_start_job", None)
         if runner is None:
             apply(work())
         else:
             runner(work, apply)
+
+    def workbook_pending(self) -> int:
+        queue = self._workbook_queue
+        if queue is None:
+            path = queue_path(self._config_dir)
+            if not path.is_file():
+                return 0
+            queue = self.workbook_queue()
+        return queue.pending_count()
+
+    # ------------------------------------------------------------------ sleep and missed passes
+    def _note_sleep_gap(self) -> None:
+        now = time.time()
+        last = self._last_tick_wall
+        self._last_tick_wall = now
+        if last and now - last > SLEEP_GAP_S:
+            minutes = int((now - last) // 60)
+            self._log(
+                f"The computer was asleep or the application was frozen for about {minutes} min; "
+                "the schedule is checked again. A pass whose time went by is reported as missed, not run late by itself.",
+                "error",
+            )
+
+    def _note_missed_rounds(self) -> None:
+        if self.session is None:
+            return
+        for record in self.session.rounds:
+            if record.status == ROUND_MISSED and "logged" not in record.note:
+                record.note = (record.note + " (logged)").strip()
+                self._log(
+                    f"Missed pass: the one scheduled for {record.scheduled_local:%d/%m/%Y %H:%M} did not start "
+                    "(the application was closed or the computer asleep). Run it now or skip it from the panel.",
+                    "error",
+                )
 
     # ------------------------------------------------------------------ manifests
     def _write_task_manifest(self, state: TaskState, planned: PlannedTask) -> None:
@@ -1701,8 +2075,11 @@ class CellularRunner(QObject):
                     from .size_estimate import recorded_seconds_from_bytes
 
                     total = sum(size for _path, size in files)
+                    max_rate = (self.session.plan.capability or {}).get("max_sample_rate_hz")
                     try:
-                        held = recorded_seconds_from_bytes(total, planned.bandwidth_hz, len(files))
+                        held = recorded_seconds_from_bytes(
+                            total, planned.bandwidth_hz, len(files), max_rate_hz=int(max_rate) if max_rate else None
+                        )
                     except Exception:
                         held = None
                     state.status = T_CONFIRMED
@@ -1736,11 +2113,11 @@ class CellularRunner(QObject):
                         for item in state.files:
                             self._downloads_pending.append((state.task_key, state.round_id, item))
                     confirmed += 1
+                    self._queue_row_result(state.round_id, planned)
                 else:
                     state.status = T_UNKNOWN
                     state.notes.append(f"Reconciliation after restart found no file for this capture ({note or 'none on the sensor'}).")
                 self._write_task_manifest(state, planned)
-                self._mark_protocol_dirty(state.round_id)
             self._save()
             self._drain_downloads()
             text = f"Reconciled with the sensor: {confirmed} capture(s) confirmed from files, {len(self.uncertain_tasks())} still uncertain."
@@ -1764,6 +2141,9 @@ class CellularRunner(QObject):
             return "No interrupted session."
         if self.uncertain_tasks():
             return "Reconcile or skip the uncertain capture(s) first."
+        mismatch = self.identity_mismatch()
+        if mismatch:
+            return mismatch
         reserve = getattr(self.host, "set_external_owner", None)
         if reserve is not None:
             error = reserve(OWNER)
@@ -1809,7 +2189,6 @@ class CellularRunner(QObject):
         if planned is not None:
             self._write_task_manifest(state, planned)
         self._save()
-        self._mark_protocol_dirty(round_id)
         self._emit_status()
 
     def retry_task(self, round_id: str, task_key: str) -> str | None:
@@ -1838,7 +2217,6 @@ class CellularRunner(QObject):
             self.state = S_RUNNING
             self._timer.start()
         self._save()
-        self._mark_protocol_dirty(round_id)
         self._tick()
         return None
 
@@ -1875,7 +2253,14 @@ class CellularRunner(QObject):
     def status(self) -> dict[str, Any]:
         session = self.session
         if session is None:
-            return {"state": self.state, "text": "No cellular collection.", "active": False}
+            return {
+                "state": self.state,
+                "text": "No cellular collection.",
+                "active": False,
+                "workbook_pending": self.workbook_pending(),
+                "workbook_status": self._workbook_status,
+                "workbook_note": self._workbook_note,
+            }
         tasks = self.current_tasks()
         record = self.current_round()
         done = sum(1 for t in tasks if t.status not in {T_QUEUED} and t.status not in IN_FLIGHT)
@@ -1896,17 +2281,29 @@ class CellularRunner(QObject):
         pending_dl = len(self._downloads_pending) + len(self._downloads_active)
         store = getattr(self.host, "_excel_store", None)
         pending_excel = store.pending_count() if store is not None else 0
-        sheet_round = record or next((r for r in reversed(session.rounds) if r.protocol_sheet or r.protocol_status), None)
         confirmed_total = sum(1 for items in session.tasks.values() for t in items if t.status == T_CONFIRMED)
         failed_total = sum(1 for items in session.tasks.values() for t in items if t.status in {T_FAILED, T_NOT_SENT, T_SENSOR_ERROR})
         uncertain_total = sum(1 for items in session.tasks.values() for t in items if t.status in UNCERTAIN)
-        recording = f"Recording {planned.label()} ({planned.duration_s:g} s)" if planned is not None else ""
+        rows_total = len(session.settings.rows()) or len({t.row for t in session.plan.tasks})
+        row_position = ""
+        if planned is not None:
+            index = self._plan_index_for(planned)
+            if index is None:
+                rows_seen = sorted({t.row for t in session.plan.tasks})
+                index = rows_seen.index(planned.row) if planned.row in rows_seen else None
+            if index is not None and rows_total:
+                row_position = f"row {index + 1} of {rows_total}"
+            if planned.window_count > 1:
+                row_position += (" - " if row_position else "") + f"window {planned.window_index} of {planned.window_count}"
+        recording = " - ".join(part for part in (self.row_label(planned) if planned else "", row_position, "recording") if part) if planned is not None else ""
+        if self._idle_check_pending and not recording:
+            recording = "checking the sensor is idle"
         if self.state == S_WAITING and countdown is not None:
-            text = f"Next capture in {format_seconds(countdown)}"
+            text = f"Next recording in {max(int(round(countdown)), 0)} seconds"
         elif self.state == S_PAUSE_REQUESTED:
-            text = "Pausing after the current capture…" + (f" {recording}" if recording else "")
+            text = "Pausing after this recording" + (f" - {recording}" if recording else "")
         elif self.state == S_STOP_REQUESTED:
-            text = "Stopping after the current capture…" + (f" {recording}" if recording else "")
+            text = "Stopping after this recording" + (f" - {recording}" if recording else "")
         elif recording:
             text = recording
         elif self.state == S_PAUSED:
@@ -1914,20 +2311,25 @@ class CellularRunner(QObject):
         elif self.state == S_PAUSED_BACKLOG:
             text = "Paused: " + (session.pause_reason or "backlog")
         elif self.state == S_WAITING_SCHEDULE:
-            text = f"Next round {upcoming.scheduled_local:%Y-%m-%d %H:%M}" if upcoming else "Waiting for the schedule"
+            if upcoming is not None:
+                seconds = (upcoming.scheduled_utc - now.astimezone(timezone.utc)).total_seconds()
+                text = f"Next pass in {max(int(round(seconds)), 0)} seconds" if seconds < 120 else f"Next pass at {upcoming.scheduled_local:%H:%M}"
+            else:
+                text = "Waiting for the schedule"
         elif self.state == S_INTERRUPTED:
-            text = "Interrupted session: reconcile with the sensor before continuing"
+            text = "Interrupted: check with the sensor before continuing"
         elif self.state == S_DONE:
             # A finished session is not the same as a successful one.
             statuses = [r.status for r in session.rounds]
             if any(s == ROUND_STOPPED for s in statuses):
-                text = "Session stopped"
+                text = "Stopped"
             elif any(s in {ROUND_PARTIAL, ROUND_FAILED} for s in statuses):
-                text = "Session finished with problems"
+                text = "Finished with problems"
             else:
-                text = "Session complete"
+                text = "Finished"
         else:
             text = "Idle"
+        workbook_pending = self.workbook_pending() if self.protocol_results_enabled() or self._workbook_queue is not None else 0
         return {
             "state": self.state,
             "active": self.active(),
@@ -1956,13 +2358,12 @@ class CellularRunner(QObject):
             "uncertain_total": uncertain_total,
             "pause_reason": session.pause_reason,
             "timezone": session.timezone_label,
+            "rows_total": rows_total,
+            "row_position": row_position,
             "protocol_results": self.protocol_results_enabled(),
-            "protocol_sheet": sheet_round.protocol_sheet if sheet_round else "",
-            "protocol_status": (
-                "writing" if self._protocol_writing is not None and sheet_round and self._protocol_writing[0] == sheet_round.round_id
-                else (sheet_round.protocol_status if sheet_round else "")
-            ),
-            "protocol_pending": len(self._protocol_dirty),
+            "workbook_pending": workbook_pending,
+            "workbook_status": self._workbook_status,
+            "workbook_note": self._workbook_note,
         }
 
     def _emit_status(self) -> None:
@@ -1997,8 +2398,34 @@ class CellularRunner(QObject):
             + len(self._checksums)
             + len(self._quality_jobs)
             + len(self._quality_pending)
-            + (1 if self._protocol_writing is not None else 0)
+            + (1 if self._workbook_flushing else 0)
         )
+
+
+def _identity_text(value: Any) -> str:
+    """Model/serial text; the window's '—' placeholder counts as unknown."""
+    text = str(value or "").strip()
+    return "" if text in {"—", "-", "?"} else text
+
+
+def failed_before_finished(summary: CaptureSummary) -> bool:
+    """The sensor reported an error before "finished" and no file was confirmed.
+
+    Nothing of this capture counts (a partial file may remain on the sensor);
+    the sensor's own error ended the mission, so one more attempt after the
+    idle check is not a blind retry of an accepted request.
+    """
+    return (
+        summary.outcome == OUTCOME_SENSOR_ERROR
+        and not summary.sensor_finished
+        and summary.parts == 0
+        and not summary.finalized_paths
+    )
+
+
+def request_refused(summary: CaptureSummary) -> bool:
+    """The sensor rejected the request before recording: no file named, never finished."""
+    return failed_before_finished(summary) and not summary.sensor_parts
 
 
 def _stem_of(path: str) -> str:

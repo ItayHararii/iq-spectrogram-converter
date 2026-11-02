@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from .sftp_client import RemoteEntry, SftpError
+from .sftp_client import RemoteEntry, SftpError, SftpNotFoundError
 from .sftp_paths import candidate_today_directories
 
 STABLE_LISTINGS = 2
@@ -29,20 +29,42 @@ def folders_for_recording(started_at: datetime, now: datetime | None = None) -> 
 
 
 def list_watch_entries(browser, folders: list[str]) -> list[RemoteEntry]:
+    """Files in the recording folders, newest listing wins.
+
+    A folder that does not exist (the date folder before the sensor's first
+    file of the day) is skipped. A folder that cannot be listed for any other
+    reason is a failing session, and when no folder could be listed at all the
+    error is raised so the caller reconnects: a dead SFTP session must not
+    look like an empty folder. (Seen on the Node 100-18: the watch session
+    went silent while a download was running, every listing came back empty,
+    and the recording that was on the disk the whole time was never
+    confirmed.)
+    """
+    alive = getattr(browser, "is_alive", None)
+    if callable(alive) and not alive():
+        raise SftpError("The SFTP session to the sensor is closed.")
     files: list[RemoteEntry] = []
     seen: set[str] = set()
+    failures: list[str] = []
+    listed = 0
     for folder in folders:
         try:
-            if not browser.directory_exists(folder):
-                continue
             entries = browser.listdir(folder)
-        except (SftpError, OSError, AttributeError):
+        except SftpNotFoundError:
             continue
+        except (SftpError, OSError) as exc:
+            failures.append(f"{folder}: {exc}")
+            continue
+        except AttributeError:
+            continue
+        listed += 1
         for entry in entries:
             if entry.is_dir or entry.path in seen:
                 continue
             seen.add(entry.path)
             files.append(entry)
+    if failures and not listed:
+        raise SftpError("Could not list the recording folder: " + "; ".join(failures))
     return files
 
 

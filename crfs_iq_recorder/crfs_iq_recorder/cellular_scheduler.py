@@ -134,16 +134,22 @@ class Schedule:
     tz: ScheduleTimeZone = field(default_factory=ScheduleTimeZone)
     # Daily repetition runs until this date (inclusive) when set.
     daily_until: date | None = None
+    # Passes over the whole protocol. Run now: this many passes back to back
+    # (after the wait interval), 0 = until stopped. Timed schedule: a count
+    # above one caps the number of passes; 0 or 1 = every listed time.
+    repeat: int = 1
 
     def describe(self) -> str:
         if self.mode == MODE_NOW:
-            return "Run now (one round)"
+            passes = "until stopped" if self.repeat == 0 else (f"{self.repeat} passes" if self.repeat > 1 else "one pass")
+            return f"Run now ({passes})"
+        cap = f" ({self.repeat} passes)" if self.repeat > 1 else ""
         times = ", ".join(t.strftime("%H:%M") for t in self.times) or "no times"
         if self.daily:
             until = f" until {self.daily_until.isoformat()}" if self.daily_until else ""
-            return f"Every day at {times}{until}"
+            return f"Every day at {times}{until}{cap}"
         dates = ", ".join(d.isoformat() for d in self.dates) or "no dates"
-        return f"At {times} on {dates}"
+        return f"At {times} on {dates}{cap}"
 
     def occurrences(self, *, after: datetime, horizon_days: int = 14) -> list[datetime]:
         """Aware scheduled starts after `after`, nearest first."""
@@ -186,6 +192,7 @@ class Schedule:
             "daily": self.daily,
             "daily_until": self.daily_until.isoformat() if self.daily_until else None,
             "tz": self.tz.to_dict(),
+            "repeat": self.repeat,
         }
 
     @classmethod
@@ -204,6 +211,10 @@ class Schedule:
             daily_until = date.fromisoformat(str(until)) if until else None
         except ValueError:
             daily_until = None
+        try:
+            repeat = max(int(data.get("repeat", 1) or 0), 0)
+        except (TypeError, ValueError):
+            repeat = 1
         return cls(
             mode=mode if mode in {MODE_NOW, MODE_TIMES} else MODE_NOW,
             times=sorted(set(times)),
@@ -211,6 +222,7 @@ class Schedule:
             daily=bool(data.get("daily", False)),
             tz=ScheduleTimeZone.from_dict(data.get("tz")),
             daily_until=daily_until,
+            repeat=repeat,
         )
 
 

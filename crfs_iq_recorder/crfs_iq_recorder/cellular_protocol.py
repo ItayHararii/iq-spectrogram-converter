@@ -150,6 +150,10 @@ class ProtocolError(ValueError):
     """The workbook or worksheet cannot be read."""
 
 
+class WorkbookUnavailable(ProtocolError):
+    """The file itself cannot be opened right now (locked by another program, drive gone)."""
+
+
 def _mentions_frequency(text: str, nominal_hz: int | None) -> bool:
     """True when the band text already starts with its nominal frequency ("700 MHz (B28)")."""
     if not nominal_hz:
@@ -220,7 +224,13 @@ class ProtocolEntry:
     repeat: int = 1
     extra: dict[str, str] = field(default_factory=dict)
     issues: tuple[Issue, ...] = ()
+    # The row is a recorded result, not an instruction: a row of an appended
+    # results block (same allocation as an earlier row, result cell filled) or
+    # a row whose status column says it is done.
     is_result: bool = False
+    # The row's result cell holds something (a plan row keeps its results from
+    # the first pass; it is still the plan).
+    has_result: bool = False
     duplicate_of: int | None = None
 
     @property
@@ -290,6 +300,7 @@ class ProtocolEntry:
             extra={str(k): str(v) for k, v in (data.get("extra") or {}).items()},
             issues=issues,
             is_result=bool(data.get("is_result", False)),
+            has_result=bool(data.get("has_result", False)),
             duplicate_of=_opt_int(data.get("duplicate_of")),
         )
 
@@ -678,16 +689,29 @@ class ProtocolImport:
         return bool(self.valid_entries()) and not self.errors
 
     def protocol_version(self) -> str:
-        """Short, stable identifier of this exact plan (file, sheet, mapping and rows)."""
+        """Short, stable identifier of the plan: the sheet and the rows to record.
+
+        Only what is recorded counts (row, band, direction, duplex, edges,
+        repeat), so filling the result cells or appending a results block
+        after a pass does not change the version; editing an allocation does.
+        """
         body = json.dumps(
             {
-                "sha": self.workbook_sha256,
                 "sheet": self.worksheet,
-                "mapping": self.mapping.to_dict(),
+                "layout": self.mapping.layout(),
                 "policy": self.duplicate_policy,
                 "entries": [
-                    {k: v for k, v in entry.to_dict().items() if k not in {"issues"}}
-                    for entry in self.entries
+                    {
+                        "row": entry.row,
+                        "band": entry.band,
+                        "nominal_hz": entry.nominal_hz,
+                        "duplex": entry.duplex,
+                        "direction": entry.direction,
+                        "start_hz": entry.start_hz,
+                        "stop_hz": entry.stop_hz,
+                        "repeat": entry.repeat,
+                    }
+                    for entry in self.valid_entries()
                 ],
             },
             sort_keys=True,
@@ -744,9 +768,9 @@ def _load_workbook(path: Path):
     try:
         return load_workbook(path, read_only=True, data_only=True, keep_vba=False)
     except FileNotFoundError as exc:
-        raise ProtocolError(f"Workbook not found: {path}") from exc
+        raise WorkbookUnavailable(f"Workbook not found: {path}") from exc
     except PermissionError as exc:
-        raise ProtocolError(f"Could not open {path.name}: {exc}") from exc
+        raise WorkbookUnavailable(f"Could not open {path.name}: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - openpyxl raises many types for bad files
         raise ProtocolError(f"Could not read {path.name}: {exc}") from exc
 
@@ -978,13 +1002,17 @@ def _entries_from_row(
             channel_bw_hz = None
     result_value = _cell(values, columns, mapping.result)
     status_value = _text(_cell(values, columns, mapping.status))
-    is_result = result_value is not None or status_value.casefold() in _DONE_STATUS
+    has_result = result_value is not None
+    # A status column that says "done" marks a finished result. A filled
+    # result cell alone does not: the first pass fills the plan rows in place,
+    # so they stay the plan; a later row that repeats an earlier allocation
+    # with a result is an appended results block (see _flag_duplicates).
+    is_result = status_value.casefold() in _DONE_STATUS
     if is_result:
-        what = _text(result_value)[:40] if result_value is not None else f"status {status_value!r}"
         issues.append(Issue(
             LEVEL_INFO,
             "result_row",
-            f"Row {row} already holds a recording result ({what}); results are never re-imported as instructions.",
+            f"Row {row} is marked {status_value!r}; results are never re-imported as instructions.",
             row=row,
         ))
     common = dict(
@@ -1000,6 +1028,7 @@ def _entries_from_row(
         repeat=repeat,
         extra={header: _text(_cell(values, columns, header)) for header in mapping.extra if _cell(values, columns, header) is not None},
         is_result=is_result,
+        has_result=has_result,
     )
 
     def make(direction: str, start: int | None, stop: int | None, extra_issues: list[Issue], duplex_value: str) -> ProtocolEntry:
@@ -1120,7 +1149,13 @@ def _reconcile(direction: str, duplex: str, row: int) -> tuple[str, str, list[Is
 
 
 def _flag_duplicates(entries: list[ProtocolEntry]) -> None:
-    """Mark exact duplicates and overlapping allocations of the same direction."""
+    """Mark exact duplicates and overlapping allocations of the same direction.
+
+    A later row that repeats an earlier allocation *and* holds a recording
+    result is a row of an appended results block (an earlier pass of the
+    collection): it is a result, never an instruction, and is reported
+    quietly. A repeat without a result is a duplicated template row.
+    """
     seen: dict[tuple[str, int, int], int] = {}
     ordered = [entry for entry in entries if entry.ok and entry.start_hz is not None and entry.stop_hz is not None]
     for index, entry in enumerate(entries):
@@ -1131,6 +1166,19 @@ def _flag_duplicates(entries: list[ProtocolEntry]) -> None:
         duplicate_of = None
         if key in seen:
             duplicate_of = seen[key]
+            if entry.has_result:
+                entries[index] = replace(
+                    entry,
+                    issues=entry.issues + (Issue(
+                        LEVEL_INFO, "result_block",
+                        f"Row {entry.row} repeats row {duplicate_of} with a recording result (an earlier pass); "
+                        "it is a result, not an instruction.",
+                        row=entry.row,
+                    ),),
+                    is_result=True,
+                    duplicate_of=duplicate_of,
+                )
+                continue
             extra.append(Issue(
                 LEVEL_WARNING, "duplicate",
                 f"Same {entry.direction} range as row {duplicate_of}. Treated as a duplicated template row and "

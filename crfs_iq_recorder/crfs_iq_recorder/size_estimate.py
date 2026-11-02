@@ -48,17 +48,20 @@ def _positive_decimal(value, *, name: str) -> Decimal:
     return number
 
 
-def iq_sample_rate_hz(bandwidth_hz: int | Decimal) -> int:
+def iq_sample_rate_hz(bandwidth_hz: int | Decimal, *, max_rate_hz: int | None = None) -> int:
     """Complex sample rate the Node uses for a requested bandwidth.
 
     125 MS/s / 2^k, the smallest value that is >= 1.25 × bandwidth, capped at
-    62.5 MS/s (so anything above 50 MHz is recorded at 62.5 MS/s).
+    `max_rate_hz`: 62.5 MS/s on the Node 40-8 (so anything above 50 MHz is
+    recorded at 62.5 MS/s), 125 MS/s on the Node 100-x.
     Verified on hardware: 1 MHz -> 1.953125, 5 and 6 MHz -> 7.8125,
-    8/10/12.5 MHz -> 15.625, 20/21 MHz -> 31.25, 30-60 MHz -> 62.5 MS/s.
+    8/10/12.5 MHz -> 15.625, 20/21 MHz -> 31.25, 30-60 MHz -> 62.5 MS/s on the
+    Node 40-8; 20/25 MHz -> 31.25, 50 MHz -> 62.5, 100 MHz -> 125 MS/s on the
+    Node 100-18.
     """
     bw = _positive_decimal(bandwidth_hz, name="Bandwidth")
     needed = bw * MIN_RATE_OVER_BANDWIDTH
-    rate = MAX_IQ_SAMPLE_RATE_HZ
+    rate = int(max_rate_hz or MAX_IQ_SAMPLE_RATE_HZ)
     while rate % 2 == 0 and Decimal(rate // 2) >= needed:
         rate //= 2
     return int(rate)
@@ -78,11 +81,16 @@ class WaveSizeModel:
         return Decimal(self.total_bytes) / Decimal(1_000_000)
 
 
-def wave_size_model(bandwidth_hz: int | Decimal, recorded_time_seconds: Decimal | float | str) -> WaveSizeModel:
+def wave_size_model(
+    bandwidth_hz: int | Decimal,
+    recorded_time_seconds: Decimal | float | str,
+    *,
+    max_rate_hz: int | None = None,
+) -> WaveSizeModel:
     """Expected on-disk size of a WAVE recording, all split parts combined."""
     bw = _positive_decimal(bandwidth_hz, name="Bandwidth")
     seconds = _positive_decimal(recorded_time_seconds, name="Recorded time")
-    rate = iq_sample_rate_hz(bw)
+    rate = iq_sample_rate_hz(bw, max_rate_hz=max_rate_hz)
     frames = (Decimal(rate) * seconds * (Decimal(1) + WAVE_EXTRA_TIME_RATIO)).to_integral_value(rounding=ROUND_CEILING)
     payload = int(frames) * DATASHEET_BYTES_PER_COMPLEX_SAMPLE
     parts = max(1, -(-payload // WAVE_PART_PAYLOAD_BYTES))
@@ -101,9 +109,15 @@ def estimated_size_mb(bandwidth_hz: int | Decimal, recorded_time_seconds: Decima
     return wave_size_model(bandwidth_hz, recorded_time_seconds).megabytes
 
 
-def recorded_seconds_from_bytes(total_bytes: int, bandwidth_hz: int | Decimal, parts: int = 1) -> float:
+def recorded_seconds_from_bytes(
+    total_bytes: int,
+    bandwidth_hz: int | Decimal,
+    parts: int = 1,
+    *,
+    max_rate_hz: int | None = None,
+) -> float:
     """How many seconds of IQ a set of WAVE parts holds, from their combined size."""
-    rate = iq_sample_rate_hz(bandwidth_hz)
+    rate = iq_sample_rate_hz(bandwidth_hz, max_rate_hz=max_rate_hz)
     payload = max(int(total_bytes) - max(int(parts), 1) * WAVE_HEADER_BYTES, 0)
     return payload / float(DATASHEET_BYTES_PER_COMPLEX_SAMPLE * rate)
 

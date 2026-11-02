@@ -152,6 +152,12 @@ _SSE_ERROR_LEVELS = {"ERROR", "FATAL", "CRITICAL"}
 # Noise the Node repeats several times a second; not worth a log line each.
 _SSE_IGNORED_MESSAGE_FRAGMENTS = ("gps reference",)
 _MAX_STREAM_EVENTS = 2000
+# Distinct sensor messages kept per recording; repeats are counted, not stored.
+_MAX_DISTINCT_MESSAGES = 50
+
+
+def _with_repeat_count(line: str, count: int) -> str:
+    return f"{line} (×{count})" if count > 1 else line
 
 
 @dataclass
@@ -197,6 +203,9 @@ class HttpOutcome:
     sensor_file_dir: str = ""
     sensor_task_id: str = ""
     sensor_messages: list[str] = field(default_factory=list)
+    # First ERROR-level message of the stream, if any. Set even when the sensor
+    # had already reported the recording finished (then `kind` stays "accepted").
+    sensor_error: str = ""
 
     def summary(self) -> str:
         parts = [self.title]
@@ -816,8 +825,13 @@ class EmpClient:
         parts: list[str] = []
         file_dir = ""
         task_echo = ""
+        # Distinct messages in order of first appearance, with a repeat count:
+        # the Node 100-18 repeats "Using internal clock because of ncpd.conf
+        # settings" several times a second, which used to fill the 50-message
+        # window and hide the error that actually ended the stream.
         messages: list[str] = []
-        state = {"finished": False, "error": False}
+        repeats: dict[str, int] = {}
+        state = {"finished": False, "error": False, "error_text": ""}
 
         def _watch(event: SseEvent) -> bool:
             nonlocal file_dir, task_echo
@@ -835,13 +849,19 @@ class EmpClient:
                     continue
                 text = redact_text(str(item.get("message", "")))
                 level = str(item.get("level", "")).upper()
-                if len(messages) < 50:
-                    messages.append(f"{level}: {text}" if level else text)
+                line = f"{level}: {text}" if level else text
+                if line in repeats:
+                    repeats[line] += 1
+                elif len(messages) < _MAX_DISTINCT_MESSAGES:
+                    messages.append(line)
+                    repeats[line] = 1
                 if sse_message_is_finished(item):
                     state["finished"] = True
                     stop = stop or stop_on_finished
                 elif sse_message_is_error(item):
                     state["error"] = True
+                    if not state["error_text"]:
+                        state["error_text"] = line
                     stop = True
             if on_event is not None:
                 try:
@@ -941,10 +961,11 @@ class EmpClient:
                 url=url,
                 finished=state["finished"],
                 error=state["error"],
+                error_text=str(state["error_text"]),
                 parts=parts,
                 file_dir=file_dir,
                 task_echo=task_echo,
-                messages=messages,
+                messages=[_with_repeat_count(line, repeats.get(line, 1)) for line in messages],
             )
 
         non_json_note = ""
@@ -1012,12 +1033,14 @@ class EmpClient:
         url: str,
         finished: bool,
         error: bool,
+        error_text: str = "",
         parts: list[str],
         file_dir: str,
         task_echo: str,
         messages: list[str],
     ) -> HttpOutcome:
         shown_url = redact_url(raw.url or url)
+        error_line = error_text or (messages[-1] if messages else "The sensor reported an error.")
         common = dict(
             status_code=raw.status_code,
             url=shown_url,
@@ -1032,27 +1055,37 @@ class EmpClient:
             sensor_file_dir=file_dir,
             sensor_task_id=task_echo,
             sensor_messages=list(messages),
+            sensor_error=error_line if error else "",
         )
-        if error:
-            last = messages[-1] if messages else "The sensor reported an error."
+        if error and not finished:
             return HttpOutcome(
                 kind="sensor_error",
                 title="Sensor reported an error for this recording",
-                detail=f"POST {shown_url} was accepted (HTTP {raw.status_code}) but the sensor reported: {last}",
+                detail=f"POST {shown_url} was accepted (HTTP {raw.status_code}) but the sensor reported: {error_line}",
                 accepted=False,
                 outcome_unknown=False,
                 **common,
             )
         if finished:
+            # An ERROR that arrives after "Remote recording is now finished" is
+            # about the mission the sensor keeps open while this client holds
+            # the stream (seen on the Node 100-18: "Unable to schedule the
+            # command" about 45 s after the end of the capture), not about the
+            # recording, whose file is already on the disk. It is reported, and
+            # the capture is still confirmed from the files.
             count = len(parts)
             files = f"{count} file(s): {', '.join(parts)}" if parts else "no file names were reported"
+            late = (
+                f" After that the sensor also reported: {error_line}. The recording itself finished before "
+                "this message; it is confirmed from the files." if error else ""
+            )
             return HttpOutcome(
                 kind="accepted",
                 title="Sensor reported the recording finished",
                 detail=(
                     f"POST {shown_url} returned HTTP {raw.status_code} and the sensor's event stream "
                     f"reported 'Remote recording is now finished' ({files}). Files may still be "
-                    "flushing to the sensor disk."
+                    "flushing to the sensor disk." + late
                 ),
                 accepted=True,
                 **common,
@@ -1076,6 +1109,73 @@ class EmpClient:
             outcome_unknown=not raw.stream_ended == STREAM_CANCELLED,
             **common,
         )
+
+
+    # ------------------------------------------------------------------ mission list
+    def list_missions(self, target: ConnectionTarget, password: str, *, timeout_s: float = 6.0) -> MissionList:
+        """Read-only GET of the EMP mission list (the page behind 'EMP Status').
+
+        On RFeye Node firmware 2.25 `/emp/missions` lists every open EMP
+        mission; a remote recording appears as "EMP Remote Recording
+        [Center:… MHz,Span:… MHz]" from the POST until the client that
+        started it disconnects (measured on the Node 40-8: gone within 2 s
+        of the disconnect). Never POSTs.
+        """
+        _ensure_requests()
+        if self.demo:
+            return MissionList(available=True, missions=[], recording=[])
+        try:
+            raw = self._get(target, password, EMP_MISSIONS_PATH, timeout=float(timeout_s or 6.0))
+        except Exception as exc:  # noqa: BLE001 - the caller decides what an unanswered probe means
+            if RequestsConnectionError is not None and isinstance(exc, RequestsConnectionError):
+                reason = connection_failure_reason(exc)
+            else:
+                reason = redact_text(str(exc)) or type(exc).__name__
+            return MissionList(available=False, error=reason)
+        if raw.status_code >= 400:
+            return MissionList(available=False, error=f"HTTP {raw.status_code}")
+        missions = parse_emp_missions(raw.text)
+        return MissionList(available=True, missions=missions, recording=remote_recording_missions(missions))
+
+
+EMP_MISSIONS_PATH = "/emp/missions"
+
+
+@dataclass
+class MissionList:
+    """What the sensor's EMP mission page showed, or why it could not be read."""
+
+    available: bool
+    missions: list[str] = field(default_factory=list)
+    recording: list[str] = field(default_factory=list)
+    error: str = ""
+
+    @property
+    def recording_open(self) -> bool:
+        return bool(self.recording)
+
+
+def parse_emp_missions(html: str) -> list[str]:
+    """Mission texts from the EMP missions fragment ('<div class="item">…</div>' per mission)."""
+    import re
+
+    text = str(html or "")
+    items = re.findall(r"<div[^>]*class=\"[^\"]*\bitem\b[^\"]*\"[^>]*>(.*?)</div>", text, flags=re.IGNORECASE | re.DOTALL)
+    if not items and text.strip():
+        stripped = re.sub(r"<[^>]+>", "\n", text)
+        items = [line for line in stripped.splitlines()]
+    out: list[str] = []
+    for item in items:
+        clean = re.sub(r"<[^>]+>", " ", item)
+        clean = re.sub(r"\s+", " ", clean).strip()
+        if clean:
+            out.append(clean)
+    return out
+
+
+def remote_recording_missions(missions: list[str]) -> list[str]:
+    """The missions that are remote recordings (ours or another client's)."""
+    return [text for text in missions if "remote recording" in text.casefold()]
 
 
 def _payload_duration(payload: dict[str, Any]) -> float:

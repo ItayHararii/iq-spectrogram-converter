@@ -1,20 +1,20 @@
-"""Turn the imported allocations into the exact sequence of captures for one round.
+"""Turn the imported protocol rows into the exact sequence of captures for one round.
 
-Rules (collection task decision of the latest meeting):
+Rules:
 
-* bands in ascending order of nominal frequency, not band number;
-* inside an FDD band every DL allocation (ascending frequency), then every
-  UL allocation; a TDD band has shared allocations, recorded once each and
-  labelled as shared (never duplicated as "DL" and "UL");
-* an allocation wider than the capture window becomes consecutive sub-band
-  windows whose union covers it; the windows are listed, their overlap is
-  stated, and each is a separate capture marked as partial coverage;
-* every capture uses the displayed duration (workbook value, else the
-  campaign fallback) and the wait between captures applies between sub-band
-  windows too.
+* the worksheet is the plan: rows are recorded top to bottom, in the order
+  and with the frequency edges the workbook lists; a TDD row is one shared
+  allocation (never duplicated as "DL" and "UL");
+* every capture uses the duration chosen in the app; the workbook's duration
+  column is a result of an earlier pass, never an instruction;
+* the capture window is what the connected sensor was verified to record
+  complete for that duration; a row wider than the window becomes
+  consecutive windows whose union covers it, each a separate capture of the
+  full duration (sequential coverage, said so before the start), and the wait
+  between captures applies between windows too.
 
 Nothing is combined into a wider capture and no allocation is cropped,
-retuned or resampled: what is recorded is exactly what the preview shows.
+retuned or resampled: what is recorded is exactly what the plan shows.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ from typing import Any
 from .cellular_capabilities import MHZ, SensorCapability, normalise_window_hz
 from .cellular_protocol import (
     DIR_DL,
-    DIR_SHARED,
     DIR_UL,
     DUPLEX_TDD,
     LEVEL_ERROR,
@@ -44,12 +43,12 @@ from .size_estimate import wave_size_model
 DURATION_FROM_WORKBOOK = "workbook"
 DURATION_FROM_CAMPAIGN = "campaign"
 
-_DIRECTION_RANK = {DIR_DL: 0, DIR_UL: 1, DIR_SHARED: 2}
-
 # Time a capture costs beyond its recording duration: request, the sensor's
-# own finalisation and the file confirmation (measured 3-13 s on the Node
-# 40-8 for 2-20 s captures; longer at 62.5 MS/s). Used for the estimate only.
-DEFAULT_OVERHEAD_S = 10.0
+# own finalisation and the file confirmation. Measured 3-13 s on the Node
+# 40-8 for 2-20 s captures; on the Node 100-18 the file reaches the disk at
+# 15-30 MB/s after the capture, so a 625 MB capture settles ~30 s after the
+# POST. Used for the estimate only.
+DEFAULT_OVERHEAD_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -255,34 +254,23 @@ class CellularPlan:
         )
 
 
-def _band_sort_key(entries: list[ProtocolEntry]) -> tuple:
-    first = entries[0]
-    nominal = first.nominal_hz
-    if nominal is None:
-        starts = [entry.start_hz for entry in entries if entry.start_hz is not None]
-        nominal = min(starts) if starts else 0
-        return (1, nominal, first.band.casefold())
-    return (0, nominal, first.band.casefold())
-
-
 def order_entries(entries: list[ProtocolEntry]) -> tuple[list[ProtocolEntry], list[str], list[Issue]]:
-    """Bands by nominal frequency; DL before UL inside a band; shared TDD as listed."""
-    groups: dict[str, list[ProtocolEntry]] = {}
-    for entry in entries:
-        groups.setdefault(entry.band_key, []).append(entry)
+    """Rows in worksheet order, top to bottom: the workbook is the plan.
+
+    Bands are listed in the order they first appear. A TDD band that also
+    has DL/UL rows is flagged, nothing is reordered.
+    """
     issues: list[Issue] = []
-    ordered_groups = sorted(groups.values(), key=_band_sort_key)
-    ordered: list[ProtocolEntry] = []
+    ordered = sorted(entries, key=lambda entry: entry.row)
     band_order: list[str] = []
-    for group in ordered_groups:
+    seen_bands: dict[str, list[ProtocolEntry]] = {}
+    for entry in ordered:
+        group = seen_bands.setdefault(entry.band_key, [])
+        if not group:
+            band_order.append(entry.band_label())
+        group.append(entry)
+    for group in seen_bands.values():
         first = group[0]
-        if first.nominal_hz is None:
-            issues.append(Issue(
-                LEVEL_INFO,
-                "band_order_by_allocation",
-                f"{first.band_label()} has no nominal frequency; it is ordered by its lowest allocation.",
-                row=first.row,
-            ))
         if first.duplex == DUPLEX_TDD and any(entry.direction in {DIR_DL, DIR_UL} for entry in group):
             issues.append(Issue(
                 LEVEL_WARNING,
@@ -290,12 +278,6 @@ def order_entries(entries: list[ProtocolEntry]) -> tuple[list[ProtocolEntry], li
                 f"{first.band_label()} mixes TDD shared and DL/UL rows; check the workbook.",
                 row=first.row,
             ))
-        group_sorted = sorted(
-            group,
-            key=lambda entry: (_DIRECTION_RANK.get(entry.direction, 3), entry.start_hz or 0, entry.row),
-        )
-        ordered.extend(group_sorted)
-        band_order.append(first.band_label())
     return ordered, band_order, issues
 
 
@@ -344,17 +326,37 @@ def build_plan(
     fallback_duration_s: float | None = None,
     edge_margin_hz: int = 0,
 ) -> CellularPlan:
-    """The capture sequence for one round. Problems are reported in `issues`, never fixed silently."""
-    window, window_notes = normalise_window_hz(window_hz or capability.default_window_hz, capability)
+    """The capture sequence for one round. Problems are reported in `issues`, never fixed silently.
+
+    Rows are recorded in worksheet order. The recording duration is the one
+    chosen in the app (`fallback_duration_s`) for every row; a duration column
+    in the workbook is a *result* (the measured seconds of an earlier pass)
+    and is never used as an instruction.
+
+    The capture window is chosen from what the connected sensor was verified
+    to record complete for that duration (`SensorCapability.window_for`);
+    `window_hz` overrides it. A row wider than the window is recorded as
+    sequential windows, each of the full duration.
+    """
+    if fallback_duration_s is not None and not fallback_duration_s > 0:
+        duration_error: Issue | None = Issue(LEVEL_ERROR, "fallback_invalid", "The recording duration must be positive.")
+        fallback_duration_s = None
+    else:
+        duration_error = None
+    if window_hz:
+        window, window_notes = normalise_window_hz(window_hz, capability)
+    else:
+        window, window_notes = normalise_window_hz(capability.window_for(fallback_duration_s or 0.0), capability)
     issues: list[Issue] = [Issue(LEVEL_INFO, "window", note) for note in window_notes]
-    window_note = capability.window_note(window)
+    window_note = capability.window_note(window, fallback_duration_s)
     entries = imported.valid_entries()
     ordered, band_order, order_issues = order_entries(entries)
     issues.extend(order_issues)
     tasks: list[PlannedTask] = []
-    if fallback_duration_s is not None and not fallback_duration_s > 0:
-        issues.append(Issue(LEVEL_ERROR, "fallback_invalid", "The campaign recording duration must be positive."))
-        fallback_duration_s = None
+    if duration_error is not None:
+        issues.append(duration_error)
+    if fallback_duration_s is None and ordered:
+        issues.append(Issue(LEVEL_ERROR, "duration_missing", "Choose the recording duration (seconds) in the app."))
     for entry in ordered:
         if entry.start_hz is None or entry.stop_hz is None:
             continue
@@ -362,18 +364,9 @@ def build_plan(
         if coverage:
             issues.append(Issue(LEVEL_ERROR, "outside_coverage", f"{entry.label()}: {coverage}", row=entry.row))
             continue
-        if entry.duration_s is not None:
-            duration, source = float(entry.duration_s), DURATION_FROM_WORKBOOK
-        elif fallback_duration_s is not None:
-            duration, source = float(fallback_duration_s), DURATION_FROM_CAMPAIGN
-        else:
-            issues.append(Issue(
-                LEVEL_ERROR,
-                "duration_missing",
-                f"{entry.label()}: no recording duration in the workbook and no campaign duration set.",
-                row=entry.row,
-            ))
+        if fallback_duration_s is None:
             continue
+        duration, source = float(fallback_duration_s), DURATION_FROM_CAMPAIGN
         windows = split_windows(entry.start_hz, entry.stop_hz, window, edge_margin_hz=edge_margin_hz)
         if len(windows) > 1:
             overlaps = sorted({w[2] for w in windows[1:]})
@@ -382,15 +375,18 @@ def build_plan(
                 LEVEL_INFO,
                 "expanded",
                 f"{entry.label()} ({(entry.stop_hz - entry.start_hz) / MHZ:g} MHz) is wider than the "
-                f"{window / MHZ:g} MHz capture window: recorded as {len(windows)} sequential windows "
-                f"(overlap {overlap_text}). This is sequential coverage, not a simultaneous full-band capture.",
+                f"{window / MHZ:g} MHz capture window: recorded as {len(windows)} sequential windows of "
+                f"{duration:g} s each (overlap {overlap_text}). This is sequential coverage, not a simultaneous "
+                "full-band capture.",
                 row=entry.row,
             ))
         repetitions = max(int(entry.repeat or 1), 1)
         for repetition in range(1, repetitions + 1):
             for w_index, (w_start, w_stop, overlap) in enumerate(windows, start=1):
                 plan, adjustments = _window_plan(w_start, w_stop)
-                model = wave_size_model(plan.bandwidth_hz, Decimal(str(duration)))
+                model = wave_size_model(
+                    plan.bandwidth_hz, Decimal(str(duration)), max_rate_hz=capability.max_sample_rate_hz
+                )
                 key = f"{entry.entry_id}#w{w_index}of{len(windows)}#r{repetition}"
                 tasks.append(PlannedTask(
                     index=len(tasks),

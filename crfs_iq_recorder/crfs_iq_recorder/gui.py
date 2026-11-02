@@ -145,9 +145,9 @@ from .sensor_storage import (
 )
 from .size_estimate import (
     SizeEstimateError,
-    estimated_size_mb,
     format_estimate,
     recorded_seconds_from_bytes,
+    wave_size_model,
 )
 from .merge_controller import MergeController
 from .sftp_window import SftpWindow, _open_browser
@@ -271,6 +271,7 @@ class MainWindow(QMainWindow):
         self._stream_lost = False
         self._sensor_parts: list[str] = []
         self._sensor_warnings: list[str] = []
+        self._sensor_message_counts: dict[str, int] = {}
         self._expected_bytes = 0
         self._pending_excel_entries: list = []
         self.record_event.connect(self._on_record_event, Qt.ConnectionType.QueuedConnection)
@@ -1680,11 +1681,20 @@ class MainWindow(QMainWindow):
             return
         scan = payload["remote_recording_scans"][0]
         try:
-            mb = estimated_size_mb(scan["bandwidth"], scan["duration"])
+            mb = wave_size_model(scan["bandwidth"], scan["duration"], max_rate_hz=self._sensor_max_rate_hz()).megabytes
             self.size_label.setText(f"Estimate ≈ {format_estimate(mb)}")
         except (SizeEstimateError, ValidationError, KeyError):
             self.size_label.setText("Estimate —")
         self._refresh_class_suggestion()
+
+    def _sensor_max_rate_hz(self) -> int | None:
+        """Highest sample rate of the connected model (125 MS/s on a Node 100-x), None when unknown."""
+        from .cellular_capabilities import capability_for
+
+        model = getattr(getattr(self, "_sensor_info", None), "model", "") or ""
+        if not model:
+            return None
+        return capability_for(model).max_sample_rate_hz
 
     def _set_msg(self, text: str, *, error: bool = False) -> None:
         self.msg.setText(text)
@@ -1962,6 +1972,97 @@ class MainWindow(QMainWindow):
             return f"Could not start the capture: {exc}"
         return None
 
+    def fetch_sensor_identity(self, on_result) -> None:
+        """Read the sensor's identity now (worker) and hand the fresh SensorInfo to `on_result`.
+
+        The sensor behind a host can change between sessions (an R40-8 and a
+        Node 100-18 answered on the same address during QA); features that
+        tie their settings to a sensor model verify it right before they start.
+        The window's own model/serial/firmware labels are updated as well.
+        """
+        host = self._conn.host.strip()
+        if not host and not self._conn.demo:
+            on_result(blank_info(demo=False))
+            return
+        try:
+            target = self._target()
+        except ValidationError:
+            on_result(blank_info(host=host, status="Unavailable"))
+            return
+        client = self._client()
+        password = self._conn.http_password
+
+        def work() -> SensorInfo:
+            return client.fetch_sensor_info(target, password)
+
+        def apply(result: Any) -> None:
+            info = result if isinstance(result, SensorInfo) else blank_info(host=host, status="Unavailable")
+            if self._alive:
+                self._apply_sensor_info(info)
+            on_result(info)
+
+        self._start_job(work, apply)
+
+    def verify_sensor_idle(self, on_result, *, max_wait_s: float = 45.0, poll_s: float = 2.0) -> None:
+        """Check the sensor's EMP mission list before another feature POSTs a recording.
+
+        The Node keeps a remote-recording mission open until the client that
+        started it disconnects, and refuses a new one meanwhile ("ERROR: Unable
+        to schedule the command", seen on the Node 100-18 when the next task
+        was sent 2 s after the previous stream closed). The mission page is
+        polled on a worker (bounded) and `on_result(ok, detail)` is called on
+        the UI thread: ok=True when no remote recording is listed, False when
+        one is still open after `max_wait_s`. When the page cannot be read the
+        caller is told so (ok=True with a detail) and decides on its own settle.
+        """
+        if self._conn.demo:
+            on_result(True, "")
+            return
+        try:
+            target = self._target()
+        except ValidationError as exc:
+            on_result(True, f"mission list not checked: {exc}")
+            return
+        client = self._client()
+        password = self._conn.http_password
+
+        def work() -> dict:
+            import time as _time
+
+            deadline = _time.monotonic() + max(float(max_wait_s), 0.0)
+            waited = 0.0
+            last = None
+            try:
+                while True:
+                    last = client.list_missions(target, password)
+                    if not last.available or not last.recording_open:
+                        break
+                    if _time.monotonic() >= deadline:
+                        break
+                    _time.sleep(max(float(poll_s), 0.5))
+                    waited += max(float(poll_s), 0.5)
+            finally:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            return {"available": last.available, "recording": list(last.recording), "error": last.error, "waited_s": waited}
+
+        def apply(result) -> None:
+            if not isinstance(result, dict):
+                on_result(True, "mission list not checked")
+                return
+            if not result.get("available"):
+                on_result(True, f"mission list not available ({result.get('error') or 'no answer'})")
+                return
+            if result.get("recording"):
+                on_result(False, "; ".join(str(item) for item in result["recording"]))
+                return
+            waited = float(result.get("waited_s") or 0.0)
+            on_result(True, f"waited {waited:.0f} s for the previous mission to close" if waited else "")
+
+        self._start_job(work, apply)
+
     def _emit_capture_summary(self, outcome: str, *, detail: str = "", record=None) -> None:
         """Report the end of the current capture once, to whoever is listening."""
         if self._summary_emitted:
@@ -2132,6 +2233,7 @@ class MainWindow(QMainWindow):
         self._stream_lost = False
         self._sensor_parts = []
         self._sensor_warnings = []
+        self._sensor_message_counts = {}
         self._pending_excel_entries = []
         self._summary_emitted = False
         try:
@@ -2341,13 +2443,17 @@ class MainWindow(QMainWindow):
         # cost ~2.5 s on the Node 40-8 and made the 2 s poll run every 4 s.
         browser = self._watch_browser
 
-        def work() -> tuple[int, object, str, object]:
+        def work() -> tuple[int, object, str, object, str]:
             session = browser
+            note = ""
             if session is not None:
                 try:
-                    return token, list_watch_entries(session, folders), "", session
-                except Exception:
-                    # The sensor may have closed an idle session: reconnect silently.
+                    return token, list_watch_entries(session, folders), "", session, ""
+                except Exception as exc:
+                    # The sensor closed or starved the idle session (seen on the
+                    # Node 100-18 while a download ran): reconnect, and say so
+                    # once, so a blind watch is never mistaken for an empty folder.
+                    note = f"The sensor file listing lost its connection ({exc}); reconnecting."
                     try:
                         session.close()
                     except Exception:
@@ -2355,26 +2461,31 @@ class MainWindow(QMainWindow):
                     session = None
             try:
                 session = _open_browser(state, cancel=cancel)
-                return token, list_watch_entries(session, folders), "", session
+                return token, list_watch_entries(session, folders), "", session, note
             except Exception as exc:
                 if session is not None:
                     try:
                         session.close()
                     except Exception:
                         pass
-                return token, [], str(exc), None
+                return token, [], str(exc), None, note
 
         self._start_job(work, self._show_watch_listing)
 
     def _show_watch_listing(self, result: object) -> None:
         self._watch_in_flight = False
-        if not self._alive or not isinstance(result, tuple) or len(result) not in (3, 4):
+        if not self._alive or not isinstance(result, tuple) or len(result) not in (3, 4, 5):
             return
-        if len(result) == 4:
+        note = ""
+        if len(result) == 5:
+            token, entries, error, session, note = result
+        elif len(result) == 4:
             token, entries, error, session = result
         else:
             token, entries, error = result
             session = None
+        if note and token == self._watch_token and self._record_phase in {FINALIZING, UNKNOWN}:
+            self.log(str(note), level="error")
         if token != self._watch_token:
             if session is not None and session is not self._watch_browser:
                 try:
@@ -2480,7 +2591,9 @@ class MainWindow(QMainWindow):
             # Demo files have made-up sizes; the bytes-to-seconds model is for real Node WAVE files.
             return total, parts, None
         try:
-            return total, parts, recorded_seconds_from_bytes(total, int(record.bandwidth_hz), parts)
+            return total, parts, recorded_seconds_from_bytes(
+                total, int(record.bandwidth_hz), parts, max_rate_hz=self._sensor_max_rate_hz()
+            )
         except Exception:
             return total, parts, None
 
@@ -2557,6 +2670,7 @@ class MainWindow(QMainWindow):
         # once it lands: it belongs to the capture that has just been closed.
         self._watch_token += 1
         self._abort_record_stream()
+        self._log_repeated_sensor_messages()
         record = None
         if self._open_record_id:
             record = next((item for item in load_recordings() if item.id == self._open_record_id), None)
@@ -2810,6 +2924,15 @@ class MainWindow(QMainWindow):
             for name in outcome.sensor_parts:
                 self._note_sensor_part(outcome.sensor_file_dir, name)
             self._mark_sensor_finished()
+            if outcome.sensor_error:
+                # The stream ended on an ERROR that arrived after "finished":
+                # the recording is over and its file is confirmed from the
+                # sensor's folder like any other; the message is kept in the log.
+                self._count_sensor_message(
+                    outcome.sensor_error,
+                    level="error",
+                    suffix=" (after the recording finished; the files decide)",
+                )
             return
         if outcome.stream_ended == "cancelled":
             return
@@ -2863,11 +2986,40 @@ class MainWindow(QMainWindow):
             if sse_message_is_finished(item):
                 self._mark_sensor_finished()
             elif sse_message_is_error(item):
-                self.log(f"Sensor: {text}", level="error")
+                if self._sensor_finished:
+                    # An ERROR after "finished" is about the mission the sensor
+                    # keeps open while this client holds the stream (Node 100-18:
+                    # "Unable to schedule the command" ~45 s after the capture);
+                    # the file is already on the disk and is confirmed from the
+                    # files. Say so once instead of ending the capture.
+                    self._count_sensor_message(text, level="error", suffix=" (after the recording finished; the files decide)")
+                else:
+                    self.log(f"Sensor: {text}", level="error")
             elif text:
+                # The Node 100-18 repeats "Using internal clock because of
+                # ncpd.conf settings" several times a second for the whole
+                # capture. A repeated message is logged once and counted.
                 level = "error" if str(item.get("level", "")).upper() == "WARNING" else "info"
-                self._sensor_warnings.append(text)
-                self.log(f"Sensor: {text}", level=level)
+                # A WARNING is information about the capture (clock source), never a failure.
+                label = "Sensor warning" if level == "error" else "Sensor"
+                self._count_sensor_message(text, level=level, label=label)
+
+    def _count_sensor_message(self, text: str, *, level: str, suffix: str = "", label: str = "Sensor") -> None:
+        """Log a sensor message the first time it is seen; count later repeats."""
+        if not text:
+            return
+        count = self._sensor_message_counts.get(text, 0) + 1
+        self._sensor_message_counts[text] = count
+        if count == 1:
+            self._sensor_warnings.append(text)
+            self.log(f"{label}: {text}{suffix}", level=level)
+
+    def _log_repeated_sensor_messages(self) -> None:
+        """One line per message the sensor repeated during the capture."""
+        repeated = [(text, count) for text, count in self._sensor_message_counts.items() if count > 1]
+        for text, count in repeated:
+            self.log(f"Sensor repeated {count}×: {text}")
+        self._sensor_message_counts = {}
 
     def _mark_sensor_finished(self) -> None:
         """The sensor said its recording task is over (event stream or final outcome).

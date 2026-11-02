@@ -179,7 +179,7 @@ def _pump(qapp, seconds=0.05):
         time.sleep(0.005)
 
 
-def test_run_now_sequence_dl_before_ul_waits_after_confirmation_and_finishes(qapp, tmp_path):
+def test_run_now_sequence_follows_the_worksheet_waits_after_confirmation_and_finishes(qapp, tmp_path):
     host = FakeHost()
     runner = _runner(tmp_path, host)
     plan = _plan(tmp_path)
@@ -189,11 +189,13 @@ def test_run_now_sequence_dl_before_ul_waits_after_confirmation_and_finishes(qap
     assert len(host.requests) == 1
     first = host.requests[0]
     assert first.owner == OWNER and first.excel is False
-    assert first.label.startswith("700 MHz DL 758–768 MHz"), first.label
-    assert first.plan.start_hz == 758 * MHZ and first.plan.end_hz == 768 * MHZ
+    # Worksheet order: the UL row comes first in this sheet.
+    assert first.label.startswith("700 MHz UL 703–713 MHz"), first.label
+    assert first.plan.start_hz == 703 * MHZ and first.plan.end_hz == 713 * MHZ
     assert first.collection_event.startswith("Camp / Site A / Camp_")
     state = runner.current_tasks()[0]
     assert state.status == T_SUBMITTING and state.attempts == 1
+    assert runner.status()["text"] == "700 MHz UL - row 1 of 3 - recording"
     # Nothing else starts while the capture runs.
     runner._tick()
     assert len(host.requests) == 1
@@ -206,17 +208,18 @@ def test_run_now_sequence_dl_before_ul_waits_after_confirmation_and_finishes(qap
     manifest = Path(runner.current_tasks()[0].manifest_path)
     assert manifest.name == "file_000001.cellular.json"
     data = json.loads(manifest.read_text(encoding="utf-8"))
-    assert data["allocation"]["window_start_hz"] == 758 * MHZ
-    assert data["target"]["direction"] == "DL"
+    assert data["allocation"]["window_start_hz"] == 703 * MHZ
+    assert data["target"]["direction"] == "UL"
     assert data["recording"]["outcome"] == "confirmed"
     assert data["identifiers"]["protocol_version"] == plan.protocol_version
     assert data["sensor"]["gnss_status"] == "unknown"
     status = runner.status()
     assert status["countdown_s"] is not None and status["task_done"] == 1 and status["tasks_total"] == 3
+    assert status["text"].startswith("Next recording in ") and status["text"].endswith(" seconds")
     time.sleep(0.25)
     runner._tick()
     assert len(host.requests) == 2
-    assert host.requests[1].label.startswith("700 MHz UL 703–713 MHz")
+    assert host.requests[1].label.startswith("700 MHz DL 758–768 MHz")
     host.finish(host.requests[1])
     _pump(qapp)
     time.sleep(0.25)
@@ -545,7 +548,8 @@ def test_downloads_start_from_a_fresh_listing_that_picks_up_late_files_and_final
     listed files when the sensor cannot be reached."""
     import crfs_iq_recorder.cellular_runner as cr
 
-    monkeypatch.setattr(cr, "FINALIZE_SETTLE_S", 0.05)
+    # Long enough that the "nothing downloaded yet" check below is not a race under load.
+    monkeypatch.setattr(cr, "FINALIZE_SETTLE_S", 0.4)
 
     class Entry:
         def __init__(self, path, size):
@@ -651,6 +655,7 @@ def test_locked_workbook_defers_excel_rows_and_retries_later(qapp, tmp_path, mon
     monkeypatch.setattr(cr, "worksheet_for_task", lambda task, catalog: cr.RESULTS_SHEET)
     runner = _runner(tmp_path, host)
     runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings())
+    runner._timer.stop()  # ticks only when the test says so (the 500 ms tick would retry on its own)
     host.finish(host.requests[0])
     _pump(qapp)
     state = runner.current_tasks()[0]
@@ -676,16 +681,19 @@ def test_connection_loss_during_a_capture_is_uncertain_and_never_resent(qapp, tm
     tasks = runner.current_tasks()
     assert tasks[0].status == T_UNKNOWN and tasks[0].attempts == 1
     assert len(host.requests) == 2, "the next task proceeds; the uncertain one is not resent"
-    assert host.requests[1].label.startswith("700 MHz UL")
+    assert host.requests[1].label.startswith("700 MHz DL")
     manifest = json.loads(Path(tasks[0].manifest_path).read_text(encoding="utf-8"))
     assert manifest["recording"]["outcome"] == "unknown"
     runner.stop()
-    host.finish(host.requests[1], OUTCOME_SENSOR_ERROR, detail="HTTP connection failed")
+    host.finish(host.requests[1], OUTCOME_SENSOR_ERROR, detail="ERROR: Unable to schedule the command")
     _pump(qapp)
     assert runner.state == S_DONE
     record = runner.session.rounds[0]
     assert record.status == ROUND_STOPPED
-    assert (record.tasks_confirmed, record.tasks_uncertain, record.tasks_failed) == (0, 1, 1)
+    # The refusal named no file: nothing was recorded. It would be sent once more after the
+    # idle check, but Stop was requested, so it ends as not recorded (skipped), not failed.
+    assert (record.tasks_confirmed, record.tasks_uncertain, record.tasks_failed, record.tasks_skipped) == (0, 1, 0, 2)
+    assert any("nothing was recorded" in n for n in tasks[1].notes)
     assert len(runner.uncertain_tasks()) == 1, "the uncertain capture stays listed for Reconcile"
 
 
@@ -816,7 +824,7 @@ def test_demo_main_window_runs_a_round_with_downloads_quality_excel_and_blocks_m
         rows = [[c.value for c in r] for r in ws.iter_rows(min_row=2) if any(c.value for c in r)]
         assert len(rows) == 3
         assert all(len(split_iq_filenames(r[8])) == 2 for r in rows)
-        assert rows[0][1] == "Cellular 700 MHz DL" and rows[0][2] == "758 MHz" and rows[0][3] == "768 MHz"
+        assert rows[0][1] == "Cellular 700 MHz UL" and rows[0][2] == "703 MHz" and rows[0][3] == "713 MHz"
         wb.close()
         handovers = list((downloads / "cellular_manifests").glob("handover_*.json"))
         assert handovers, "handover written once downloads and checks finished"
@@ -843,3 +851,348 @@ def test_capture_summary_dict_and_properties():
     assert summary.short and summary.confirmed and not summary.retry_is_safe
     assert summary.as_dict()["held_s"] == 14.1
     assert CaptureSummary(outcome=OUTCOME_NOT_SENT).retry_is_safe
+
+
+# --------------------------------------------------------------------------- 1.10: idle check, refusals, identity
+class IdleHost(FakeHost):
+    """A host whose mission-list check the test answers by hand."""
+
+    def __init__(self):
+        super().__init__()
+        self.idle_callbacks: list = []
+
+    def verify_sensor_idle(self, on_result, **_kwargs):
+        self.idle_callbacks.append(on_result)
+
+    def answer_idle(self, ok, detail=""):
+        callback = self.idle_callbacks.pop(0)
+        callback(ok, detail)
+
+
+def test_every_request_waits_for_the_mission_list_and_a_refusal_is_sent_once_more(qapp, tmp_path):
+    """Node 100-18, 18:44 run: a POST sent 2 s after the previous stream closed was refused
+    ("ERROR: Unable to schedule the command") with no file and no 'finished'. The runner reads
+    the mission list before every request, counts the refusal as not recorded, and re-sends
+    once after the list shows the sensor idle — never on a timer alone."""
+    host = IdleHost()
+    runner = _runner(tmp_path, host)
+    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings())
+    assert host.requests == [] and len(host.idle_callbacks) == 1, "the first request also waits for the list"
+    assert runner.status()["text"] == "checking the sensor is idle"
+    runner._tick()
+    assert len(host.idle_callbacks) == 1, "one check at a time"
+    host.answer_idle(True)
+    assert len(host.requests) == 1
+    first = host.requests[0]
+    host.finish(first, OUTCOME_SENSOR_ERROR, detail="ERROR: Unable to schedule the command")
+    _pump(qapp)
+    task = runner.current_tasks()[0]
+    assert task.status == T_QUEUED and task.attempts == 1
+    assert any("nothing was recorded" in n for n in task.notes)
+    assert len(host.requests) == 1 and len(host.idle_callbacks) == 1, "re-sent only after the list is read again"
+    host.answer_idle(True, "waited 3 s for the previous mission to close")
+    assert len(host.requests) == 2 and task.status == T_SUBMITTING and task.attempts == 2
+    host.finish(host.requests[1], OUTCOME_SENSOR_ERROR, detail="ERROR: Unable to schedule the command")
+    _pump(qapp)
+    assert task.status == T_SENSOR_ERROR, "at most one re-submission"
+    assert any("Not recorded" in n for n in task.notes)
+    # Seen on the Node 100-18 (22:26): the sensor named a file, then reported "ERROR: Collection
+    # was modified; enumeration operation may not execute" 0.2 s in; 58 MB of 251 MB stayed on
+    # the disk. Nothing finished and no file was confirmed: the partial file is named in the
+    # note, not counted, and the request is sent once more after the idle check.
+    host.answer_idle(True)
+    second = host.requests[2]
+    summary = CaptureSummary(
+        outcome=OUTCOME_SENSOR_ERROR, request=second, requested_s=1.0, sensor_parts=["iq_x_0001.wav"],
+        detail="ERROR: Collection was modified; enumeration operation may not execute.",
+    )
+    host.capture_finished.emit(summary)
+    _pump(qapp)
+    broken = runner.current_tasks()[1]
+    assert broken.status == T_QUEUED and broken.attempts == 1
+    assert any("partial file (iq_x_0001.wav)" in n and "not counted" in n for n in broken.notes)
+    assert len(host.requests) == 3, "re-sent only after the mission list is read again"
+    host.answer_idle(True)
+    assert len(host.requests) == 4 and broken.attempts == 2
+    host.finish(host.requests[3], held=1.0, names=["iq_y_0001.wav"])
+    _pump(qapp)
+    assert broken.status == T_CONFIRMED
+    # An error after a file was CONFIRMED is a failed capture with files; never re-sent.
+    host.answer_idle(True)
+    third = host.requests[4]
+    last = runner.current_tasks()[2]
+    host.capture_finished.emit(CaptureSummary(
+        outcome=OUTCOME_SENSOR_ERROR, request=third, requested_s=1.0, parts=1, sensor_parts=["iq_z_0001.wav"],
+        finalized_paths=["/mnt/1/remdata/20261103/iq_z_0001.wav"], detail="FATAL: disk",
+    ))
+    _pump(qapp)
+    assert last.status == T_SENSOR_ERROR and last.attempts == 1
+    assert len(host.requests) == 5, "never re-sent"
+
+
+def test_a_sensor_that_still_lists_a_mission_delays_the_request_then_pauses(qapp, tmp_path):
+    import crfs_iq_recorder.cellular_runner as cr
+
+    host = IdleHost()
+    runner = _runner(tmp_path, host)
+    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings())
+    for attempt in range(cr.IDLE_RETRIES):
+        host.answer_idle(False, "EMP Remote Recording [Center:0.708 GHz,Span:10 MHz]")
+        assert host.requests == [] and runner.state == S_WAITING, attempt
+        runner._wait_deadline = 0.0  # the retry wait elapses
+        runner._tick()
+        assert len(host.idle_callbacks) == 1
+    host.answer_idle(False, "EMP Remote Recording [Center:0.708 GHz,Span:10 MHz]")
+    assert runner.state == S_PAUSED and "still lists a remote recording" in runner.session.pause_reason
+    assert host.requests == []
+    runner.resume()
+    host.answer_idle(True)
+    assert len(host.requests) == 1
+
+
+def test_pause_requested_during_the_idle_check_is_honoured(qapp, tmp_path):
+    host = IdleHost()
+    runner = _runner(tmp_path, host)
+    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings())
+    runner.pause()
+    host.answer_idle(True)
+    assert host.requests == [] and runner.state == S_PAUSED
+    runner.resume()
+    host.answer_idle(True)
+    assert len(host.requests) == 1
+
+
+def test_start_is_refused_when_the_connected_sensor_is_not_the_one_the_plan_was_made_for(qapp, tmp_path):
+    host = FakeHost()  # R40-8, serial SN1
+    runner = _runner(tmp_path, host)
+    settings = _settings(sensor_model="R100-18", sensor_serial="rfeye100400")
+    error = runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), settings)
+    assert error and "CRFS 40-8" in error and "CRFS 100-18" in error and "rfeye100400" in error
+    assert host.owner == "" and runner.session is None
+    assert runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(sensor_model="R40-8", sensor_serial="SN1")) is None
+    assert runner.session.sensor["name"] == "CRFS 40-8"
+
+
+def test_run_now_repeats_passes_after_the_wait_and_until_stopped(qapp, tmp_path):
+    host = FakeHost()
+    base = datetime(2026, 11, 3, 9, 0, tzinfo=timezone.utc)
+    clock = {"now": base}
+    runner = _runner(tmp_path, host, clock=lambda: clock["now"])
+    assert runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW, repeat=2), _settings(wait_s=5.0)) is None
+    for _ in range(3):
+        host.finish(host.requests[-1])
+        _pump(qapp)
+        runner._wait_deadline = 0.0
+        runner._tick()
+    assert runner.session.rounds[0].status == ROUND_DONE
+    assert len(runner.session.rounds) == 2, "a second pass was queued after the first"
+    assert runner.state == S_WAITING_SCHEDULE and runner.status()["text"].startswith("Next pass in ")
+    assert len(host.requests) == 3, "the second pass waits for the interval"
+    clock["now"] = base + timedelta(seconds=6)
+    runner._tick()
+    assert len(host.requests) == 4 and runner.current_round() is runner.session.rounds[1]
+    for _ in range(3):
+        host.finish(host.requests[-1])
+        _pump(qapp)
+        runner._wait_deadline = 0.0
+        runner._tick()
+    runner._tick()
+    assert runner.state == S_DONE and len(runner.session.rounds) == 2, "repeat count reached"
+    # Until stopped: passes keep coming until Stop.
+    host2 = FakeHost()
+    (tmp_path / "b").mkdir(exist_ok=True)
+    runner2 = _runner(tmp_path / "b", host2, clock=lambda: clock["now"])
+    assert runner2.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW, repeat=0), _settings(wait_s=0.0)) is None
+    for _ in range(3):
+        host2.finish(host2.requests[-1])
+        _pump(qapp)
+        runner2._tick()
+    assert len(runner2.session.rounds) == 2 and runner2.state in {S_WAITING_SCHEDULE, S_RUNNING}
+    runner2.stop()
+    assert runner2.state == S_DONE
+
+
+def test_timed_schedule_is_capped_by_the_repeat_count(qapp, tmp_path):
+    host = FakeHost()
+    base = datetime(2026, 11, 3, 7, 0, tzinfo=timezone.utc)
+    runner = _runner(tmp_path, host, clock=lambda: base)
+    schedule = Schedule(
+        mode=MODE_TIMES, daily=True, repeat=3,
+        times=[datetime(2026, 1, 1, 8, 0).time(), datetime(2026, 1, 1, 20, 0).time()],
+        tz=ScheduleTimeZone(kind=TZ_UTC),
+    )
+    assert runner.start_session(_plan(tmp_path), schedule, _settings()) is None
+    assert len(runner.session.rounds) == 3
+    assert "3 passes" in schedule.describe()
+
+
+def test_sleep_gap_and_missed_pass_are_reported_simply(qapp, tmp_path):
+    host = FakeHost()
+    base = datetime(2026, 11, 3, 7, 0, tzinfo=timezone.utc)
+    clock = {"now": base}
+    runner = _runner(tmp_path, host, clock=lambda: clock["now"])
+    logs = []
+    runner.log.connect(lambda m, lvl: logs.append(m))
+    schedule = Schedule(mode=MODE_TIMES, times=[datetime(2026, 1, 1, 8, 0).time()], dates=[base.date()], tz=ScheduleTimeZone(kind=TZ_UTC))
+    runner.start_session(_plan(tmp_path), schedule, _settings())
+    runner._last_tick_wall = time.time() - 600
+    clock["now"] = base + timedelta(hours=3)
+    runner._tick()
+    assert any("asleep" in m for m in logs)
+    assert any("Missed pass" in m and "08:00" in m for m in logs)
+    assert sum(1 for m in logs if "Missed pass" in m) == 1
+    runner._tick()
+    assert sum(1 for m in logs if "Missed pass" in m) == 1, "said once"
+
+
+def _protocol_settings(workbook, **kwargs):
+    from crfs_iq_recorder.cellular_workbook import layout_from_import, plan_rows_from_import
+
+    imported = import_protocol(workbook, "Cellular Protocol")
+    assert not imported.errors
+    layout = layout_from_import(imported)
+    rows = plan_rows_from_import(imported)
+    base = dict(
+        wait_s=0.0, auto_download=False, verify_checksums=False,
+        protocol_path=str(workbook), protocol_sheet="Cellular Protocol", protocol_results=True,
+        protocol_layout=layout.to_dict(), plan_rows=[r.to_dict() for r in rows],
+    )
+    base.update(kwargs)
+    return imported, CampaignSettings(**base)
+
+
+def test_results_land_in_the_protocol_rows_then_in_an_appended_block(qapp, tmp_path, monkeypatch):
+    import crfs_iq_recorder.cellular_runner as cr
+    from openpyxl import load_workbook
+    from test_cellular_workbook import make_workbook
+
+    monkeypatch.setattr(cr, "WORKBOOK_COALESCE_S", 0.02)
+    workbook = make_workbook(
+        tmp_path / "protocol.xlsx",
+        rows=[
+            ("700 MHz (B28)", "DL", "FDD", 753, 773),
+            ("700 MHz (B28)", "UL", "FDD", 698, 718),
+            ("1800 MHz (B3)", "DL", "FDD", 1805, 1825),
+            ("3500 MHz (n78)", "TDD / shared UL-DL", "TDD", 3300, 3450),
+        ],
+    )
+    imported, settings = _protocol_settings(workbook)
+    plan = build_plan(imported, capability_for("R100-18"), fallback_duration_s=2.0)
+    # 2 s on the 100-18 -> 50 MHz windows: three single-window rows and n78 in three windows.
+    assert plan.ready and len(plan.tasks) == 6, [t.label() for t in plan.tasks]
+    host = FakeHost()
+    host._sensor_info = type("Info", (), {"model": "R100-18", "serial": "rfeye100400", "firmware": "2.25"})()
+    runner = _runner(tmp_path, host)
+    logs = []
+    runner.log.connect(lambda m, lvl: logs.append(m))
+    assert runner.start_session(plan, Schedule(mode=MODE_NOW), settings) is None
+    assert runner.protocol_results_enabled()
+    # Row 1 (700 DL): one window, two files, 2.011 s measured.
+    host.finish(host.requests[0], parts=2, held=2.011, names=["iq_20261103_070001_0000.wav", "iq_20261103_070001_0001.wav"])
+    _pump(qapp)
+    assert runner.workbook_pending() == 0, runner.status()
+    wb = load_workbook(workbook)
+    ws = wb["Cellular Protocol"]
+    assert ws["G2"].value == "iq_20261103_070001_0000.wav\niq_20261103_070001_0001.wav"
+    assert ws["H2"].value == pytest.approx(2.011) and ws["H2"].number_format == "0.000"
+    assert isinstance(ws["I2"].value, datetime) and ws["I2"].number_format == "dd/mm/yyyy hh:mm:ss"
+    assert ws["F2"].value == "CRFS 100-18"
+    assert ws["G3"].value is None
+    wb.close()
+    assert any("row 1 of 4): complete" in m for m in logs), logs
+    # Row 2 (700 UL): refused twice -> nothing written, reported as incomplete coverage.
+    host.finish(host.requests[1], OUTCOME_SENSOR_ERROR, detail="ERROR: Unable to schedule the command")
+    _pump(qapp)
+    host.finish(host.requests[2], OUTCOME_SENSOR_ERROR, detail="ERROR: Unable to schedule the command")
+    _pump(qapp)
+    assert any("row 2 of 4): incomplete" in m for m in logs)
+    # Row 3 (1800 DL) one window; row 4 (n78) two of three windows recorded.
+    host.finish(host.requests[3], held=2.0, names=["iq_20261103_070100_0000.wav"])
+    _pump(qapp)
+    n78 = [r for r in host.requests[4:]]
+    host.finish(n78[0], held=2.0, names=["iq_20261103_070200_0000.wav"])
+    _pump(qapp)
+    host.finish(host.requests[5], OUTCOME_UNKNOWN, detail="no file settled")
+    _pump(qapp)
+    host.finish(host.requests[6], held=2.0, names=["iq_20261103_070300_0000.wav"])
+    _pump(qapp)
+    runner._tick()
+    assert runner.state == S_DONE
+    assert _pump_until(qapp, lambda: runner.workbook_pending() == 0 and not runner._workbook_flushing, timeout=5.0), runner.status()
+    wb = load_workbook(workbook)
+    ws = wb["Cellular Protocol"]
+    assert ws["G3"].value is None and ws["H3"].value is None, "a row with nothing recorded stays empty"
+    assert ws["G4"].value == "iq_20261103_070100_0000.wav"
+    assert ws["G5"].value == "iq_20261103_070200_0000.wav\niq_20261103_070300_0000.wav", "windows of one row grouped in its cell"
+    assert ws["H5"].value == pytest.approx(4.0), "seconds of IQ held by the files of both windows"
+    assert ws.max_row == 5 and dict(ws.tables.items()) == {"CellularProtocol": "A1:I5"}
+    wb.close()
+    assert any("Incomplete coverage this pass" in m and "700 MHz" in m and "2 of 3 windows" in m for m in logs), logs
+    assert any("Pass 1 partial: 2 of 4 protocol row(s) complete" in m for m in logs), logs
+    # Second pass (new session, same workbook): appended block, first block untouched.
+    host2 = FakeHost()
+    host2._sensor_info = host._sensor_info
+    (tmp_path / "second").mkdir(exist_ok=True)
+    runner2 = _runner(tmp_path / "second", host2)
+    assert runner2.start_session(plan, Schedule(mode=MODE_NOW), settings) is None
+    host2.finish(host2.requests[0], held=2.5, names=["iq_20261103_120000_0000.wav"])
+    _pump(qapp)
+    assert _pump_until(qapp, lambda: runner2.workbook_pending() == 0 and not runner2._workbook_flushing, timeout=5.0), runner2.status()
+    wb = load_workbook(workbook)
+    ws = wb["Cellular Protocol"]
+    assert ws["G2"].value.startswith("iq_20261103_070001_0000.wav")
+    assert ws["G6"].value == "iq_20261103_120000_0000.wav" and ws["A6"].value == "700 MHz (B28)" and ws["B6"].value == "DL"
+    assert ws["H6"].value == pytest.approx(2.5)
+    assert dict(ws.tables.items()) == {"CellularProtocol": "A1:I9"}
+    wb.close()
+    assert len(list(tmp_path.glob("*.crfs-backup-*"))) == 2, "every session backs the workbook up before its first change"
+    runner2.stop()
+    if runner2.state != S_DONE and host2.requests:
+        host2.finish(host2.requests[-1])
+    _pump(qapp)
+    assert runner2.state == S_DONE
+
+
+def test_pending_workbook_results_survive_a_restart_and_a_locked_file(qapp, tmp_path, monkeypatch):
+    from openpyxl import load_workbook
+    from test_cellular_workbook import make_workbook
+
+    import crfs_iq_recorder.cellular_workbook as cw
+    from crfs_iq_recorder.excel_writer import ExcelBusyError
+
+    workbook = make_workbook(tmp_path / "protocol.xlsx")
+    imported, settings = _protocol_settings(workbook)
+    plan = build_plan(imported, capability_for("R40-8"), fallback_duration_s=1.0)
+    host = FakeHost()
+    runner = _runner(tmp_path, host)
+    logs = []
+    runner.log.connect(lambda m, lvl: logs.append(m))
+
+    def locked(*_a, **_k):
+        raise ExcelBusyError("protocol.xlsx is open in another program")
+
+    monkeypatch.setattr(cw, "write_results_openpyxl", locked)
+    runner.start_session(plan, Schedule(mode=MODE_NOW), settings)
+    host.finish(host.requests[0], held=1.0, names=["iq_20261103_080000_0000.wav"])
+    _pump(qapp)
+    assert runner.workbook_pending() == 1
+    status = runner.status()
+    assert status["workbook_pending"] == 1 and status["workbook_status"] == "busy"
+    assert any("Excel update pending" in m for m in logs)
+    assert load_workbook(workbook)["Cellular Protocol"]["G2"].value is None
+    runner.shutdown()
+    # Restart with the workbook free: the queued result is written, once.
+    monkeypatch.undo()
+    host2 = FakeHost()
+    runner2 = _runner(tmp_path, host2)
+    assert runner2.workbook_pending() == 1
+    assert runner2.status()["workbook_pending"] == 1, "the pending indicator shows before anything is started"
+    # The runner flushes on its own shortly after start-up (no user action needed).
+    assert _pump_until(qapp, lambda: runner2.workbook_pending() == 0 and not runner2._workbook_flushing, timeout=6.0)
+    wb = load_workbook(workbook)
+    assert wb["Cellular Protocol"]["G2"].value == "iq_20261103_080000_0000.wav"
+    assert wb["Cellular Protocol"]["H2"].value == 1.0
+    wb.close()
+    runner2._flush_workbook()
+    assert runner2.workbook_pending() == 0
+    assert len(list(tmp_path.glob("*.crfs-backup-*"))) == 1, "one backup before the first change"
