@@ -57,6 +57,17 @@ The sensor writes one WAVE file per 500 MB (see [Why the sensor splits recording
 
 Measured on an RFeye Node 40-8 (firmware 2.25) and checked against the RFeye Site user guide: the Node's recording service writes IQ to `/mnt/1/remdata/{date}/file_{time}_{n:4}` with `filesize: 500MB` (`/etc/node/ncpd/ncpd.conf`, storage section; the factory default is `iq_{date}_{time}_{n:4}` with 100 MB). `filesize` is "the maximum size of a file": the Node closes a part after 1023 blocks of 512,000 bytes (523,776,000 bytes of IQ) and opens the next number, whatever the sample rate. At 31.25 MS/s (25 MHz bandwidth) that is 4.19 s per part; at 62.5 MS/s, 2.1 s. The `duration`/`rate`/`capture_length` request values do not cause the split; the app sends the same number of seconds for all three, and the parts' `signaltime` stamps are contiguous to within 1 ms, so a split recording is one continuous capture. The limit is set on the Node, not in this app; the app does not change it. See the QA report for the per-part measurements.
 
+## Cellular Collection
+
+Records every allocation of a cellular protocol workbook in a fixed order (bands by nominal frequency, downlink before uplink within each FDD band, TDD bands once), with a configurable wait between captures, once or at selected times of day. The panel sits under **Merge recording parts** in the main window and reuses the normal recording, SFTP download, Excel and merge paths; while a collection runs the manual **Start Recording** is held, and the other way round.
+
+- The workbook is read by column headers (band, direction, start/stop frequencies, optional duration; Hz/kHz/MHz/GHz understood). Invalid rows are listed and block the plan; rows that already carry results are never recorded again; the imported protocol is snapshotted, so edits to the workbook do not change a running session.
+- Allocations wider than the capture window (20 MHz by default) are recorded as consecutive sub-band windows that are listed before the run; this is sequential coverage, not a simultaneous full-band capture, and nothing is cropped, retuned or resampled silently.
+- Every capture gets a `<recording>.cellular.json` manifest beside its parts; a session ends with a handover summary (`cellular_manifests\handover_*.json` / `.md`). With Excel logging on, captures are added to the collection workbook (class sheet or a **Cellular Results** sheet). Nothing is uploaded and no recording is deleted automatically.
+- Interrupted sessions are shown on the next start with their uncertain captures; **Reconcile with sensor** checks the sensor's files before anything is resent. Missed scheduled rounds are listed to run or skip; they never start on their own at a different hour.
+
+Operator steps are in the [Quick Start](docs/confluence/CRFS_IQ_Recorder_Quick_Start.md); the design is in [Cellular Collection](docs/CELLULAR_COLLECTION.md).
+
 ## Log recordings to Excel
 
 Use this for field collection into an existing `.xlsm` workbook (macros stay in the file).
@@ -133,6 +144,7 @@ Click a WAVE file for a short spectrogram preview of the start of the file (I le
 
 - [Architecture](docs/ARCHITECTURE.md) - components, recording flow, threads, persistence, and Converter hand-off
 - [Distribution](docs/DISTRIBUTION.md) - SmartScreen / Smart App Control / WDAC analysis, code signing, installer, IT guidance
+- [Cellular Collection](docs/CELLULAR_COLLECTION.md) - protocol import, sequencing, scheduling, recovery, manifests (developer report)
 - [Quick Start](docs/confluence/CRFS_IQ_Recorder_Quick_Start.md)
 
 ## Tests

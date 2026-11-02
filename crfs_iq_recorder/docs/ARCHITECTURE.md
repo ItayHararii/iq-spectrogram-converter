@@ -1,7 +1,7 @@
 # CRFS IQ Recorder - architecture
 
-**Version documented:** 1.8.10
-**Code:** `crfs_iq_recorder/` as of this file (21 September 2026)
+**Version documented:** 1.9.0
+**Code:** `crfs_iq_recorder/` as of this file (2 November 2026)
 **Related app:** IQ Spectrogram Converter (`iq_gui.py`, `iq_data.py`) at the repository root
 
 This note describes how the software works today. Items we could not prove from source or from a published CRFS EMP schema are listed under [Unverified](#unverified). Ideas for later work are in [Proposed improvements](#proposed-improvements) and are not current behavior.
@@ -114,6 +114,16 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | File watch | Stable SFTP size for every recording's parts, including the parts the sensor named in its EMP stream (1.8.10: always on, not only with Excel or Repeat) | `file_watch.py` |
 | Merge engine | Parse RIFF/RF64 parts and the CRFS `meta` chunk, check format/tuning/numbering/continuity, chunked byte-exact concatenation to RIFF or RF64, JSON sidecar (1.8.10) | `iq_merge.py` |
 | Merge controller | Toggle state, queue, one worker thread, dedupe via `merge_history.json` and sidecars, cancel, `.partial` sweep on start (1.8.10) | `merge_controller.py` |
+| Programmatic capture | `MainWindow.start_capture(CaptureRequest)` drives the same Start path as the button; `capture_finished(CaptureSummary)` reports confirmed / unknown / not_sent / sensor_error / failed; an external owner blocks manual Start and the series (1.9.0) | `capture_api.py`, `gui.py` |
+| Cellular protocol import | Excel workbook/worksheet by headers (DL/UL rows or paired DL/UL columns), unit parsing, validation, duplicates/overlaps, result rows never reimported, versioned snapshot (1.9.0) | `cellular_protocol.py` |
+| Sensor capability | Model window (20 MHz conservative), IBW vs sustained limit kept apart, sub-band split without gaps (1.9.0) | `cellular_capabilities.py` |
+| Cellular plan | Bands by nominal frequency, DL before UL, TDD once, sub-band windows, per-task storage estimate (1.9.0) | `cellular_plan.py` |
+| Cellular schedule | Run now / times of day / dates / daily; explicit time zone, UTC stored; round IDs; delayed and missed rounds (1.9.0) | `cellular_scheduler.py` |
+| Cellular runner | QObject controller: one capture at a time, wait after confirmed finalization, Pause/Resume/Stop, task states, persisted session, restart reconciliation, bounded download queue, Excel deferral (1.9.0) | `cellular_runner.py` |
+| Cellular manifests | Versioned JSON manifest beside each logical capture; session handover JSON + Markdown with counts kept apart (1.9.0) | `cellular_manifest.py` |
+| Cellular Excel | Rows through the existing persistent queue; `Cellular Results` sheet when the workbook has no matching class (1.9.0) | `cellular_excel.py` |
+| Cellular quality | Pre-run checks, post-download WAV validation sampling begin/middle/end, sampled preview PNG, coverage summary (1.9.0) | `cellular_quality.py` |
+| Cellular panel | Collapsible panel in the recording card; mapping, plan preview and coverage dialogs; site profiles (1.9.0) | `cellular_panel.py`, `cellular_reference.py` |
 | Sensor Files window | Listing, sort, groups, download, delete, waterfall | `sftp_window.py` |
 | SFTP backend | One listing thread and one SSH session for browse/delete | `sftp_window.py` (`SftpBackend`) |
 | SFTP client | Paramiko connect (8 s), read (20 s), download via `.part` | `sftp_client.py`, `download_util.py` |

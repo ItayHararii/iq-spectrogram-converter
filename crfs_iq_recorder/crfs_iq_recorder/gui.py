@@ -43,6 +43,18 @@ from PySide6.QtWidgets import (
 
 from . import APP_NAME, __version__
 from .api_client import EmpClient, HttpOutcome
+from .cellular_panel import CellularPanel
+from .cellular_runner import CellularRunner
+from .capture_api import (
+    OUTCOME_BUSY,
+    OUTCOME_CONFIRMED,
+    OUTCOME_FAILED,
+    OUTCOME_NOT_SENT,
+    OUTCOME_SENSOR_ERROR,
+    OUTCOME_UNKNOWN,
+    CaptureRequest,
+    CaptureSummary,
+)
 from .class_match import suggest_class
 from .collection_catalog import preferred_event, load_workbook_catalog
 from .connection_dialog import ConnectionDialog
@@ -219,6 +231,10 @@ def app_icon() -> QIcon:
 class MainWindow(QMainWindow):
     # Events from the sensor's EMP stream, emitted on the HTTP worker thread.
     record_event = Signal(object)
+    # A capture ended (confirmed, unknown, not sent, sensor error or failed).
+    # Carries a capture_api.CaptureSummary; emitted on the UI thread for every
+    # capture, manual or programmatic, exactly once.
+    capture_finished = Signal(object)
 
     def __init__(self, *, demo: bool = False) -> None:
         super().__init__()
@@ -228,6 +244,13 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(icon)
 
         self._demo_forced = demo
+        # Programmatic captures (Cellular Collection): the request being run,
+        # and the feature that holds the sensor between its captures so the
+        # manual Start button and the repeat series stay out of its way.
+        self._external_capture: CaptureRequest | None = None
+        self._external_owner: str = ""
+        self._summary_emitted = False
+        self._sent_recording_format = ""
         self._jobs: list[tuple[QThread, Worker]] = []
         self._alive = True
         self._sensor_info = blank_info(demo=demo)
@@ -313,6 +336,14 @@ class MainWindow(QMainWindow):
         self._conn = ConnectionState.from_settings(load_settings(), demo=demo)
         self._plan = self._conn.frequency_plan()
         self._merge.enabled = bool(self._conn.merge_parts)
+        # Cellular Collection drives captures through start_capture()/capture_finished
+        # and keeps its own session state under the user config folder.
+        self._cellular = CellularRunner(
+            self,
+            config_dir=user_config_dir(),
+            download_dir=lambda: resolved_download_dir(self._conn.download_dir),
+            parent=self,
+        )
 
         central = QWidget()
         central.setObjectName("central")
@@ -657,6 +688,9 @@ class MainWindow(QMainWindow):
         self.merge_progress.setRange(0, 100)
         self.merge_progress.setVisible(False)
         layout.addWidget(self.merge_progress)
+
+        self.cellular_panel = CellularPanel(self._cellular, host=self, config_dir=user_config_dir())
+        layout.addWidget(self.cellular_panel)
         layout.addStretch(1)
 
         scroll = QScrollArea()
@@ -868,6 +902,13 @@ class MainWindow(QMainWindow):
         self._alive = False
         self._capture_session_into_conn()
         save_settings(self._conn.persistable())
+        if hasattr(self, "cellular_panel"):
+            try:
+                self.cellular_panel.persist()
+            except Exception:  # noqa: BLE001 - closing must not fail on settings
+                pass
+        if hasattr(self, "_cellular"):
+            self._cellular.shutdown()
         self._record_timer.stop()
         self._watch_timer.stop()
         self._wait_timer.stop()
@@ -1700,9 +1741,11 @@ class MainWindow(QMainWindow):
             self._set_phase(RECORDING)
             self._set_msg(f"Recording {label}.")
             return
-        hold = self._series_active or self._watching or self._waiting
+        hold = self._series_active or self._watching or self._waiting or bool(self._external_owner)
         self.start_btn.setEnabled(not hold)
-        if self._series_active or self._waiting:
+        if self._external_owner:
+            self.start_btn.setText(f"{self._external_owner} running…")
+        elif self._series_active or self._waiting:
             self.start_btn.setText("Recording series…")
         elif self._watching:
             # The capture is being confirmed from the sensor's files; starting
@@ -1773,6 +1816,9 @@ class MainWindow(QMainWindow):
                 self._set_phase(IDLE)
                 self._end_series()
                 self.log(text, level="error")
+                # The request may or may not have reached the sensor: an
+                # exception on the worker says nothing about that.
+                self._emit_capture_summary(OUTCOME_FAILED, detail=text)
                 return
             if self._ignore_late_http:
                 self._ignore_late_http = False
@@ -1819,8 +1865,167 @@ class MainWindow(QMainWindow):
 
         self._start_job(work, self._show_test_outcome)
 
+    # ------------------------------------------------------------------ programmatic captures
+    def excel_logging_target(self) -> tuple[Path, object] | None:
+        """Workbook path and class catalog while "Log to Excel" is on with a loaded workbook."""
+        if not hasattr(self, "excel_check") or not self.excel_check.isChecked():
+            return None
+        path = Path(self.workbook_edit.text().strip() or "")
+        if not path.is_file():
+            return None
+        return path, self._catalog
+
+    def capture_busy_reason(self) -> str | None:
+        """Why a new capture cannot start now, or None when the sensor is free."""
+        if self._external_owner and self._external_capture is None and not self._recording_active:
+            # Held between the owner's captures; the owner itself may start.
+            return None
+        if self._recording_active or self._submit_lock or self._http_in_flight:
+            return "A recording is in progress."
+        if self._record_phase in {SUBMITTING, RECORDING}:
+            return "A recording is in progress."
+        if self._watching or self._record_phase == FINALIZING:
+            return "The previous recording is still being confirmed from the sensor's files."
+        if self._series_active or self._waiting:
+            return "A repeat series is running. Stop it first."
+        return None
+
+    def set_external_owner(self, name: str) -> str | None:
+        """Reserve the sensor for a feature that runs its own capture sequence.
+
+        Returns an error text when a manual recording or series is active;
+        None when the reservation took effect. Manual Start is held until
+        `release_external_owner()`.
+        """
+        if self._external_owner and self._external_owner != name:
+            return f"{self._external_owner} is using the sensor."
+        reason = self.capture_busy_reason()
+        if reason and not self._external_owner:
+            return reason
+        self._external_owner = name
+        self._set_recording_ui(self._recording_active)
+        return None
+
+    def release_external_owner(self, name: str | None = None) -> None:
+        if name is not None and self._external_owner and self._external_owner != name:
+            return
+        self._external_owner = ""
+        if not self._recording_active:
+            self._set_recording_ui(False)
+
+    def start_capture(self, request: CaptureRequest) -> str | None:
+        """Start one recording for another feature. Returns an error text or None.
+
+        The request's own frequency plan, duration and labels are used; the
+        manual fields are not read. The caller learns how the capture ended
+        from `capture_finished`.
+        """
+        if self._external_owner and request.owner != self._external_owner:
+            return f"{self._external_owner} is using the sensor."
+        if self._recording_active or self._submit_lock or self._http_in_flight:
+            return "A recording is in progress."
+        if self._watching or self._record_phase in {SUBMITTING, RECORDING, FINALIZING}:
+            return "The previous recording is still being confirmed from the sensor's files."
+        if self._series_active or self._waiting:
+            return "A repeat series is running."
+        try:
+            seconds = float(request.seconds)
+        except (TypeError, ValueError):
+            return "Invalid recording time."
+        if not (seconds > 0):
+            return "Recording time must be positive."
+        plan = request.plan
+        if plan is None or int(plan.bandwidth_hz) <= 0:
+            return "Invalid frequency plan."
+        if not self._conn.host.strip() and not self._conn.demo:
+            return "Set the sensor IP in Settings."
+        try:
+            target = self._target()
+        except ValidationError as exc:
+            return str(exc)
+        try:
+            estimated = estimated_recording_bytes(int(plan.bandwidth_hz), seconds)
+        except Exception:
+            estimated = 0
+        blocked = recording_blocked_reason(self._storage, estimated)
+        if blocked:
+            self.log(blocked, level="error")
+            return blocked
+        self._submit_lock = True
+        self._external_capture = request
+        try:
+            self._launch_capture(plan, seconds, target=target, mapping=None, request=request)
+        except Exception as exc:  # noqa: BLE001 - report instead of leaving the lock set
+            self._external_capture = None
+            self._submit_lock = False
+            self.log(f"Could not start the capture: {exc}", level="error")
+            return f"Could not start the capture: {exc}"
+        return None
+
+    def _emit_capture_summary(self, outcome: str, *, detail: str = "", record=None) -> None:
+        """Report the end of the current capture once, to whoever is listening."""
+        if self._summary_emitted:
+            return
+        self._summary_emitted = True
+        request = self._external_capture
+        self._external_capture = None
+        if record is None and self._open_record_id:
+            record = next((item for item in load_recordings() if item.id == self._open_record_id), None)
+        total, parts, held_s = self._measured_capture(record) if record is not None else (0, 0, None)
+        if outcome in {OUTCOME_NOT_SENT, OUTCOME_BUSY}:
+            total, parts, held_s = 0, 0, None
+        state = self._watch_state
+        finalized = sorted(state.finalized)
+        stem = ""
+        if self._sensor_parts:
+            from .recording_history import iq_group_key
+
+            stem = iq_group_key(self._sensor_parts[0])
+        elif record is not None and (record.iq_stem or "").strip():
+            stem = record.iq_stem.strip()
+        summary = CaptureSummary(
+            outcome=outcome,
+            request=request,
+            record_id=record.id if record is not None else self._open_record_id,
+            phase=self._record_phase,
+            detail=detail or (self.msg.text() if hasattr(self, "msg") else ""),
+            requested_s=float(record.duration_s) if record is not None else (
+                float(request.seconds) if request is not None else 0.0
+            ),
+            held_s=held_s,
+            parts=parts,
+            total_bytes=total,
+            expected_bytes=int(self._expected_bytes or 0),
+            sensor_finished=bool(self._sensor_finished),
+            stream_lost=bool(self._stream_lost),
+            request_sent=outcome not in {OUTCOME_NOT_SENT, OUTCOME_BUSY},
+            sensor_parts=list(self._sensor_parts),
+            finalized_paths=finalized,
+            sizes={path: int(state.sizes.get(path, 0)) for path in finalized},
+            sensor_warnings=list(self._sensor_warnings),
+            started_at=record.started_at if record is not None else None,
+            finished_at=datetime.now(),
+            stem=stem,
+            recording_format="" if outcome in {OUTCOME_NOT_SENT, OUTCOME_BUSY} else self._sent_recording_format,
+        )
+        try:
+            self.capture_finished.emit(summary)
+        except Exception:  # noqa: BLE001 - a listener must not break the recorder
+            self.log(traceback.format_exc(limit=4), level="error")
+
     def _on_start(self) -> None:
         if self._recording_active or self._submit_lock:
+            return
+        if self._external_owner:
+            QMessageBox.warning(
+                self,
+                "Sensor in use",
+                f"{self._external_owner} is running its own recording sequence. Stop it before recording manually.",
+            )
+            return
+        if self._watching or self._record_phase == FINALIZING:
+            # The manual button is disabled in this state; a programmatic or
+            # keyboard trigger must not abandon the confirmation half-way.
             return
         self._submit_lock = True
         payload, error = self._try_payload()
@@ -1895,17 +2100,32 @@ class MainWindow(QMainWindow):
                 self.stop_btn.setEnabled(True)
         scan = payload["remote_recording_scans"][0]
         seconds = float(scan["duration"])
-        plan = self._plan
+        self._capture_session_into_conn()
+        save_settings(self._conn.persistable())
+        self._launch_capture(self._plan, seconds, target=target, mapping=mapping, request=None)
+
+    def _launch_capture(
+        self,
+        plan: FrequencyPlan,
+        seconds: float,
+        *,
+        target,
+        mapping,
+        request: CaptureRequest | None,
+    ) -> None:
+        """Submit one recording (manual or programmatic) and arm the completion watch."""
+        recording_format = self._recording_format()
+        if request is not None and request.recording_format:
+            recording_format = request.recording_format
         payload = build_payload_for_recording_time(
             plan,
             seconds,
             task_id=unique_task_id(),
-            recording_format=self._recording_format(),
+            recording_format=recording_format,
         )
         scan = payload["remote_recording_scans"][0]
         self._last_recording_s = seconds
-        self._capture_session_into_conn()
-        save_settings(self._conn.persistable())
+        self._sent_recording_format = str(scan.get("recording_format") or recording_format)
         self._ignore_late_http = False
         self._sensor_finished = False
         self._sensor_finished_at = 0.0
@@ -1913,10 +2133,23 @@ class MainWindow(QMainWindow):
         self._sensor_parts = []
         self._sensor_warnings = []
         self._pending_excel_entries = []
+        self._summary_emitted = False
         try:
             self._expected_bytes = estimated_recording_bytes(int(scan["bandwidth"]), seconds)
         except Exception:
             self._expected_bytes = 0
+        if request is not None:
+            collection_event = request.collection_event
+            target_class = request.target_class
+            worksheet = request.worksheet
+        else:
+            collection_event = self.event_combo.currentText().strip() if hasattr(self, "event_combo") else ""
+            target_class = mapping.target_class if mapping is not None else (
+                self.class_combo.currentText().strip() if hasattr(self, "class_combo") else ""
+            )
+            worksheet = mapping.worksheet if mapping is not None else (
+                self.sheet_combo.currentText().strip() if hasattr(self, "sheet_combo") else ""
+            )
         record = new_recording(
             host=self._conn.host.strip(),
             start_hz=plan.start_hz,
@@ -1925,13 +2158,9 @@ class MainWindow(QMainWindow):
             bandwidth_hz=plan.bandwidth_hz,
             duration_s=seconds,
             demo=self._conn.demo,
-            collection_event=self.event_combo.currentText().strip() if hasattr(self, "event_combo") else "",
-            target_class=mapping.target_class if mapping is not None else (
-                self.class_combo.currentText().strip() if hasattr(self, "class_combo") else ""
-            ),
-            worksheet=mapping.worksheet if mapping is not None else (
-                self.sheet_combo.currentText().strip() if hasattr(self, "sheet_combo") else ""
-            ),
+            collection_event=collection_event,
+            target_class=target_class,
+            worksheet=worksheet,
             sensor_id=self._sensor_info.serial if self._sensor_info.serial not in {"", "—"} else "",
         )
         add_recording(record)
@@ -1947,8 +2176,11 @@ class MainWindow(QMainWindow):
         self._record_gen += 1
         gen = self._record_gen
         unit = self._freq_unit()
+        prefix = f"{request.owner}: {request.label} — " if request is not None and request.label else (
+            f"{request.owner}: " if request is not None else ""
+        )
         self.log(
-            f"Start: {display_from_hz(int(scan['center_frequency']), unit)} {unit}, "
+            f"{prefix}Start: {display_from_hz(int(scan['center_frequency']), unit)} {unit}, "
             f"{display_from_hz(int(scan['bandwidth']), unit)} {unit} BW, {seconds} s, "
             f"{scan['recording_format']}"
             + (" (demo)" if self._conn.demo else "")
@@ -2077,6 +2309,7 @@ class MainWindow(QMainWindow):
                 self._set_phase(UNKNOWN)
                 self._set_msg("Time elapsed. Check Sensor Files for the recording.", error=True)
                 self.log("No history entry for this recording; its files cannot be confirmed automatically.", level="error")
+                self._emit_capture_summary(OUTCOME_UNKNOWN, detail="No history entry; files not confirmed.")
                 if self._series_active:
                     self._maybe_start_next()
                 else:
@@ -2264,6 +2497,9 @@ class MainWindow(QMainWindow):
 
     def _log_iq_file(self, record, entry, *, duration_s: float | None = None) -> None:
         self._update_collection_status()
+        if self._external_capture is not None and not self._external_capture.excel:
+            # The feature that requested this capture writes its own rows.
+            return
         if not hasattr(self, "excel_check") or not self.excel_check.isChecked():
             return
         sensor_id = record.sensor_id or self._sensor_info.serial
@@ -2397,6 +2633,7 @@ class MainWindow(QMainWindow):
         if parts:
             self._recordings_completed += 1
         self._update_collection_status()
+        self._emit_capture_summary(OUTCOME_CONFIRMED if parts else OUTCOME_UNKNOWN, record=record)
         if self._series_active:
             self._maybe_start_next()
         else:
@@ -2520,6 +2757,7 @@ class MainWindow(QMainWindow):
             self._set_recording_ui(False)
             self._set_phase(IDLE)
             self._end_series()
+            self._emit_capture_summary(OUTCOME_FAILED, detail=str(outcome))
             return
         if outcome.stream_ended:
             self._show_stream_outcome(outcome)
@@ -2540,6 +2778,7 @@ class MainWindow(QMainWindow):
             self._end_series()
             self._set_msg(outcome.detail, error=True)
             self._show_http_outcome(outcome, recording=True)
+            self._emit_capture_summary(OUTCOME_NOT_SENT, detail=outcome.detail)
             return
         if self._ignore_late_http and outcome.kind in (
             "connection_failure",
@@ -2565,6 +2804,7 @@ class MainWindow(QMainWindow):
             self._set_phase(UNKNOWN)
             self._set_msg("The sensor reported an error. Check Sensor Files.", error=True)
             self._end_series()
+            self._emit_capture_summary(OUTCOME_SENSOR_ERROR, detail=outcome.detail)
             return
         if outcome.sensor_finished:
             for name in outcome.sensor_parts:

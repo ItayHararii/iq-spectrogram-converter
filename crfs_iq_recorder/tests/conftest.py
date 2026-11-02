@@ -43,6 +43,16 @@ def reset_demo_sftp():
 
 
 @pytest.fixture(autouse=True)
+def isolated_config_dir(tmp_path, monkeypatch):
+    """Keep every test out of the developer's own config folder (panel settings,
+    cellular sessions, merge history)."""
+    config = tmp_path / "config"
+    monkeypatch.setattr("crfs_iq_recorder.paths.user_config_dir", lambda: config)
+    monkeypatch.setattr("crfs_iq_recorder.gui.user_config_dir", lambda: config)
+    monkeypatch.setattr("crfs_iq_recorder.merge_controller.merge_history_path", lambda: config / "merge_history.json")
+
+
+@pytest.fixture(autouse=True)
 def isolated_excel_log(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "crfs_iq_recorder.paths.excel_log_path",
