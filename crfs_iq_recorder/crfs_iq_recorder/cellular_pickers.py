@@ -791,7 +791,12 @@ class TimesField(_Themed, QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(8)
         self.chips_host = QWidget()
-        self.chips_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        # Vertically *Preferred*, not Minimum: a height-for-width widget's size
+        # hint is its height at its minimum width (every chip on its own row),
+        # and a policy that cannot shrink below the hint made the whole form
+        # reserve that stacked height - ~85 px of empty space under the chips
+        # once three start times were set, although they fit on one row.
+        self.chips_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.flow = FlowLayout(self.chips_host, h_spacing=6, v_spacing=6)
         self.empty_label = QLabel("No start time yet")
         self.empty_label.setObjectName("muted")

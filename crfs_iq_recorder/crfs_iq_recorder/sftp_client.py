@@ -239,6 +239,17 @@ class ParamikoSftpBrowser(SftpBrowser):
             raise SftpError(str(exc)) from exc
         except OSError as exc:
             cleanup_part(tmp)
+            if cancel is not None and cancel.is_set():
+                raise SftpError("Download cancelled.") from exc
+            raise SftpError(f"Download failed: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - paramiko raises its own classes
+            # Cancel closes the socket under paramiko, which then raises
+            # `paramiko.sftp.SFTPError: Garbage packet received` (not an OSError):
+            # on the Node 100-18 that left "<name>.wav.part" behind and counted
+            # the cancel as a failure with a pop-up.
+            cleanup_part(tmp)
+            if cancel is not None and cancel.is_set():
+                raise SftpError("Download cancelled.") from exc
             raise SftpError(f"Download failed: {exc}") from exc
 
     def remove_file(self, remote_path: str) -> None:

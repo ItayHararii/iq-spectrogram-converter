@@ -756,7 +756,7 @@ def write_results_openpyxl(path: Path, *, layout: SheetLayout, plan: list[PlanRo
     try:
         workbook = load_workbook(file, keep_vba=keep_vba)
     except PermissionError as exc:
-        raise ExcelBusyError(f"Could not open {file.name}: {exc}") from exc
+        raise ExcelBusyError(f"Could not open {file.name}: {_busy_reason(exc)}") from exc
     try:
         if layout.worksheet not in workbook.sheetnames:
             raise WorkbookError(f"Worksheet {layout.worksheet!r} is not in {file.name}.")
@@ -767,7 +767,7 @@ def write_results_openpyxl(path: Path, *, layout: SheetLayout, plan: list[PlanRo
                 workbook.save(temp)
                 os.replace(temp, file)
             except PermissionError as exc:
-                raise ExcelBusyError(f"Could not save {file.name}: {exc}") from exc
+                raise ExcelBusyError(f"Could not save {file.name}: {_busy_reason(exc)}") from exc
             finally:
                 try:
                     if temp.exists():
@@ -999,6 +999,14 @@ _LOCK_WINERRORS = {32, 33}  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
 
 def _file_locked(exc: OSError) -> bool:
     return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in _LOCK_WINERRORS
+
+
+def _busy_reason(exc: OSError) -> str:
+    """One readable sentence for a lock or permission error (no temp-file paths in the log)."""
+    code = getattr(exc, "winerror", None)
+    if code in _LOCK_WINERRORS or code == 5:  # sharing/lock violation, access denied
+        return "another program has the file open (it is written when the file is free)"
+    return exc.strerror or exc.__class__.__name__
 
 
 def ensure_backup(queue: WorkbookQueue, workbook: Path) -> Path | None:

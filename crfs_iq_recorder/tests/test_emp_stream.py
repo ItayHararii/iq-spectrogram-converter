@@ -339,6 +339,17 @@ def test_repeated_warning_is_counted_once_and_never_hides_the_real_error(sensor)
     assert outcome.sensor_parts == ["file_164410_0001.wav"]
 
 
+def test_internal_clock_warning_carries_its_explanation():
+    """Read on rfeye100400 (3 Nov 2026, read-only): ncpd.conf sets real_time_clock and
+    reference_clock to "internal". The log line says what the message means."""
+    from crfs_iq_recorder.api_client import sensor_message_note
+
+    note = sensor_message_note("Using internal clock because of ncpd.conf settings")
+    assert "real_time_clock" in note and "not affected" in note
+    assert sensor_message_note("No suitable antenna found") == ""
+    assert sensor_message_note("") == ""
+
+
 def test_warning_only_stream_finishes_normally(sensor):
     """A WARNING alone (internal clock) must never be treated as a failed recording."""
     script = _Script([(0.02, CLOCK), (0.02, remote_time("file_164410_0001.wav")), (0.05, CLOCK), (0.05, FINISHED)])
@@ -530,6 +541,45 @@ def test_paramiko_browser_reports_a_dead_transport_and_distinguishes_missing_fol
     with pytest.raises(SftpError) as info:
         browser.listdir("/mnt/1/remdata/20261102/")
     assert not isinstance(info.value, SftpNotFoundError)
+
+
+def test_paramiko_browser_cancel_reports_cancelled_and_leaves_no_part_file(tmp_path):
+    """Hardware (Node 100-18, 750 MB file cancelled after 5 MB): Cancel closes the socket under
+    paramiko, which raises its own `SFTPError("Garbage packet received")` (not an OSError).
+    That was counted as a failure, shown in a pop-up, and left `<name>.wav.part` behind."""
+    import threading
+    from pathlib import Path
+
+    from crfs_iq_recorder.sftp_client import ParamikoSftpBrowser, SftpError
+
+    class ParamikoSFTPError(Exception):
+        pass
+
+    class Sftp:
+        def __init__(self, cancel):
+            self.cancel = cancel
+
+        def get(self, remote, local, callback=None):
+            Path(local).write_bytes(b"x" * 1024)  # a partial file is on disk already
+            self.cancel.set()  # the operator pressed Cancel; the socket is closed under us
+            raise ParamikoSFTPError("Garbage packet received")
+
+    cancel = threading.Event()
+    browser = ParamikoSftpBrowser.__new__(ParamikoSftpBrowser)
+    browser._client = None
+    browser._sftp = Sftp(cancel)
+    dest = tmp_path / "iq_20261103_081248_0001.wav"
+    with pytest.raises(SftpError, match="cancelled"):
+        browser.download("/mnt/1/remdata/20261103/iq_20261103_081248_0001.wav", dest, cancel=cancel, expected_size=750_047_812)
+    assert not dest.exists()
+    assert not dest.with_name(dest.name + ".part").exists(), "no leftover part file after a cancel"
+
+    # The same transport error without a cancel is a failure, still without a leftover.
+    quiet = threading.Event()
+    browser._sftp = Sftp(threading.Event())
+    with pytest.raises(SftpError, match="Download failed: Garbage packet received"):
+        browser.download("/mnt/1/remdata/20261103/iq_x_0001.wav", dest, cancel=quiet)
+    assert not dest.with_name(dest.name + ".part").exists()
 
 
 def _entry(name, size, when):

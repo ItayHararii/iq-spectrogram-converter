@@ -338,6 +338,36 @@ def test_a_file_lock_held_by_another_program_is_busy_not_a_backup_failure(tmp_pa
     assert _values(path)[1][6] == "a0.wav"
 
 
+def test_a_share_deny_write_handle_is_busy_and_the_log_text_names_no_temp_file(tmp_path: Path):
+    """Hardware (3 Nov, 100-18): another program held the workbook open for reading with write
+    sharing denied. The backup copy succeeds, saving fails at os.replace with access denied
+    (WinError 5) -> busy, retried, and the log says so in one sentence instead of printing the
+    temp-file path. Written once the handle is gone, without duplicates."""
+    import win32con
+    import win32file
+
+    path = make_workbook(tmp_path / "p.xlsx")
+    imported = _import(path)
+    layout, plan = layout_from_import(imported), plan_rows_from_import(imported)
+    queue = WorkbookQueue(tmp_path / "q.json")
+    queue.enqueue(path, layout, plan, _result("r1", 0, ["a0.wav"], 2.0, datetime(2026, 1, 1)))
+    handle = win32file.CreateFile(str(path), win32con.GENERIC_READ | win32con.GENERIC_WRITE, win32con.FILE_SHARE_READ, None, win32con.OPEN_EXISTING, 0, None)
+    try:
+        report = flush_queue(queue, excel_open=lambda p: False)
+        assert report.ok and report.busy and not report.error and report.pending == 1 and report.written == 0
+        assert len(report.backups) == 1, "the backup copy only needs read access"
+        assert "another program has the file open" in report.busy
+        assert "crfs-tmp" not in report.busy and "WinError" not in report.busy and str(tmp_path) not in report.busy
+        assert list(tmp_path.glob("*.crfs-tmp-*")) == [], "no temp file left behind"
+    finally:
+        handle.Close()
+    report = flush_queue(queue, excel_open=lambda p: False)
+    assert report.ok and report.written == 1 and report.pending == 0
+    assert _values(path)[1][6] == "a0.wav"
+    report = flush_queue(queue, excel_open=lambda p: False)
+    assert report.written == 0 and _values(path)[1][6] == "a0.wav", "nothing is written twice"
+
+
 def test_open_workbook_goes_through_excel(tmp_path: Path, monkeypatch):
     path = make_workbook(tmp_path / "p.xlsx")
     imported = _import(path)

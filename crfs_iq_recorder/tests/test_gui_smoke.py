@@ -125,6 +125,34 @@ def test_gui_default_payload(qapp):
         window.close()
 
 
+def test_gui_estimate_follows_the_model_once_the_identity_arrives(qapp):
+    """A saved 100 MHz plan is restored before the sensor answers; the estimate
+    must be recomputed with the model's top sample rate when the identity lands
+    (hardware: 251.5 MB shown for 100 MHz x 1 s, 502.8 MB written by the Node 100-18)."""
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.sensor_info import SensorInfo, blank_info
+
+    window = MainWindow(demo=True)
+    try:
+        window._apply_sensor_info(blank_info(host="h", status="Checking…"))
+        window.mode_center.setChecked(True)
+        window.field_a.setText("1842.5")
+        window.field_b.setText("100")
+        window.time_edit.setText("1")
+        assert "251.5" in window.size_label.text(), window.size_label.text()
+        window._set_msg("Recording finished (1 file(s)).")
+        window._apply_sensor_info(SensorInfo(host="h", model="R100-18", firmware="2.25-325", serial="x", status="Connected", connected=True))
+        assert "502.8" in window.size_label.text() or "503.0" in window.size_label.text(), window.size_label.text()
+        # Only the estimate changed: a status on screen is kept.
+        assert window.msg.text() == "Recording finished (1 file(s))."
+        # The same identity again does not touch anything.
+        window.size_label.setText("sentinel")
+        window._apply_sensor_info(SensorInfo(host="h", model="R100-18", firmware="2.25-325", serial="x", status="Connected", connected=True))
+        assert window.size_label.text() == "sentinel"
+    finally:
+        window.close()
+
+
 def test_gui_recording_time_fills_all_timing_fields(qapp):
     from crfs_iq_recorder.gui import MainWindow
 
@@ -1837,10 +1865,14 @@ def test_gui_follows_the_sensor_stream_and_pins_the_reported_filename(qapp, tmp_
         return _sse("time.RemoteTimeData", [{"first_filename": f"{box['stem']}_0001.wav",
                                              "file_dir": "/mnt/1/remdata/20261031/", "task_id": "iq-test"}])()
 
+    clock = _message("WARNING", "Using internal clock because of ncpd.conf settings")
     client = _StreamingClient([
         _sse("crfs_iq_recorder.http_accepted", {"status": 200}),
         _message("WARNING", "No GPS reference (0 satellites), using internal clock"),  # noise: not logged
+        clock,
         part_event,
+        clock,
+        clock,
         _message("INFO", "Remote recording is now finished"),
     ])
     monkeypatch.setattr(window, "_client", lambda: client)
@@ -1858,13 +1890,18 @@ def test_gui_follows_the_sensor_stream_and_pins_the_reported_filename(qapp, tmp_
         assert "Request accepted (HTTP 200)" in log
         assert "Sensor is writing" in log and box["stem"] in log
         assert "Sensor reported: recording finished." in log
-        assert "GPS" not in log
+        assert "No GPS reference" not in log
+        # The Node 100-18's clock notice is logged once, with what it means (ncpd.conf
+        # real_time_clock/reference_clock = internal), and the repeats are counted.
+        assert log.count("Sensor warning: Using internal clock because of ncpd.conf settings") == 1
+        assert "real_time_clock" in log and "the recording is not affected" in log
         _drive_capture(window, qapp)
         assert _pump_until(qapp, lambda: window._record_phase == CONFIRMED, timeout=5), (
             window._record_phase,
             window.log_edit.toPlainText(),
         )
         assert "sensor confirmed" in window.log_edit.toPlainText()
+        assert "Sensor repeated 3×: Using internal clock because of ncpd.conf settings" in window.log_edit.toPlainText()
         assert window._recordings_completed == 1
         assert window._files_found == 2
         # Finishing the capture releases the stream so the Node drops the mission.

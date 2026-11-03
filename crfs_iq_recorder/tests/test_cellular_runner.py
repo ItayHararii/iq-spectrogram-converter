@@ -442,6 +442,102 @@ def test_run_missed_round_on_request(qapp, tmp_path):
     assert "operator's request" in runner.session.rounds[0].note
 
 
+def _timed_session(tmp_path, host, clock, times):
+    runner = _runner(tmp_path, host, clock=lambda: clock["now"])
+    schedule = Schedule(
+        mode=MODE_TIMES,
+        times=[datetime(2026, 1, 1, h, m).time() for h, m in times],
+        dates=[clock["now"].date()],
+        tz=ScheduleTimeZone(kind=TZ_UTC),
+    )
+    assert runner.start_session(_plan(tmp_path), schedule, _settings()) is None
+    assert runner.state == S_WAITING_SCHEDULE and host.requests == []
+    return runner
+
+
+def test_restart_after_a_scheduled_time_passed_lists_the_pass_as_missed_and_continue_never_runs_it(qapp, tmp_path):
+    """1.12.0 regression (hardware, 3 Nov): the app was closed while waiting for 10:50 and reopened at
+    10:53; the session came back as a bare "Interrupted" and Continue started the pass late on its own."""
+    host = FakeHost()
+    clock = {"now": datetime(2026, 11, 3, 8, 40, tzinfo=timezone.utc)}
+    runner = _timed_session(tmp_path, host, clock, [(8, 50), (12, 0)])
+    runner.shutdown()  # closed while waiting, nothing in flight
+    clock["now"] = datetime(2026, 11, 3, 8, 53, tzinfo=timezone.utc)  # inside the 15-minute grace of a running app
+    host2 = FakeHost()
+    runner2 = _runner(tmp_path, host2, clock=lambda: clock["now"])
+    first, second = runner2.session.rounds
+    assert runner2.state == S_INTERRUPTED and host2.requests == []
+    status = runner2.status()
+    assert status["missed_rounds"] == [first.round_id] and second.status == "pending"
+    assert "missed" in status["text"] and "check with the sensor" not in status["text"]
+    assert runner2.uncertain_tasks() == []
+    logged: list[str] = []
+    runner2.log.connect(lambda text, level: logged.append(text))
+    _pump(qapp)
+    assert any("Missed pass" in line for line in logged), "the missed pass is logged once the panel listens"
+    # Continue keeps the 12:00 pass and does not start the 08:50 one.
+    assert runner2.resume_after_restart() is None
+    assert host2.requests == [] and runner2.state == S_WAITING_SCHEDULE
+    assert first.status == ROUND_MISSED and host2.owner == OWNER
+    assert runner2.status()["next_round_text"].endswith("12:00")
+    # The operator decides to run it now.
+    assert runner2.run_missed_round(first.round_id) is None
+    assert len(host2.requests) == 1 and first.status == ROUND_RUNNING
+
+
+def test_missed_pass_can_be_run_or_skipped_straight_from_the_interrupted_session(qapp, tmp_path):
+    host = FakeHost()
+    clock = {"now": datetime(2026, 11, 3, 8, 40, tzinfo=timezone.utc)}
+    runner = _timed_session(tmp_path, host, clock, [(8, 50), (9, 30)])
+    runner.shutdown()
+    clock["now"] = datetime(2026, 11, 3, 11, 0, tzinfo=timezone.utc)  # both times went by
+    # Skip both: the session finishes without a recording and releases the sensor.
+    host2 = FakeHost()
+    runner2 = _runner(tmp_path, host2, clock=lambda: clock["now"])
+    missed = runner2.status()["missed_rounds"]
+    assert len(missed) == 2 and runner2.state == S_INTERRUPTED
+    for rid in missed:
+        runner2.skip_missed_round(rid)
+    assert runner2.status()["missed_rounds"] == [] and "Continue" in runner2.status()["text"]
+    assert runner2.resume_after_restart() is None
+    assert runner2.state == S_DONE and host2.requests == [] and host2.owner == ""
+    # Run the first one straight away (no Continue first): the sensor is reserved on the way.
+    runner2.discard_session()
+    runner3 = _timed_session(tmp_path, FakeHost(), {"now": datetime(2026, 11, 3, 8, 40, tzinfo=timezone.utc)}, [(8, 50)])
+    runner3.shutdown()
+    host4 = FakeHost()
+    runner4 = _runner(tmp_path, host4, clock=lambda: clock["now"])
+    rid = runner4.status()["missed_rounds"][0]
+    assert runner4.run_missed_round(rid) is None
+    assert host4.owner == OWNER and len(host4.requests) == 1 and runner4.state == S_RUNNING
+    host4.finish(host4.requests[0])
+    _pump(qapp)
+    for _ in range(3):
+        if host4.requests and runner4.current_round() is not None:
+            host4.finish(host4.requests[-1])
+            _pump(qapp)
+            runner4._tick()
+    assert runner4.state == S_DONE and runner4.session.rounds[0].status == ROUND_DONE
+
+
+def test_a_missed_pass_is_not_run_while_an_interrupted_pass_still_needs_reconciliation(qapp, tmp_path):
+    host = FakeHost()
+    clock = {"now": datetime(2026, 11, 3, 7, 59, tzinfo=timezone.utc)}
+    runner = _timed_session(tmp_path, host, clock, [(8, 0), (8, 5)])
+    clock["now"] = datetime(2026, 11, 3, 8, 1, tzinfo=timezone.utc)
+    runner._tick()
+    assert runner.state == S_RUNNING and len(host.requests) == 1
+    runner.shutdown()  # closed during the first capture
+    clock["now"] = datetime(2026, 11, 3, 8, 30, tzinfo=timezone.utc)
+    host2 = FakeHost()
+    runner2 = _runner(tmp_path, host2, clock=lambda: clock["now"])
+    assert runner2.state == S_INTERRUPTED and len(runner2.uncertain_tasks()) == 1
+    assert runner2.status()["missed_rounds"] == [runner2.session.rounds[1].round_id]
+    error = runner2.run_missed_round(runner2.session.rounds[1].round_id)
+    assert error and "Check with the sensor" in error
+    assert host2.requests == [] and runner2.state == S_INTERRUPTED
+
+
 def test_restart_recovers_an_interrupted_session_without_resending(qapp, tmp_path):
     host = FakeHost()
     runner = _runner(tmp_path, host)

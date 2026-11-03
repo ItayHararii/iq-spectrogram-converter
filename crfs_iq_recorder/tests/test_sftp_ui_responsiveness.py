@@ -256,6 +256,53 @@ def test_closing_sftp_does_not_abort_active_downloads(qapp, tmp_path, monkeypatc
         qapp.processEvents()
 
 
+def test_cancelled_download_is_counted_as_cancelled_not_failed(qapp, tmp_path, monkeypatch):
+    """Hardware (Node 100-18): after Cancel the transport raised paramiko's own
+    SFTPError; the window said "1 failed." and opened a pop-up."""
+    from crfs_iq_recorder.connection_state import ConnectionState
+    from crfs_iq_recorder.sftp_client import DemoSftpBrowser
+    from crfs_iq_recorder.sftp_window import SftpWindow
+
+    class ParamikoSFTPError(Exception):
+        pass
+
+    started = threading.Event()
+
+    def download_then_die(self, remote_path, local_path, progress=None, *, cancel=None, expected_size=0):
+        started.set()
+        for _ in range(100):
+            if cancel is not None and cancel.is_set():
+                raise ParamikoSFTPError("Garbage packet received")
+            time.sleep(0.02)
+        raise AssertionError("cancel never arrived")
+
+    popups: list[object] = []
+    monkeypatch.setattr(DemoSftpBrowser, "download", download_then_die)
+    monkeypatch.setattr("crfs_iq_recorder.sftp_window.QMessageBox.warning", lambda *a, **k: popups.append(a))
+    window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10", download_dir=str(tmp_path)))
+    try:
+        assert _wait_listing(window, qapp, count=1) >= 1
+        files = [entry for entry in window._entries if not entry.is_dir]
+        window._begin_downloads(files[:1])
+        deadline = time.time() + 3
+        while time.time() < deadline and not (started.is_set() and window._dl_active):
+            qapp.processEvents()
+            time.sleep(0.02)
+        window.cancel_btn.click()
+        deadline = time.time() + 5
+        while time.time() < deadline and (window._dl_active or window._dl_pending):
+            qapp.processEvents()
+            time.sleep(0.02)
+        _pump(qapp, 0.1)
+        assert window._dl_cancel_count == 1 and window._dl_fail == 0
+        assert window.status.text() == "1 cancelled."
+        assert popups == [], "a cancel is not an error"
+        assert not window._busy and window.refresh_btn.isEnabled()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
 def test_main_window_close_does_not_wait_on_sftp(qapp, monkeypatch):
     from crfs_iq_recorder.gui import MainWindow
 

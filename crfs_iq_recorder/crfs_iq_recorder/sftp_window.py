@@ -444,7 +444,12 @@ class FileDownloadWorker(QObject):
         except SftpError as exc:
             self.failed.emit(self._name, str(exc))
         except Exception:
-            self.failed.emit(self._name, traceback.format_exc(limit=3))
+            if self._cancel is not None and self._cancel.is_set():
+                # Whatever the transport raised once the socket was closed, the
+                # operator pressed Cancel: report that, not a failure.
+                self.failed.emit(self._name, "Download cancelled.")
+            else:
+                self.failed.emit(self._name, traceback.format_exc(limit=3))
         finally:
             if self._browser is not None:
                 self._browser.close()

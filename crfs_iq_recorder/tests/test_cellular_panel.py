@@ -473,6 +473,100 @@ def test_collapsed_panel_builds_nothing_until_opened_and_opens_for_a_saved_sessi
         assert panel2._built and not panel2.body.isHidden()
         assert panel2.chip.text() == "Interrupted"
         assert not panel2.recovery.isHidden() and "interrupted" in panel2.recovery_label.text().casefold()
+        # Closed during a pass whose capture was refused: nothing is uncertain, so
+        # Continue is offered without "Check with the sensor".
+        assert window2._cellular.uncertain_tasks() == [] and window2._cellular.current_round() is not None
+        assert panel2.reconcile_btn.isHidden() and not panel2.resume_session_btn.isHidden()
+        assert "during a pass" in panel2.recovery_label.text()
+        # The docked bar is on screen next to the manual "Start Recording" button
+        # while the section is scrolled away: it names its owner.
+        assert window2.cellular_bar is panel2.action_bar and not panel2.action_bar.isHidden()
+        assert panel2.bar_caption.text().casefold() == "cellular collection"
+        assert not panel2.bar_caption.isHidden()
+        assert "cellular" in panel2.start_btn.accessibleName().casefold()
     finally:
         window2.close()
+        qapp.processEvents()
+
+
+def test_panel_offers_run_or_skip_for_a_pass_missed_while_the_app_was_closed(qapp, tmp_path):
+    """1.12.0 regression: a session closed while waiting for a scheduled pass is not a bare
+    "Interrupted: check with the sensor"; the missed pass is listed with Run now / Skip."""
+    from datetime import datetime, timedelta, timezone
+    from crfs_iq_recorder.cellular_plan import build_plan
+    from crfs_iq_recorder.cellular_capabilities import capability_for
+    from crfs_iq_recorder.cellular_runner import S_INTERRUPTED, CampaignSettings, CellularRunner
+    from crfs_iq_recorder.cellular_scheduler import MODE_TIMES, Schedule
+    from crfs_iq_recorder.gui import MainWindow
+
+    book = _plan_book(tmp_path / "plan.xlsx")
+    plan = build_plan(import_protocol(book, "Plan"), capability_for("R40-8"), fallback_duration_s=1.0)
+
+    class Host:
+        capture_finished = None
+        _conn = None
+
+        def set_external_owner(self, name):
+            return None
+
+        def release_external_owner(self, name=None):
+            return None
+
+        def start_capture(self, request):
+            raise AssertionError("nothing may be recorded")
+
+    now = datetime.now().astimezone()
+    runner = CellularRunner(Host(), config_dir=tmp_path / "config", download_dir=lambda: tmp_path / "downloads")
+    tomorrow = now.date() + timedelta(days=1)
+    schedule = Schedule(mode=MODE_TIMES, times=[datetime(2026, 1, 1, 12, 0).time(), datetime(2026, 1, 1, 13, 0).time()], dates=[tomorrow])
+    assert runner.start_session(plan, schedule, CampaignSettings(wait_s=0, auto_download=False)) is None
+    first = runner.session.rounds[0]
+    # The first pass's time went by three minutes ago while the application was closed.
+    first.scheduled_local = now - timedelta(minutes=3)
+    first.scheduled_utc = first.scheduled_local.astimezone(timezone.utc)
+    runner._save()
+    runner.shutdown()
+
+    window = MainWindow(demo=True)
+    try:
+        panel = window.cellular_panel
+        runner2 = window._cellular
+        assert runner2.state == S_INTERRUPTED and runner2.uncertain_tasks() == []
+        assert runner2.status()["missed_rounds"] == [first.round_id]
+        qapp.processEvents()
+        text = panel.recovery_label.text().casefold()
+        assert "missed" in text and "run it now or skip it" in text
+        assert "check with the sensor" not in text
+        assert not panel.run_missed_btn.isHidden() and not panel.skip_missed_btn.isHidden()
+        assert panel.reconcile_btn.isHidden(), "nothing is uncertain, so there is nothing to check"
+        assert not panel.resume_session_btn.isHidden() and not panel.discard_btn.isHidden()
+        assert "missed" in panel.status_label.text().casefold()
+        panel.skip_missed_btn.click()
+        qapp.processEvents()
+        assert runner2.status()["missed_rounds"] == []
+        assert panel.run_missed_btn.isHidden()
+        assert "continue" in panel.status_label.text().casefold()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_chip_says_stopped_when_the_operator_stopped_the_collection(qapp, tmp_path):
+    """1.12.0: a session the operator stopped is not badged "Finished" (seen on hardware, 3 Nov)."""
+    from crfs_iq_recorder.cellular_runner import S_DONE
+    from crfs_iq_recorder.gui import MainWindow
+
+    window = MainWindow(demo=True)
+    try:
+        panel = window.cellular_panel
+        panel._set_expanded(True)
+        qapp.processEvents()
+        panel._on_status({"state": S_DONE, "text": "Stopped", "active": False})
+        assert (panel.chip.text(), panel.chip.objectName()) == ("Stopped", "badgeWait")
+        panel._on_status({"state": S_DONE, "text": "Finished with problems", "active": False})
+        assert (panel.chip.text(), panel.chip.objectName()) == ("Finished", "badgeWait")
+        panel._on_status({"state": S_DONE, "text": "Finished", "active": False})
+        assert (panel.chip.text(), panel.chip.objectName()) == ("Finished", "badgeOk")
+    finally:
+        window.close()
         qapp.processEvents()

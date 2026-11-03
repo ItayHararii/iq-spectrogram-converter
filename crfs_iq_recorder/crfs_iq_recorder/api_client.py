@@ -254,6 +254,27 @@ def _message_items(event: SseEvent) -> list[dict]:
     return [item for item in items if isinstance(item, dict)]
 
 
+_INTERNAL_CLOCK_NOTE = (
+    " (the Node's ncpd.conf sets real_time_clock and reference_clock to \"internal\", so time stamps "
+    "come from its own clock, not GPS; the recording is not affected)"
+)
+
+
+def sensor_message_note(text: str) -> str:
+    """A short explanation appended to a known sensor message, or ''.
+
+    "Using internal clock because of ncpd.conf settings" is repeated several
+    times a second by the Node 100-18 for the whole capture. Read on the sensor
+    (read-only): `/etc/node/ncpd/ncpd.conf` has `"real_time_clock":"internal"`
+    and `"reference_clock":"internal"`; the files are complete and the capture
+    finishes normally, so the message is a configuration notice, not a fault.
+    """
+    lowered = (text or "").casefold()
+    if "internal clock" in lowered and "ncpd.conf" in lowered:
+        return _INTERNAL_CLOCK_NOTE
+    return ""
+
+
 def sse_message_is_noise(item: dict) -> bool:
     text = str(item.get("message", "")).casefold()
     return any(fragment in text for fragment in _SSE_IGNORED_MESSAGE_FRAGMENTS)

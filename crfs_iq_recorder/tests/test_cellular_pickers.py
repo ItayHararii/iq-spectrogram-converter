@@ -291,6 +291,34 @@ def test_times_field_adds_removes_sorts_and_signals(qapp, de_locale):
     small.close()
 
 
+def test_times_field_does_not_reserve_a_row_per_chip_when_they_fit_on_one(qapp, de_locale):
+    """1.11.0 left ~85 px of empty space under the chips: the chip host could not
+    shrink below its size hint, which is the stacked height at its minimum width."""
+    from PySide6.QtWidgets import QVBoxLayout, QWidget
+
+    from crfs_iq_recorder.theme import CONTROL_H
+
+    host = QWidget()
+    layout = QVBoxLayout(host)
+    field = TimesField([time(9, 0), time(12, 0), time(16, 0)])
+    layout.addWidget(field)
+    layout.addStretch(1)
+    host.resize(700, 300)
+    host.show()
+    try:
+        qapp.processEvents()
+        one_row = CONTROL_H
+        assert field.heightForWidth(600) == one_row
+        assert field.minimumSizeHint().height() == one_row
+        # The parent layout's minimum height follows the one-row figure, not three stacked chips.
+        assert host.layout().totalMinimumSize().height() <= one_row + 2 * 12
+        assert field.height() <= one_row + 2
+        # Narrow hosts still wrap: three rows when only one chip fits per row.
+        assert field.flow.heightForWidth(100) > one_row
+    finally:
+        host.close()
+
+
 def test_date_field_takes_the_date_chosen_in_the_popup(qapp, us_locale):
     field = DateField(date(2026, 11, 2))
     spy = _Spy(field.changed)

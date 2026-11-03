@@ -58,6 +58,7 @@ from .cellular_scheduler import (
     ROUND_FAILED,
     ROUND_MISSED,
     ROUND_PARTIAL,
+    ROUND_PENDING,
     ROUND_RUNNING,
     ROUND_SKIPPED,
     ROUND_STOPPED,
@@ -555,6 +556,9 @@ class CellularRunner(QObject):
                 self.state = S_INTERRUPTED
             else:
                 self.state = self.session.runner_state if self.session.runner_state == S_DONE else S_IDLE
+            if self.state == S_INTERRUPTED and self._mark_missed_while_closed(self._clock()):
+                # Logged once the panel listens; the window is still being built here.
+                QTimer.singleShot(0, self, self._note_missed_rounds)
         # Results that could not be written before the last exit (Excel had the
         # workbook, the application was closed) are written now, whether or not
         # the collection itself is finished; a busy workbook is retried.
@@ -1936,6 +1940,28 @@ class CellularRunner(QObject):
                 "error",
             )
 
+    def _mark_missed_while_closed(self, now: datetime) -> int:
+        """Passes whose time went by while the collection was not running are missed.
+
+        Applies after a restart (and before an interrupted session continues):
+        the grace that lets a pass start a few minutes late while the
+        application runs does not apply here. Such a pass is listed for the
+        operator - Run the missed pass now / Skip it - and never started late
+        on its own. The round being recorded when the application closed is
+        not touched; reconciliation deals with it.
+        """
+        if self.session is None:
+            return 0
+        now_utc = now.astimezone(timezone.utc)
+        count = 0
+        for record in self.session.rounds:
+            if record.status in {ROUND_PENDING, ROUND_DUE, ROUND_DELAYED} and record.scheduled_utc <= now_utc:
+                late = (now_utc - record.scheduled_utc).total_seconds()
+                record.status = ROUND_MISSED
+                record.note = f"Scheduled time passed {int(late // 60)} min ago while the application was closed or the collection interrupted."
+                count += 1
+        return count
+
     def _note_missed_rounds(self) -> None:
         if self.session is None:
             return
@@ -2151,6 +2177,9 @@ class CellularRunner(QObject):
                 return error
         self._capture_in_flight = False
         requeued = self._requeue_unfinished_downloads()
+        # A pass whose time went by meanwhile is never started by Continue.
+        if self._mark_missed_while_closed(self._clock()):
+            self._note_missed_rounds()
         record = self.current_round()
         if record is not None and self._next_queued() is None:
             self._finish_round()
@@ -2225,9 +2254,16 @@ class CellularRunner(QObject):
         record = self.session.round(round_id) if self.session else None
         if record is None or record.status != ROUND_MISSED:
             return "This round is not marked as missed."
+        if self.state == S_INTERRUPTED:
+            if self.current_round() is not None or self.uncertain_tasks():
+                return "Check with the sensor or skip the uncertain capture(s) and press Continue first; the missed pass can be run after that."
+            # Same path as Continue: identity check, sensor reserved, downloads from before the restart queued again.
+            error = self.resume_after_restart()
+            if error:
+                return error
         record.status = ROUND_DUE
         record.note = (record.note + " Run late on the operator's request.").strip()
-        if self.state in {S_DONE, S_IDLE, S_INTERRUPTED}:
+        if self.state in {S_DONE, S_IDLE}:
             reserve = getattr(self.host, "set_external_owner", None)
             if reserve is not None:
                 error = reserve(OWNER)
@@ -2317,7 +2353,16 @@ class CellularRunner(QObject):
             else:
                 text = "Waiting for the schedule"
         elif self.state == S_INTERRUPTED:
-            text = "Interrupted: check with the sensor before continuing"
+            if uncertain_total:
+                text = "Interrupted: check with the sensor before continuing"
+            elif record is not None:
+                text = "Interrupted during a pass: press Continue to finish it"
+            elif missed:
+                text = "Interrupted: a scheduled pass was missed - run it now or skip it"
+            elif upcoming is not None:
+                text = f"Interrupted: press Continue to keep the schedule (next pass at {upcoming.scheduled_local:%H:%M})"
+            else:
+                text = "Interrupted: press Continue to finish"
         elif self.state == S_DONE:
             # A finished session is not the same as a successful one.
             statuses = [r.status for r in session.rounds]

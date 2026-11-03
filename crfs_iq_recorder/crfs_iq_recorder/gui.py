@@ -1317,7 +1317,14 @@ class MainWindow(QMainWindow):
         restyle(self.status_value)
 
     def _apply_sensor_info(self, info: SensorInfo) -> None:
+        previous_model = getattr(self._sensor_info, "model", "") or ""
         self._sensor_info = info
+        if (info.model or "") != previous_model and hasattr(self, "size_label"):
+            # The estimate follows the model's highest sample rate (125 MS/s on a
+            # Node 100-x, 62.5 MS/s otherwise). The fields are restored before
+            # the identity arrives, so a saved 100 MHz plan showed half its size
+            # until a field was edited (hardware: 251.5 MB shown, 502.8 MB written).
+            self._refresh_size_keeping_message()
         self.model_value.setText(info.display_model())
         self.firmware_value.setText(info.display_firmware())
         self.serial_value.setText(info.display_serial())
@@ -1725,6 +1732,15 @@ class MainWindow(QMainWindow):
         except (SizeEstimateError, ValidationError, KeyError):
             self.size_label.setText("Estimate —")
         self._refresh_class_suggestion()
+
+    def _refresh_size_keeping_message(self) -> None:
+        """Recompute the estimate without clearing a status such as "Recording finished"."""
+        keep_text, keep_name = self.msg.text(), self.msg.objectName()
+        self._refresh_size()
+        if keep_text and keep_name != "error" and not self.msg.text():
+            self.msg.setText(keep_text)
+            self.msg.setObjectName(keep_name)
+            restyle(self.msg)
 
     def _sensor_max_rate_hz(self) -> int | None:
         """Highest sample rate of the connected model (125 MS/s on a Node 100-x), None when unknown."""
@@ -2999,6 +3015,7 @@ class MainWindow(QMainWindow):
             return
         from .api_client import (
             SSE_EVENT_HTTP_ACCEPTED,
+            sensor_message_note,
             sse_message_is_error,
             sse_message_is_finished,
             sse_message_is_noise,
@@ -3041,7 +3058,7 @@ class MainWindow(QMainWindow):
                 level = "error" if str(item.get("level", "")).upper() == "WARNING" else "info"
                 # A WARNING is information about the capture (clock source), never a failure.
                 label = "Sensor warning" if level == "error" else "Sensor"
-                self._count_sensor_message(text, level=level, label=label)
+                self._count_sensor_message(text, level=level, label=label, suffix=sensor_message_note(text))
 
     def _count_sensor_message(self, text: str, *, level: str, suffix: str = "", label: str = "Sensor") -> None:
         """Log a sensor message the first time it is seen; count later repeats."""

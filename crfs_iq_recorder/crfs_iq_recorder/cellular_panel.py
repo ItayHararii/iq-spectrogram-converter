@@ -380,11 +380,18 @@ class CellularPanel(QFrame):
         texts = QVBoxLayout()
         texts.setContentsMargins(0, 0, 0, 0)
         texts.setSpacing(1)
+        # The bar is docked under the scrolling form, so it can be on screen
+        # next to the manual "Start Recording" button while the section itself
+        # is scrolled away: the caption says which Start this is.
+        self.bar_caption = QLabel("CELLULAR COLLECTION")
+        self.bar_caption.setObjectName("sensorFactLabel")
+        self.bar_caption.setToolTip("These controls belong to the Cellular Collection section")
         self.status_label = ElideLabel("Idle")
         self.status_label.setObjectName("summary")
         self.detail_label = ElideLabel("")
         self.detail_label.setObjectName("muted")
         self.detail_label.setVisible(False)
+        texts.addWidget(self.bar_caption)
         texts.addWidget(self.status_label)
         texts.addWidget(self.detail_label)
         row.addLayout(texts, 1)
@@ -394,7 +401,8 @@ class CellularPanel(QFrame):
         self.start_btn.setObjectName("primary")
         self.start_btn.setAutoDefault(False)
         self.start_btn.setMinimumWidth(96)
-        self.start_btn.setToolTip("Check the connected sensor, show the preview, then record the list")
+        self.start_btn.setAccessibleName("Start Cellular Collection")
+        self.start_btn.setToolTip("Cellular Collection: check the connected sensor, show the preview, then record the list")
         self.start_btn.clicked.connect(self._start_clicked)
         self.pause_btn = _ghost("Pause", tooltip="Finish the current recording, then wait")
         self.pause_btn.clicked.connect(self.runner.pause)
@@ -1085,7 +1093,12 @@ class CellularPanel(QFrame):
         state = status.get("state", S_IDLE)
         text = status.get("text", "")
         if state in self.CHIPS:
-            self._set_chip(*self.CHIPS[state])
+            chip_text, chip_style = self.CHIPS[state]
+            if state == S_DONE and text.startswith("Stopped"):
+                chip_text, chip_style = "Stopped", "badgeWait"  # stopped by the operator, not finished
+            elif state == S_DONE and text.startswith("Finished with problems"):
+                chip_style = "badgeWait"
+            self._set_chip(chip_text, chip_style)
         elif self.plan is not None and self.plan.ready and not self._importing:
             self._set_chip("Ready", "badgeOk")
         else:
@@ -1173,15 +1186,21 @@ class CellularPanel(QFrame):
             self.recovery.setVisible(False)
             return
         lines = []
+        uncertain = self.runner.uncertain_tasks() if interrupted else []
         if interrupted:
-            uncertain = self.runner.uncertain_tasks()
-            lines.append(
-                "The last collection was interrupted"
-                + (f" ({session.pause_reason})" if session.pause_reason else "")
-                + ". "
-                + (f"{len(uncertain)} recording(s) may or may not exist on the sensor: check with the sensor before continuing, or skip them. " if uncertain else "")
-                + "Nothing is recorded again on its own."
-            )
+            reason = f" ({session.pause_reason})" if session.pause_reason else ""
+            if uncertain:
+                lines.append(
+                    f"The last collection was interrupted{reason}. {len(uncertain)} recording(s) may or may not exist on the sensor: "
+                    "check with the sensor before continuing, or skip them. Nothing is recorded again on its own."
+                )
+            elif self.runner.current_round() is not None:
+                lines.append(f"The last collection was interrupted during a pass{reason}. Nothing is recorded again on its own; Continue finishes the pass.")
+            else:
+                lines.append(
+                    "The application was closed while the collection was waiting for its next pass. "
+                    "Nothing is recorded again on its own; Continue keeps the remaining schedule."
+                )
         if missed:
             record = session.round(missed[0])
             when = format_datetime(record.scheduled_local.astimezone()) if record is not None else "its time"
@@ -1189,9 +1208,9 @@ class CellularPanel(QFrame):
         if status.get("state") == S_DONE:
             lines.append(status.get("text") or "Finished.")
         self.recovery_label.setText("\n".join(lines))
-        self.reconcile_btn.setVisible(interrupted)
+        self.reconcile_btn.setVisible(interrupted and bool(uncertain))
         self.resume_session_btn.setVisible(interrupted)
-        self.skip_uncertain_btn.setVisible(interrupted and bool(self.runner.uncertain_tasks()))
+        self.skip_uncertain_btn.setVisible(interrupted and bool(uncertain))
         self.run_missed_btn.setVisible(bool(missed))
         self.skip_missed_btn.setVisible(bool(missed))
         self.discard_btn.setVisible(not self.runner.active())
