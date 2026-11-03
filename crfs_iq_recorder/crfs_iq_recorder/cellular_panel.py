@@ -1,12 +1,13 @@
-"""Cellular Collection panel: a collapsible section of the main window.
+"""Excel Collection tab: record the rows of a protocol worksheet.
 
-Workflow order, top to bottom: Excel file and worksheet → recording duration
-and wait → run now or schedule (date, start times, repeat daily) → the action
-bar (Preview, Start, Pause / Resume, Stop) with a one-line status. The action
-bar is a separate widget so the main window can keep it in view under the
-scrolling form. Everything heavy (workbook import, identity check, downloads,
-Excel updates) runs off the UI thread through the host's job helper or the
-runner; this module only draws and forwards. Diagnostics go to the activity log.
+Workflow order, top to bottom: the last recording and the end-of-pass summary
+(when there is one) → Excel file and worksheet → recording duration and wait →
+run now or schedule (date, start times, repeat daily). The action bar
+(Preview, Start, Pause / Resume, Stop) with a one-line status is a separate
+widget so the main window can keep it in view under the scrolling form.
+Everything heavy (workbook import, identity check, downloads, Excel updates)
+runs off the UI thread through the host's job helper or the runner; this
+module only draws and forwards. Diagnostics go to the diagnostic log.
 """
 
 from __future__ import annotations
@@ -16,8 +17,8 @@ from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEvent, QSize, Qt
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -43,9 +44,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import desktop_open
 from .cellular_capabilities import capability_for, readable_sensor_name
 from .cellular_pickers import DateField, TimesField, format_datetime
-from .cellular_plan import CellularPlan, build_plan, format_bytes, format_seconds
+from .cellular_plan import REQUEST_SENTENCE, CellularPlan, build_plan, format_bytes, format_seconds, summary_line
 from .cellular_protocol import (
     LEVEL_WARNING,
     ProtocolError,
@@ -68,21 +70,26 @@ from .cellular_runner import (
     S_STOP_REQUESTED,
     S_WAITING,
     S_WAITING_SCHEDULE,
+    OWNER,
     CampaignSettings,
     CellularRunner,
 )
 from .cellular_scheduler import MODE_NOW, MODE_TIMES, Schedule, ScheduleTimeZone, tight_schedule_warning
 from .cellular_workbook import layout_from_import, plan_rows_from_import
+from .diagnostic_log import diag
 from .json_store import read_json, write_json
-from .theme import CONTROL_H, LABEL_W, current_palette, glyph_icon, restyle
+from .operator_text import clip
+from .result_card import ResultCard
+from .theme import CONTROL_H, LABEL_W, restyle
+from .waterfall_dialog import WaterfallDialog
 
 SETTINGS_NAME = "settings.json"
 DEFAULT_WAIT_S = 10.0
 DEFAULT_DURATION_S = 5.0
 MAX_START_TIMES = 12
 SPIN_W = 124  # duration / wait / repeat spin boxes
-_THEME_EVENTS = (QEvent.Type.StyleChange, QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange)
 
+NO_WORKBOOK = "Load a protocol workbook first."
 STOP_TOOLTIP = "Stops after the current recording: it finishes and is written to Excel, nothing else is recorded."
 
 
@@ -94,14 +101,14 @@ class PanelSettings:
     workbook: str = ""
     worksheet: str = ""
     duration_s: float = DEFAULT_DURATION_S
-    wait_s: float = DEFAULT_WAIT_S
+    wait_s: float = DEFAULT_WAIT_S  # always seconds; wait_unit is how it is shown
+    wait_unit: str = "seconds"
     schedule_mode: str = MODE_NOW
     times: list[str] = field(default_factory=list)
     schedule_date: str = ""
     daily: bool = False
     repeat: int = 1
     until_stopped: bool = False
-    expanded: bool = False
     last_sensor: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -110,13 +117,13 @@ class PanelSettings:
             "worksheet": self.worksheet,
             "duration_s": self.duration_s,
             "wait_s": self.wait_s,
+            "wait_unit": self.wait_unit,
             "schedule_mode": self.schedule_mode,
             "times": list(self.times),
             "schedule_date": self.schedule_date,
             "daily": self.daily,
             "repeat": self.repeat,
             "until_stopped": self.until_stopped,
-            "expanded": self.expanded,
             "last_sensor": dict(self.last_sensor),
         }
 
@@ -134,6 +141,7 @@ class PanelSettings:
             settings.wait_s = max(float(data.get("wait_s", DEFAULT_WAIT_S)), 0.0)
         except (TypeError, ValueError):
             settings.wait_s = DEFAULT_WAIT_S
+        settings.wait_unit = "minutes" if data.get("wait_unit") == "minutes" else "seconds"
         settings.schedule_mode = MODE_TIMES if data.get("schedule_mode") == MODE_TIMES else MODE_NOW
         settings.times = [str(t) for t in data.get("times") or []]
         settings.schedule_date = str(data.get("schedule_date") or "")
@@ -143,7 +151,6 @@ class PanelSettings:
         except (TypeError, ValueError):
             settings.repeat = 1
         settings.until_stopped = bool(data.get("until_stopped", False))
-        settings.expanded = bool(data.get("expanded", False))
         settings.last_sensor = {str(k): str(v) for k, v in (data.get("last_sensor") or {}).items()}
         return settings
 
@@ -231,26 +238,31 @@ def _ghost(text: str, *, tooltip: str = "") -> QPushButton:
 
 # ----------------------------------------------------------------------------- preview
 class PlanPreviewDialog(QDialog):
-    """What will be recorded, row by row, before Start — including any sequential windows."""
+    """What will be requested, row by row, before Start: one request per protocol row."""
 
-    def __init__(self, plan: CellularPlan, *, wait_s: float, rows_total: int, notes: list[str] | None = None, start_label: str | None = None, parent=None) -> None:
+    def __init__(self, plan: CellularPlan, *, wait_s: float, rows_total: int, notes: list[str] | None = None, start_label: str | None = None, passes: int = 1, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Cellular Collection")
+        self.setWindowTitle("Excel Collection")
         self.resize(760, 500)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
-        windows = len(plan.tasks)
-        summary = QLabel(
-            _plural(rows_total, "protocol row")
-            + (f" · recorded as {windows} captures per pass" if windows != rows_total else "")
-            + f" · {format_seconds(plan.capture_seconds)} of IQ per pass · about {format_bytes(plan.estimated_bytes)} per pass"
-            + f" · ≈ {format_seconds(plan.estimated_round_seconds(wait_s))} per pass with {format_seconds(wait_s)} waits"
-        )
+        summary = QLabel(summary_line(plan, wait_s=wait_s, passes=passes))
         summary.setObjectName("summary")
         summary.setWordWrap(True)
         layout.addWidget(summary)
-        for text in [plan.window_note, *(notes or [])]:
+        rule = QLabel(REQUEST_SENTENCE)
+        rule.setWordWrap(True)
+        layout.addWidget(rule)
+        estimate = QLabel(
+            f"Estimate only: about {format_bytes(plan.estimated_bytes)} and "
+            f"{format_seconds(plan.estimated_round_seconds(wait_s))} per pass. "
+            "What CRFS records is read from its files afterwards."
+        )
+        estimate.setObjectName("muted")
+        estimate.setWordWrap(True)
+        layout.addWidget(estimate)
+        for text in notes or []:
             if text:
                 note = QLabel(text)
                 note.setWordWrap(True)
@@ -258,17 +270,17 @@ class PlanPreviewDialog(QDialog):
                 layout.addWidget(note)
         tree = QTreeWidget()
         tree.setColumnCount(5)
-        tree.setHeaderLabels(["Row", "Band", "Direction", "Recorded as", "Duration"])
+        tree.setHeaderLabels(["Row", "Band", "Direction", "Requested range", "Duration"])
         tree.setRootIsDecorated(False)
         tree.setAlternatingRowColors(True)
         tree.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
         tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         tree.setEditTriggers(QTreeWidget.EditTrigger.NoEditTriggers)
         for task in plan.tasks:
-            recorded = f"{task.window_start_hz / 1e6:g}–{task.window_stop_hz / 1e6:g} MHz"
-            if task.window_count > 1:
-                recorded += f" (window {task.window_index} of {task.window_count}, sequential)"
-            item = QTreeWidgetItem([str(task.row), task.band_label, task.direction, recorded, f"{task.duration_s:g} s"])
+            requested = task.range_text
+            if task.repetitions > 1:
+                requested += f" (repeat {task.repetition} of {task.repetitions})"
+            item = QTreeWidgetItem([str(task.row), task.band_label, task.direction, requested, f"{task.duration_s:g} s"])
             tree.addTopLevelItem(item)
         header = tree.header()
         header.setStretchLastSection(False)
@@ -276,12 +288,12 @@ class PlanPreviewDialog(QDialog):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(tree, 1)
-        problems = [i for i in plan.issues if i.level in {"error", LEVEL_WARNING}]
+        problems = [i for i in plan.issues if i.level in {"error", LEVEL_WARNING, "info"}]
         if problems:
             box = QPlainTextEdit()
             box.setReadOnly(True)
             box.setMaximumHeight(110)
-            box.setPlainText("\n".join((f"row {i.row}: " if i.row else "") + i.message for i in problems))
+            box.setPlainText("\n".join(i.message for i in problems))
             layout.addWidget(box)
         buttons = QDialogButtonBox()
         if start_label:
@@ -296,12 +308,13 @@ class PlanPreviewDialog(QDialog):
 
 # ----------------------------------------------------------------------------- panel
 class CellularPanel(QFrame):
-    """Collapsible "Cellular Collection" section for the main window.
+    """The form of the "Excel Collection" tab.
 
-    ``action_bar`` (Preview / Start / Pause / Resume / Stop with the status
-    line) is created with the header; the host may take it with
-    ``detach_action_bar()`` and keep it under the scrolling form. It is shown
-    while the section is expanded.
+    ``action_bar`` (state chip, status line, Preview / Start / Pause / Resume /
+    Stop) is created at once; the host takes it with ``detach_action_bar()``
+    and keeps it under the scrolling form. The form itself is built the first
+    time it is needed (``ensure_built()``), so a large saved workbook is not
+    read while the window opens on the other tab.
     """
 
     CHIPS = {
@@ -329,82 +342,69 @@ class CellularPanel(QFrame):
         self._import_token = 0
         self._importing = False
         self._identity_pending = False
+        self._host_paused = False
         self._built = False
         self._details_open = False
-        self._build_header()
+        self._pass_dismissed = ""
+        self._waterfall = None
+        self._build_frame()
         self._build_action_bar()
         self.runner.status_changed.connect(self._on_status)
         self.runner.session_changed.connect(self._refresh_recovery)
         self.runner.log.connect(self._on_runner_log)
-        if self.settings.expanded or self.runner.session is not None:
-            self._set_expanded(True)
+        if self.runner.session is not None:
+            self.ensure_built()
         else:
             self._on_status(self.runner.status())
 
     # ------------------------------------------------------------------ construction
-    def _build_header(self) -> None:
+    def _build_frame(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(6)
-        head = QHBoxLayout()
-        head.setSpacing(8)
-        self.toggle_btn = QPushButton("Cellular Collection")
-        self.toggle_btn.setObjectName("sectionToggle")
-        self.toggle_btn.setAutoDefault(False)
-        self.toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.toggle_btn.setIconSize(QSize(14, 14))
-        self.toggle_btn.setToolTip("Show or hide the Cellular Collection form")
-        self.toggle_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.toggle_btn.clicked.connect(lambda: self._set_expanded(self.body.isHidden()))
-        head.addWidget(self.toggle_btn, 1)
-        self.chip = QLabel("Idle")
-        self.chip.setObjectName("badgeIdle")
-        self.chip.setToolTip("State of the collection")
-        head.addWidget(self.chip, 0, Qt.AlignmentFlag.AlignVCenter)
-        outer.addLayout(head)
         self.body = QWidget()
         self.body.setObjectName("section")
         self.body.setVisible(False)
         outer.addWidget(self.body)
         self._bar_slot = outer
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
-        self._refresh_icons()
 
     def _build_action_bar(self) -> None:
         bar = QFrame()
         bar.setObjectName("actionBar")
-        bar.setVisible(False)
         row = QHBoxLayout(bar)
         row.setContentsMargins(14, 8, 14, 8)
         row.setSpacing(8)
+        self.chip = QLabel("Idle")
+        self.chip.setObjectName("badgeIdle")
+        self.chip.setToolTip("State of the collection")
+        row.addWidget(self.chip, 0, Qt.AlignmentFlag.AlignVCenter)
         texts = QVBoxLayout()
         texts.setContentsMargins(0, 0, 0, 0)
         texts.setSpacing(1)
-        # The bar is docked under the scrolling form, so it can be on screen
-        # next to the manual "Start Recording" button while the section itself
-        # is scrolled away: the caption says which Start this is.
-        self.bar_caption = QLabel("CELLULAR COLLECTION")
-        self.bar_caption.setObjectName("sensorFactLabel")
-        self.bar_caption.setToolTip("These controls belong to the Cellular Collection section")
         self.status_label = ElideLabel("Idle")
         self.status_label.setObjectName("summary")
         self.detail_label = ElideLabel("")
         self.detail_label.setObjectName("muted")
         self.detail_label.setVisible(False)
-        texts.addWidget(self.bar_caption)
+        # Why Start is not available right now ("Manual recording is running.").
+        self.reason_label = ElideLabel("")
+        self.reason_label.setObjectName("reasonText")
+        self.reason_label.setVisible(False)
         texts.addWidget(self.status_label)
         texts.addWidget(self.detail_label)
+        texts.addWidget(self.reason_label)
         row.addLayout(texts, 1)
-        self.preview_btn = _ghost("Preview", tooltip="The rows that will be recorded, in order, with the exact range of every capture")
+        self.preview_btn = _ghost("Preview", tooltip="The rows that will be recorded, in order, with the requested range of each")
         self.preview_btn.clicked.connect(lambda: self._show_preview(start=False))
         self.start_btn = QPushButton("Start")
         self.start_btn.setObjectName("primary")
         self.start_btn.setAutoDefault(False)
         self.start_btn.setMinimumWidth(96)
-        self.start_btn.setAccessibleName("Start Cellular Collection")
-        self.start_btn.setToolTip("Cellular Collection: check the connected sensor, show the preview, then record the list")
+        self.start_btn.setAccessibleName("Start Excel Collection")
+        self.start_btn.setToolTip("Check the connected sensor, show the preview, then record the rows")
         self.start_btn.clicked.connect(self._start_clicked)
-        self.pause_btn = _ghost("Pause", tooltip="Finish the current recording, then wait")
+        self.pause_btn = _ghost("Pause", tooltip="Pauses after the current recording")
         self.pause_btn.clicked.connect(self.runner.pause)
         self.resume_btn = _ghost("Resume", tooltip="Continue with the next recording")
         self.resume_btn.clicked.connect(self.runner.resume)
@@ -421,14 +421,27 @@ class CellularPanel(QFrame):
         self.action_bar.setParent(None)
         return self.action_bar
 
-    def _ensure_built(self) -> None:
+    def ensure_built(self) -> None:
+        """Build the form (first use of the tab, or a saved collection to show)."""
         if self._built:
             return
         self._built = True
         self._build_body()
+        self.body.setVisible(True)
         self._load_saved_workbook()
         self._refresh_recovery()
         self._on_status(self.runner.status())
+
+    def host_state_changed(self) -> None:
+        """The main window's manual recording started or ended: Start follows."""
+        self._sync_buttons(self.runner.status())
+        self._sync_log_note()
+
+    def host_reason(self) -> str:
+        """What the manual tab says while a paused collection still holds the sensor ("" otherwise)."""
+        if self.runner.state in {S_PAUSED, S_PAUSED_BACKLOG}:
+            return f"{OWNER} is paused. Stop it first."
+        return ""
 
     def _build_body(self) -> None:
         body = QVBoxLayout(self.body)
@@ -464,6 +477,43 @@ class CellularPanel(QFrame):
         rec.addLayout(rec_buttons)
         self.recovery.setVisible(False)
         body.addWidget(self.recovery)
+
+        # End of a pass: counts and "Retry failed rows".
+        self.pass_box = QFrame()
+        self.pass_box.setObjectName("resultCard")
+        pass_l = QVBoxLayout(self.pass_box)
+        pass_l.setContentsMargins(12, 10, 12, 10)
+        pass_l.setSpacing(6)
+        self.pass_title = QLabel("")
+        self.pass_title.setObjectName("resultTitle")
+        self.pass_counts = QLabel("")
+        self.pass_counts.setWordWrap(True)
+        pass_l.addWidget(self.pass_title)
+        pass_l.addWidget(self.pass_counts)
+        pass_buttons = QHBoxLayout()
+        pass_buttons.setSpacing(8)
+        self.retry_btn = _ghost(
+            "Retry failed rows",
+            tooltip="Checks uncertain rows with the sensor first, then sends the failed rows again. Completed and partial rows are kept.",
+        )
+        self.retry_btn.clicked.connect(self._retry_failed)
+        self.pass_hint = QLabel("")
+        self.pass_hint.setObjectName("muted")
+        self.pass_hint.setWordWrap(True)
+        self.pass_dismiss_btn = _ghost("Dismiss", tooltip="Hide this summary")
+        self.pass_dismiss_btn.clicked.connect(self._dismiss_pass)
+        pass_buttons.addWidget(self.retry_btn)
+        pass_buttons.addWidget(self.pass_hint, 1)
+        pass_buttons.addStretch(0)  # takes the width while the hint is hidden
+        pass_buttons.addWidget(self.pass_dismiss_btn)
+        pass_l.addLayout(pass_buttons)
+        self.pass_box.setVisible(False)
+        body.addWidget(self.pass_box)
+
+        self.result_card = ResultCard("Last recording")
+        self.result_card.open_folder_clicked.connect(self._open_result_folder)
+        self.result_card.waterfall_clicked.connect(self._show_result_waterfall)
+        body.addWidget(self.result_card)
 
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
@@ -554,15 +604,33 @@ class CellularPanel(QFrame):
         grid.addWidget(FieldLabel("Wait between recordings"), row, 0)
         wait_row = QHBoxLayout()
         wait_row.setSpacing(8)
-        self.wait_spin = QSpinBox()
-        self.wait_spin.setRange(0, 24 * 3600)
-        self.wait_spin.setSuffix(" s")
+        self.wait_spin = QDoubleSpinBox()
+        self.wait_spin.setDecimals(1)
+        self.wait_spin.setSingleStep(1.0)
         self.wait_spin.setFixedSize(SPIN_W, CONTROL_H)
-        self.wait_spin.setToolTip("Pause after each confirmed recording before the next row")
-        self.wait_spin.setValue(int(round(self.settings.wait_s)))
+        self.wait_spin.setToolTip("Pause after each recording before the next row")
+        self.wait_unit = QComboBox()
+        self.wait_unit.addItems(["Seconds", "Minutes"])
+        self.wait_unit.setFixedHeight(CONTROL_H)
+        self.wait_unit.setMinimumWidth(112)
+        minutes = self.settings.wait_unit == "minutes"
+        self.wait_unit.setCurrentText("Minutes" if minutes else "Seconds")
+        self._apply_wait_range(minutes)
+        self.wait_spin.setValue(self.settings.wait_s / 60.0 if minutes else self.settings.wait_s)
+        self.wait_unit.currentTextChanged.connect(self._on_wait_unit)
+        self.wait_spin.valueChanged.connect(self._rebuild_plan)
         wait_row.addWidget(self.wait_spin)
+        wait_row.addWidget(self.wait_unit)
         wait_row.addStretch(1)
         grid.addLayout(wait_row, row, 1)
+        row += 1
+
+        # The manual tab's recording log (.xlsm) also receives these recordings when it is on.
+        self.log_note = QLabel("")
+        self.log_note.setObjectName("muted")
+        self.log_note.setWordWrap(True)
+        self.log_note.setVisible(False)
+        grid.addWidget(self.log_note, row, 1)
         row += 1
 
         # 3. Run now / schedule
@@ -597,6 +665,9 @@ class CellularPanel(QFrame):
         self.until_stopped.setChecked(self.settings.until_stopped)
         self.until_stopped.toggled.connect(lambda on: self.repeat_spin.setEnabled(not on))
         self.repeat_spin.setEnabled(not self.settings.until_stopped)
+        # The summary line counts passes.
+        self.repeat_spin.valueChanged.connect(self._rebuild_plan)
+        self.until_stopped.toggled.connect(self._rebuild_plan)
         repeat_row.addWidget(self.until_stopped)
         repeat_row.addStretch(1)
         self.repeat_box = QWidget()
@@ -651,28 +722,36 @@ class CellularPanel(QFrame):
         self._on_daily(self.daily_check.isChecked())
 
     # ------------------------------------------------------------------ small helpers
-    def _refresh_icons(self) -> None:
-        text = QColor(current_palette().text)
-        expanded = not self.body.isHidden()
-        self.toggle_btn.setIcon(glyph_icon("chevron-down" if expanded else "chevron-right", text))
+    def _apply_wait_range(self, minutes: bool) -> None:
+        self.wait_spin.setRange(0.0, 24 * 60.0 if minutes else 24 * 3600.0)
 
-    def changeEvent(self, event: QEvent) -> None:  # noqa: N802
-        super().changeEvent(event)
-        if event.type() in _THEME_EVENTS:
-            self._refresh_icons()
+    def _on_wait_unit(self, text: str) -> None:
+        """Switching units keeps the same wait: 90 s becomes 1.5 min."""
+        minutes = text == "Minutes"
+        seconds = self._wait_from_widgets(not minutes)  # the spin box still shows the previous unit
+        self.wait_spin.blockSignals(True)
+        self._apply_wait_range(minutes)
+        self.wait_spin.setValue(seconds / 60.0 if minutes else seconds)
+        self.wait_spin.blockSignals(False)
+        self._rebuild_plan()
 
-    def _set_expanded(self, on: bool) -> None:
-        if on:
-            self._ensure_built()
-        self.body.setVisible(on)
-        self.action_bar.setVisible(on)
-        self.toggle_btn.setToolTip("Hide the Cellular Collection form" if on else "Show the Cellular Collection form")
-        self._refresh_icons()
-        self.settings.expanded = on
-        self._save_settings()
+    def _wait_from_widgets(self, minutes: bool) -> float:
+        value = max(float(self.wait_spin.value()), 0.0)
+        return value * 60.0 if minutes else value
 
-    def is_expanded(self) -> bool:
-        return not self.body.isHidden()
+    def _sync_log_note(self) -> None:
+        if not self._built:
+            return
+        target = getattr(self.host, "excel_logging_target", None)
+        try:
+            found = target() if callable(target) else None
+        except Exception:  # noqa: BLE001 - advisory line only
+            found = None
+        name = Path(found[0]).name if found else ""
+        self.log_note.setText(
+            f"Each recording is also logged to {name} (the Excel log option of the Manual Recording tab)." if name else ""
+        )
+        self.log_note.setVisible(bool(name))
 
     def _set_chip(self, text: str, style: str) -> None:
         self.chip.setText(text)
@@ -690,7 +769,8 @@ class CellularPanel(QFrame):
             self.settings.workbook = self.workbook_edit.text().strip()
             self.settings.worksheet = self._current_sheet()
             self.settings.duration_s = float(self.duration_spin.value())
-            self.settings.wait_s = float(self.wait_spin.value())
+            self.settings.wait_s = self.wait_seconds()
+            self.settings.wait_unit = "minutes" if self.wait_unit.currentText() == "Minutes" else "seconds"
             self.settings.schedule_mode = MODE_TIMES if self.run_times.isChecked() else MODE_NOW
             self.settings.times = [t.strftime("%H:%M") for t in self.times_field.times()]
             chosen = self.date_field.date()
@@ -707,7 +787,9 @@ class CellularPanel(QFrame):
         return float(self.duration_spin.value())
 
     def wait_seconds(self) -> float:
-        return float(self.wait_spin.value())
+        if not self._built:
+            return float(self.settings.wait_s)
+        return self._wait_from_widgets(self.wait_unit.currentText() == "Minutes")
 
     def _sensor_model(self) -> str:
         """The connected sensor's model, '' until its identity has been read ('—' is the window's placeholder)."""
@@ -728,10 +810,10 @@ class CellularPanel(QFrame):
         if not callable(log):
             return
         try:
-            log(f"Cellular: {message}", level=level)
+            log(message, level=level)
         except TypeError:
             try:
-                log(f"Cellular: {message}")
+                log(message)
             except Exception:  # noqa: BLE001 - the log widget may not exist yet
                 pass
         except Exception:  # noqa: BLE001
@@ -752,10 +834,19 @@ class CellularPanel(QFrame):
 
     # ------------------------------------------------------------------ protocol
     def _load_saved_workbook(self) -> None:
-        if self.settings.workbook and Path(self.settings.workbook).is_file():
-            self.workbook_edit.setText(self.settings.workbook)
+        saved = self.settings.workbook
+        if not saved:
+            return
+        if Path(saved).is_file():
+            self.workbook_edit.setText(saved)
             self._fill_sheets(self.settings.worksheet)
             self._import(force=False, quiet=True)
+            return
+        # The saved file is gone (moved, renamed, drive unplugged): say so once, keep the setting.
+        diag("protocol_missing", Path(saved).name, worksheet=self.settings.worksheet)
+        self.workbook_edit.setText(saved)
+        self._set_import_text("Protocol workbook not found. Choose the file again.", warn=True)
+        self.workbook_edit.setToolTip(f"Not found: {Path(saved).name}")
 
     def _browse_workbook(self) -> None:
         start = self.workbook_edit.text().strip() or str(Path.home())
@@ -763,6 +854,7 @@ class CellularPanel(QFrame):
         if not path:
             return
         self.workbook_edit.setText(path)
+        self.workbook_edit.setToolTip("The protocol workbook; each row of the worksheet is one recording")
         self._fill_sheets("")
         self._import(force=True)
 
@@ -778,9 +870,13 @@ class CellularPanel(QFrame):
                 # The worksheet stays selected so results are queued for it.
                 self.sheet_combo.addItem(kept.worksheet, kept.worksheet)
                 self.sheet_combo.setCurrentIndex(0)
-                self._set_import_text(self._kept_text(kept, exc))
+                self._set_import_text(self._kept_text(kept, path, exc))
+            elif isinstance(exc, WorkbookUnavailable):
+                diag("protocol_unavailable", Path(path).name, error=str(exc))
+                self._set_import_text(self._unavailable_text(path, exc), warn=True)
             else:
-                self._set_import_text(str(exc))
+                diag("protocol_error", Path(path).name, error=str(exc))
+                self._set_import_text(clip(str(exc), 160), warn=True)
             self.sheet_combo.blockSignals(False)
             return
         for name, visible in sheets:
@@ -808,10 +904,16 @@ class CellularPanel(QFrame):
         return self.imported if _same_file(self.imported.source, path) else None
 
     @staticmethod
-    def _kept_text(kept: ProtocolImport, error: Exception) -> str:
+    def _unavailable_text(path: str, error: Exception) -> str:
+        name = Path(path).name or "The workbook"
+        if "not found" in str(error).casefold():
+            return f"Protocol workbook not found: {name}. Choose the file again."
+        return f"{name} cannot be opened right now. Is it open in another program?"
+
+    def _kept_text(self, kept: ProtocolImport, path: str, error: Exception) -> str:
         return (
-            f"{error} Using the {len(kept.valid_entries())} row(s) imported earlier from '{kept.worksheet}'; "
-            "results are queued until the workbook can be written."
+            f"{self._unavailable_text(path, error)} Using the {_plural(len(kept.valid_entries()), 'row')} "
+            "imported earlier; results are queued."
         )
 
     def _set_import_text(self, text: str, *, warn: bool = False, details: str = "") -> None:
@@ -842,14 +944,20 @@ class CellularPanel(QFrame):
                 headers, _row = read_headers(path, sheet)
                 mapping = suggest_mapping(headers)
                 if mapping.missing():
-                    return {"error": "This worksheet cannot be used as a protocol: missing " + "; ".join(mapping.missing()) + "."}
+                    return {
+                        "error": "This worksheet cannot be used as a protocol: missing " + "; ".join(mapping.missing()) + ".",
+                        "short": "This worksheet cannot be used as a protocol: it has no start/stop frequency columns.",
+                    }
                 return {"imported": import_protocol(path, sheet, mapping)}
             except WorkbookUnavailable as exc:
-                return {"error": str(exc), "unavailable": exc}
+                diag("protocol_unavailable", Path(path).name, error=str(exc))
+                return {"error": self._unavailable_text(path, exc), "unavailable": exc}
             except ProtocolError as exc:
-                return {"error": str(exc)}
+                diag("protocol_error", Path(path).name, sheet=sheet, error=str(exc))
+                return {"error": str(exc), "short": clip(str(exc), 120)}
             except Exception as exc:  # noqa: BLE001 - reported, never raised across threads
-                return {"error": f"{type(exc).__name__}: {exc}"}
+                diag("protocol_failed", Path(path).name, sheet=sheet, error=f"{type(exc).__name__}: {exc}")
+                return {"error": "The worksheet could not be read. See details."}
 
         def apply(result) -> None:
             if token != self._import_token:
@@ -860,16 +968,18 @@ class CellularPanel(QFrame):
                 kept = self._kept_import(path, error) if error is not None else None
                 if kept is not None and kept.worksheet == sheet:
                     # Locked or unplugged right now: the plan imported earlier stands.
-                    self._set_import_text(self._kept_text(kept, error), warn=True, details=self._details_text())
+                    self._set_import_text(self._kept_text(kept, path, error), warn=True, details=self._details_text())
                     if not quiet:
                         self._host_log(self.import_label.text(), "error")
                     self._sync_buttons(self.runner.status())
                     return
                 self.imported = None
                 self.plan = None
-                self._set_import_text(str(result.get("error") if isinstance(result, dict) else "The worksheet could not be read."), warn=True)
+                text = str(result.get("error") if isinstance(result, dict) else "The worksheet could not be read.")
+                self._set_import_text(text, warn=True)
                 if not quiet:
-                    self._host_log(self.import_label.text(), "error")
+                    short = result.get("short") if isinstance(result, dict) else None
+                    self._host_log(str(short or text), "error")
                 self._sync_buttons(self.runner.status())
                 self._on_status(self.runner.status())
                 return
@@ -881,7 +991,8 @@ class CellularPanel(QFrame):
             self._rebuild_plan()
             self._save_settings()
             if not quiet:
-                self._host_log(self.import_label.text() + (f" {self.details_label.text()}" if self.details_label.text() else ""))
+                rows = len(self.imported.valid_entries())
+                self._host_log(f"Protocol loaded: {self.imported.worksheet}, {_plural(rows, 'row')}.")
             self._on_status(self.runner.status())
 
         runner = getattr(self.host, "_start_job", None)
@@ -895,44 +1006,49 @@ class CellularPanel(QFrame):
             return
         capability = self._capability()
         self.plan = build_plan(self.imported, capability, fallback_duration_s=self.duration_seconds())
-        rows = len(self.imported.valid_entries())
-        windows = len(self.plan.tasks)
-        parts = [_plural(rows, "row")]
-        if windows != rows:
-            parts.append(_plural(windows, "capture"))
-        parts.append(f"Estimated {format_bytes(self.plan.estimated_bytes)}")
         errors = len(self.imported.errors) + len(self.plan.errors)
+        text = self.summary_text()
         if errors:
-            parts.append(_plural(errors, "problem") + " (see Preview)")
-        self._set_import_text(" · ".join(parts), warn=bool(errors), details=self._details_text(capability))
-        self._sync_buttons(self.runner.status())
+            text += " · " + _plural(errors, "problem") + " (see Preview)"
+        self._set_import_text(text, warn=bool(errors), details=self._details_text(capability))
+        self._on_status(self.runner.status())
+
+    def passes(self) -> int:
+        """Passes the current settings ask for (0 = until stopped)."""
+        if not self._built:
+            return max(int(self.settings.repeat), 1)
+        if self.run_now.isChecked():
+            return 0 if self.until_stopped.isChecked() else int(self.repeat_spin.value())
+        if self.daily_check.isChecked():
+            return 0
+        return max(len(self.times_field.times()), 1)
+
+    def summary_text(self) -> str:
+        """'15 rows · 2 s per request · 10 s between recordings · 1 pass'."""
+        if self.plan is None:
+            return ""
+        return summary_line(self.plan, wait_s=self.wait_seconds(), passes=self.passes())
 
     def _details_text(self, capability=None) -> str:
-        """Sensor capture window, sequential windows, kept result rows: the long version."""
+        """Estimate, kept result rows and the sensor the plan was checked against."""
         if self.plan is None or self.imported is None:
             return ""
         capability = capability or self._capability()
-        window_mhz = self.plan.window_hz / 1e6
-        split = [t for t in self.plan.tasks if t.window_count > 1]
-        rows_split = len({t.row for t in split})
-        lines: list[str] = []
-        lines.append(f"Worksheet '{self.imported.worksheet}', rows recorded in worksheet order; the estimate is per pass.")
+        lines: list[str] = [
+            f"Rows are sent in worksheet order. Estimate only: about {format_bytes(self.plan.estimated_bytes)} "
+            f"per pass; what CRFS records is read from its files afterwards."
+        ]
         if self._sensor_model():
             name = readable_sensor_name(capability.model) or capability.model or "this sensor"
-            lines.append(f"{name}: up to {window_mhz:g} MHz per capture at {self.duration_seconds():g} s.")
+            lines.append(f"Checked against {name}.")
         else:
-            lines.append(
-                f"Sensor not verified yet: up to {window_mhz:g} MHz per capture at {self.duration_seconds():g} s "
-                "(conservative figure; the plan is rebuilt for the connected sensor when you press Start)."
-            )
-        if rows_split:
-            lines.append(f"{_plural(rows_split, 'row')} wider than that are recorded as sequential frequency windows, each for the full duration; the windows are recorded one after another, never at the same time.")
+            lines.append("The sensor is checked when you press Start.")
         results = len(self.imported.result_rows())
         if results:
             lines.append(f"{_plural(results, 'earlier result row')} kept, not recorded again.")
         layout = layout_from_import(self.imported)
         if not (layout.result or layout.time or layout.duration):
-            lines.append("No result column in this worksheet: results stay in the log and the manifests.")
+            lines.append("No result column in this worksheet: results stay in the log and the record files.")
         return " ".join(lines)
 
     # ------------------------------------------------------------------ schedule / settings
@@ -973,13 +1089,6 @@ class CellularPanel(QFrame):
         notes: list[str] = []
         if self.plan is None:
             return notes
-        split_rows = sorted({t.row for t in self.plan.tasks if t.window_count > 1})
-        if split_rows:
-            notes.append(
-                f"{len(split_rows)} row(s) are wider than one capture at this duration and are recorded as sequential "
-                f"frequency windows, each for the full {self.duration_seconds():g} s. The row lists all its files; the windows are "
-                "recorded one after another, not at the same time."
-            )
         if schedule is not None and schedule.mode == MODE_TIMES:
             warning = tight_schedule_warning(schedule, self.plan.estimated_round_seconds(self.wait_seconds()), now=datetime.now(timezone.utc))
             if warning:
@@ -997,7 +1106,7 @@ class CellularPanel(QFrame):
 
     def _show_preview(self, *, start: bool) -> None:
         if self.plan is None:
-            QMessageBox.information(self, "Cellular Collection", "Load a protocol workbook first.")
+            QMessageBox.information(self, "Excel Collection", "Load a protocol workbook first.")
             return
         self._rebuild_plan()
         schedule, error = self._schedule() if start else (None, None)
@@ -1010,6 +1119,7 @@ class CellularPanel(QFrame):
             rows_total=len(self.imported.valid_entries()) if self.imported is not None else len({t.row for t in self.plan.tasks}),
             notes=self._notes_before_start(schedule),
             start_label="Start" if start else None,
+            passes=self.passes(),
             parent=self.window(),
         )
         try:
@@ -1024,7 +1134,7 @@ class CellularPanel(QFrame):
     def _start_clicked(self) -> None:
         """Verify the sensor's identity first, then preview (which explains any subdivision) and start."""
         if self.plan is None:
-            QMessageBox.information(self, "Cellular Collection", "Load a protocol workbook first.")
+            QMessageBox.information(self, "Excel Collection", "Load a protocol workbook first.")
             return
         if self._identity_pending:
             return
@@ -1052,13 +1162,10 @@ class CellularPanel(QFrame):
                 )
                 return
             previous = self.settings.last_sensor or {}
+            diag("sensor_identity", "before Excel Collection", model=model, serial=serial, previous=previous)
             if previous.get("serial") and serial and previous["serial"] != serial:
-                self._host_log(
-                    f"The connected sensor is {readable_sensor_name(model)} {serial}; the last collection used "
-                    f"{readable_sensor_name(previous.get('model', ''))} {previous['serial']}. The plan is rebuilt for this sensor.",
-                    "error",
-                )
-            self._host_log(f"Sensor verified: {readable_sensor_name(model)} (model {model}, serial {serial}).")
+                self._host_log("This is not the sensor of the last collection. The plan is checked again for it.", "error")
+            self._host_log(f"Sensor checked: {readable_sensor_name(model)}, serial {serial}.")
             self._rebuild_plan()
             self._show_preview(start=True)
 
@@ -1073,7 +1180,9 @@ class CellularPanel(QFrame):
         save_panel_settings(self._config_dir, self.settings)
         error = self.runner.start_session(self.plan, schedule, settings, protocol_snapshot=self._snapshot_path)
         if error:
-            QMessageBox.warning(self, "Cellular Collection", error)
+            QMessageBox.warning(self, "Excel Collection", error)
+        else:
+            self._pass_dismissed = ""
 
     def _stop(self) -> None:
         status = self.runner.status()
@@ -1092,6 +1201,12 @@ class CellularPanel(QFrame):
     def _on_status(self, status: dict) -> None:
         state = status.get("state", S_IDLE)
         text = status.get("text", "")
+        paused = state in {S_PAUSED, S_PAUSED_BACKLOG}
+        if paused != self._host_paused:
+            self._host_paused = paused
+            sync = getattr(self.host, "_sync_other_tab_reasons", None)
+            if callable(sync):
+                sync()
         if state in self.CHIPS:
             chip_text, chip_style = self.CHIPS[state]
             if state == S_DONE and text.startswith("Stopped"):
@@ -1105,7 +1220,9 @@ class CellularPanel(QFrame):
             self._set_chip("Idle", "badgeIdle")
         if not self._built:
             if status.get("active") or state in {S_INTERRUPTED, S_DONE} or status.get("missed_rounds"):
-                self._set_expanded(True)
+                self.ensure_built()
+            else:
+                self._sync_bar_texts(status)
             return
         if status.get("active") or state in {S_INTERRUPTED, S_DONE}:
             if state == S_WAITING_SCHEDULE and status.get("next_round"):
@@ -1121,53 +1238,167 @@ class CellularPanel(QFrame):
             details: list[str] = []
             if status.get("rounds_total", 0) > 1 and status.get("round_index"):
                 details.append(f"pass {status['round_index']} of {status['rounds_total']}")
-            pending = int(status.get("workbook_pending") or 0)
-            wb_status = str(status.get("workbook_status") or "")
-            if pending:
-                details.append(f"{pending} Excel update(s) pending" + (" — the workbook is busy; written when it is free" if wb_status == "busy" else ""))
-            elif wb_status == "error":
-                details.append("Excel update failed — see the activity log")
-            if status.get("pending_downloads"):
-                details.append(f"{status['pending_downloads']} download(s) in progress")
-            if status.get("pause_reason") and state in {S_PAUSED, S_PAUSED_BACKLOG}:
-                details.append(str(status["pause_reason"]))
+            # The status line may already say it ("Paused: Downloads: 10 waiting (limit 8)…").
+            details.extend(item for item in self._background_details(status) if item not in text)
+            reason = str(status.get("pause_reason") or "")
+            if reason and state in {S_PAUSED, S_PAUSED_BACKLOG} and reason not in text:
+                details.append(reason)
             self.detail_label.setText(" · ".join(details))
             self.detail_label.setVisible(bool(details))
         else:
-            if not self._identity_pending and not self._importing:
-                if self.plan is None:
-                    self.status_label.setText("Idle · load a protocol workbook")
-                elif self.plan.ready:
-                    self.status_label.setText("Ready to start")
-                else:
-                    self.status_label.setText("Fix the problems listed in Preview before starting")
-            pending = int(status.get("workbook_pending") or 0)
-            if pending:
-                # Results left over from an earlier run are still waiting for the workbook.
-                self.detail_label.setText(f"{pending} Excel update(s) pending from the last collection — written when the workbook is free")
-                self.detail_label.setVisible(True)
-            else:
-                self.detail_label.setText("")
-                self.detail_label.setVisible(False)
+            self._sync_bar_texts(status)
         self._sync_buttons(status)
+        self._update_results(status)
         if state in {S_INTERRUPTED, S_WAITING_SCHEDULE, S_DONE} or status.get("missed_rounds"):
             self._refresh_recovery()
 
-    def _sync_buttons(self, status: dict) -> None:
+    @staticmethod
+    def _background_details(status: dict) -> list[str]:
+        """'Downloads: 2 waiting' and the Excel state; recording progress is the status line's job."""
+        out: list[str] = []
+        downloads = int(status.get("pending_downloads") or 0)
+        if downloads:
+            out.append(f"Downloads: {downloads} waiting")
+        pending = int(status.get("workbook_pending") or 0)
+        wb_status = str(status.get("workbook_status") or "")
+        if pending:
+            out.append(f"Excel updates pending: {pending}" + (" (the workbook is busy)" if wb_status == "busy" else ""))
+        elif wb_status == "error":
+            out.append("Excel update failed; trying again")
+        return out
+
+    def _sync_bar_texts(self, status: dict) -> None:
+        """Status line while no collection runs."""
+        if not self._identity_pending and not self._importing:
+            self.status_label.setToolTip(self.summary_text())
+            if self.plan is None:
+                self.status_label.setText("Load a protocol workbook")
+            elif self.plan.ready:
+                # Short enough for the pinned bar; the full summary line is in the form.
+                self.status_label.setText(f"Ready to start · {_plural(len(self.plan.tasks), 'row')}")
+            else:
+                self.status_label.setText("Fix the problems listed in Preview before starting")
+        details = self._background_details(status)
+        self.detail_label.setText(" · ".join(details))
+        self.detail_label.setVisible(bool(details))
+        self._sync_buttons(status)
+
+    # ------------------------------------------------------------------ results
+    def _update_results(self, status: dict) -> None:
         if not self._built:
             return
+        self.result_card.set_view(self.runner.last_task_view())
+        round_id = str(status.get("last_round_id") or "")
+        counts = status.get("pass_counts") or {}
+        finished = bool(round_id) and not status.get("round_id") and any(counts.values())
+        if not finished or round_id == self._pass_dismissed:
+            self.pass_box.setVisible(False)
+            return
+        session = self.runner.session
+        index = next((i + 1 for i, r in enumerate(session.rounds) if r.round_id == round_id), 0) if session else 0
+        self.pass_title.setText(f"Pass {index} finished" if index else "Pass finished")
+        self.pass_counts.setText(str(status.get("pass_summary") or ""))
+        failed = int(counts.get("failed", 0) or 0)
+        uncertain = int(counts.get("uncertain", 0) or 0)
+        active = bool(status.get("active"))
+        legacy = bool(status.get("legacy"))
+        can_retry = (failed or uncertain) and not active and not legacy
+        self.retry_btn.setVisible(bool(failed or uncertain))
+        self.retry_btn.setEnabled(bool(can_retry))
+        if active and (failed or uncertain):
+            hint = "Available when the collection has stopped."
+        elif uncertain and not failed:
+            hint = "Uncertain rows are checked with the sensor first; a row whose file is found is not sent again."
+        elif int(counts.get("partial", 0) or 0):
+            hint = "Partial rows are kept and not retried."
+        else:
+            hint = ""
+        self.pass_hint.setText(hint)
+        self.pass_hint.setVisible(bool(hint))
+        self.pass_box.setVisible(True)
+
+    def _retry_failed(self) -> None:
+        round_id = str(self.runner.status().get("last_round_id") or "")
+        self.retry_btn.setEnabled(False)
+        self.pass_hint.setText("Checking with the sensor…")
+        self.pass_hint.setVisible(True)
+
+        def done(message: str) -> None:
+            self._host_log(message)
+            self.pass_hint.setText(message)
+            self._on_status(self.runner.status())
+
+        self.runner.retry_failed(round_id or None, done)
+
+    def _dismiss_pass(self) -> None:
+        self._pass_dismissed = str(self.runner.status().get("last_round_id") or "")
+        self.pass_box.setVisible(False)
+
+    def _open_result_folder(self) -> None:
+        view = self.result_card.view
+        if view is not None and view.local_paths and not desktop_open.reveal(view.local_paths[0]):
+            self._host_log("Could not open the folder.", "error")
+
+    def _show_result_waterfall(self) -> None:
+        view = self.result_card.view
+        if view is None or not view.local_paths:
+            return
+        self._waterfall = WaterfallDialog(view.local_paths[0], center_hz=view.centre_hz, bandwidth_hz=view.bandwidth_hz, parent=self.window())
+        self._waterfall.show()
+
+    def _host_busy_reason(self) -> str:
+        """Why Start waits for the other tab ('Manual recording is running.'), or ''."""
+        probe = getattr(self.host, "manual_busy_reason", None)
+        try:
+            return str(probe() or "") if callable(probe) else ""
+        except Exception:  # noqa: BLE001 - advisory
+            return ""
+
+    def _start_reason(self, host: str, *, ready: bool, active: bool, blocked: bool, previous: str = "") -> str:
+        if active or self._identity_pending:
+            return ""
+        if host:
+            return host
+        if blocked:
+            return "Continue or dismiss the interrupted collection first."
+        if previous:
+            return previous
+        if self._importing:
+            return "Reading the worksheet…"
+        if self.plan is None:
+            return NO_WORKBOOK
+        if not ready:
+            return "Fix the problems listed in Preview first."
+        return ""
+
+    def _sync_buttons(self, status: dict) -> None:
         state = status.get("state", S_IDLE)
         active = bool(status.get("active"))
         ready = self.plan is not None and self.plan.ready and not self._importing
-        self.start_btn.setEnabled(ready and not active and state != S_INTERRUPTED and not self._identity_pending)
+        # A collection saved by an older version is never continued; a fresh plan may replace it.
+        blocked = state == S_INTERRUPTED and not bool(status.get("legacy"))
+        host = self._host_busy_reason()
+        reason = self._start_reason(host, ready=ready, active=active, blocked=blocked, previous=str(status.get("previous_work") or ""))
+        self.start_btn.setEnabled(ready and not active and not blocked and not self._identity_pending and not reason)
+        self.start_btn.setToolTip(reason or "Check the connected sensor, show the preview, then record the rows")
+        # Without a workbook the status line already says what to do.
+        shown = "" if reason == NO_WORKBOOK else reason
+        self.reason_label.setText(shown)
+        self.reason_label.setVisible(bool(shown))
         self.pause_btn.setEnabled(state in {S_RUNNING, S_WAITING, S_WAITING_SCHEDULE, S_PAUSED_BACKLOG})
         self.pause_btn.setVisible(state not in {S_PAUSED, S_PAUSED_BACKLOG, S_PAUSE_REQUESTED})
         self.resume_btn.setEnabled(state in {S_PAUSED, S_PAUSED_BACKLOG, S_PAUSE_REQUESTED})
         self.resume_btn.setVisible(state in {S_PAUSED, S_PAUSED_BACKLOG, S_PAUSE_REQUESTED})
         self.stop_btn.setEnabled(active)
         self.preview_btn.setEnabled(self.plan is not None and not self._importing)
+        self.preview_btn.setToolTip(
+            "The rows that will be recorded, in order, with the requested range of each"
+            if self.plan is not None else "Load a protocol workbook first."
+        )
+        if not self._built:
+            return
         self.reload_btn.setEnabled(bool(self.workbook_edit.text().strip()) and not active and not self._importing)
-        for widget in (self.browse_btn, self.sheet_combo, self.duration_spin, self.wait_spin, self.run_now, self.run_times, self.schedule_box, self.repeat_spin, self.until_stopped):
+        for widget in (self.browse_btn, self.sheet_combo, self.duration_spin, self.wait_spin, self.wait_unit, self.run_now, self.run_times, self.schedule_box, self.repeat_spin, self.until_stopped):
             widget.setEnabled(not active)
         if not active:
             self.repeat_spin.setEnabled(not self.until_stopped.isChecked())
@@ -1176,43 +1407,55 @@ class CellularPanel(QFrame):
     def _refresh_recovery(self) -> None:
         if not self._built:
             if self.runner.session is not None:
-                self._set_expanded(True)
+                self.ensure_built()
             return
         session = self.runner.session
         status = self.runner.status()
         missed = status.get("missed_rounds") or []
         interrupted = self.runner.interrupted()
-        if session is None or (not interrupted and not missed and status.get("state") != S_DONE):
+        legacy = bool(session is not None and session.plan.legacy)
+        if session is None or (not interrupted and not missed and not legacy):
+            # A finished collection is summarised by the pass summary above the form.
             self.recovery.setVisible(False)
             return
         lines = []
-        uncertain = self.runner.uncertain_tasks() if interrupted else []
-        if interrupted:
+        uncertain = self.runner.uncertain_tasks() if interrupted and not legacy else []
+        if legacy:
+            lines.append(
+                "This collection was saved by an older version. Its results are kept, "
+                "but it cannot be continued: start a fresh plan or discard it."
+            )
+        elif interrupted and self.runner.downloads_only():
+            uncertain = []
+            lines.append(
+                f"The application was closed before {_plural(self.runner.unfinished_downloads(), 'download')} finished. "
+                "The files are on the sensor; Continue downloads them."
+            )
+        elif interrupted:
             reason = f" ({session.pause_reason})" if session.pause_reason else ""
             if uncertain:
                 lines.append(
-                    f"The last collection was interrupted{reason}. {len(uncertain)} recording(s) may or may not exist on the sensor: "
-                    "check with the sensor before continuing, or skip them. Nothing is recorded again on its own."
+                    f"The last collection was interrupted{reason}. {_plural(len(uncertain), 'recording')} not confirmed: "
+                    "check with the sensor first, or skip them. Nothing is sent again on its own."
                 )
             elif self.runner.current_round() is not None:
-                lines.append(f"The last collection was interrupted during a pass{reason}. Nothing is recorded again on its own; Continue finishes the pass.")
+                lines.append(f"The last collection was interrupted during a pass{reason}. Continue finishes the pass.")
             else:
-                lines.append(
-                    "The application was closed while the collection was waiting for its next pass. "
-                    "Nothing is recorded again on its own; Continue keeps the remaining schedule."
-                )
-        if missed:
+                lines.append("The application was closed while waiting for the next pass. Continue keeps the schedule.")
+        if missed and not legacy:
             record = session.round(missed[0])
             when = format_datetime(record.scheduled_local.astimezone()) if record is not None else "its time"
-            lines.append(f"A scheduled pass was missed at {when} (the application was closed or the computer asleep). Run it now or skip it.")
-        if status.get("state") == S_DONE:
-            lines.append(status.get("text") or "Finished.")
+            lines.append(f"A scheduled pass was missed at {when}. Run it now or skip it.")
         self.recovery_label.setText("\n".join(lines))
         self.reconcile_btn.setVisible(interrupted and bool(uncertain))
-        self.resume_session_btn.setVisible(interrupted)
+        self.resume_session_btn.setVisible(interrupted and not legacy)
         self.skip_uncertain_btn.setVisible(interrupted and bool(uncertain))
-        self.run_missed_btn.setVisible(bool(missed))
-        self.skip_missed_btn.setVisible(bool(missed))
+        self.run_missed_btn.setVisible(bool(missed) and not legacy)
+        self.skip_missed_btn.setVisible(bool(missed) and not legacy)
+        self.discard_btn.setText("Discard" if legacy else "Dismiss")
+        self.discard_btn.setToolTip(
+            "Forget this collection; its files, record files and Excel results stay" if legacy else "Hide this notice"
+        )
         self.discard_btn.setVisible(not self.runner.active())
         self.recovery.setVisible(True)
 

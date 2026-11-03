@@ -323,17 +323,19 @@ def order_files(names: Iterable[str]) -> list[str]:
 
 
 def build_row_result(round_id: str, plan_index: int, tasks: list[dict[str, Any]], *, sensor: str) -> RowResult:
-    """One row's result from the session's task dictionaries (all windows of the row).
+    """One row's result from the session's task dictionaries (every request of the row).
 
-    Files: every confirmed part of every window, in the sensor's order. Duration:
-    the seconds of IQ those files hold, added over the windows (a row recorded as
-    three 5 s windows holds 15 s of IQ, not one continuous 5 s capture). Start:
-    the first window's capture start, from the sensor's file name when it carries
-    the time, else the moment the request was sent.
+    Files: every part of every recording of the row that has files, in the
+    sensor's order. Duration: the seconds of IQ read from those files' WAVE
+    headers, added over the row's recordings (the workbook's Repeat column
+    may send the same request more than once); unknown (empty) when any of
+    them could not be measured - never the requested time. Start: the
+    earliest start the sensor wrote into the files (CRFS metadata, else the
+    UTC time in the file name); unknown when neither is available.
     """
     files: list[str] = []
     seconds = 0.0
-    measured = False
+    unknown = False
     starts: list[datetime] = []
     keys: list[str] = []
     confirmed = 0
@@ -347,25 +349,41 @@ def build_row_result(round_id: str, plan_index: int, tasks: list[dict[str, Any]]
         files.extend(names)
         held = summary.get("held_s")
         if held is None:
-            # Confirmed files whose seconds could not be modelled (demo sensor,
-            # XDAT): the requested time is the best figure available.
-            held = summary.get("requested_s")
-        if held is not None:
+            unknown = True
+        else:
             seconds += float(held)
-            measured = True
-        start = capture_start_from_stem(str(summary.get("stem") or "")) or local_naive(summary.get("started_at")) or local_naive(task.get("started_utc"))
+        start = _metadata_start(task) or capture_start_from_stem(str(summary.get("stem") or ""))
         if start is not None:
             starts.append(start)
     return RowResult(
         round_id=round_id,
         plan_index=plan_index,
         files=order_files(files),
-        duration_s=round(seconds, DURATION_DIGITS) if measured and seconds > 0 else None,
+        duration_s=round(seconds, DURATION_DIGITS) if confirmed and not unknown and seconds > 0 else None,
         recorded_at=min(starts) if starts else None,
         sensor=sensor,
         complete=bool(tasks) and confirmed == len(tasks),
         task_keys=keys,
     )
+
+
+def _metadata_start(task: dict[str, Any]) -> datetime | None:
+    """Earliest signal time in the files' CRFS metadata, as local wall-clock time."""
+    values: list[datetime] = []
+    candidates = [f.get("signal_time") for f in task.get("files") or []]
+    measurement = (task.get("summary") or {}).get("measurement") or {}
+    candidates += [p.get("signal_time") for p in measurement.get("parts") or [] if isinstance(p, dict)]
+    for value in candidates:
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        values.append(parsed.astimezone().replace(tzinfo=None, microsecond=0))
+    return min(values) if values else None
 
 
 # ----------------------------------------------------------------------------- sheet adapters
@@ -656,18 +674,27 @@ class WriteReport:
     written: list[tuple[str, int, int]] = field(default_factory=list)  # (round_id, plan_index, sheet row)
     unchanged: int = 0
     skipped: list[str] = field(default_factory=list)
+    skipped_keys: list[tuple[str, int]] = field(default_factory=list)  # (round_id, plan_index) not written
+    conflicts: list[tuple[str, int]] = field(default_factory=list)  # ... because the row holds other entries
     blocks: dict[str, BlockRef] = field(default_factory=dict)
     last_row: int = 0
 
 
 def _write_row(sheet, layout: SheetLayout, row: int, result: RowResult) -> tuple[bool, str | None]:
-    """Write one row's result cells; (changed, problem)."""
+    """Write one row's result cells; (changed, problem).
+
+    Entries the application did not write are never overwritten: a row that
+    lists other recording files, or that has no file but a duration or time
+    typed in, is left as it is and reported.
+    """
     changed = False
     if layout.result:
         existing = _split_names(sheet.value(row, layout.result))
         wanted = list(result.files)
         if existing and set(existing) - set(wanted):
             return False, f"row {row} already lists other recording files ({', '.join(existing[:2])}…); left unchanged"
+        if not existing and any(col and _text(sheet.value(row, col)) for col in (layout.duration, layout.time)):
+            return False, f"row {row} already holds a duration or time entered by hand; left unchanged"
         if wanted and existing != wanted:
             sheet.set_value(row, layout.result, "\n".join(wanted), wrap=True)
             sheet.set_row_height(row, len(wanted))
@@ -719,6 +746,7 @@ def apply_results(
                     f"{round_id}: the rows of this round are no longer where they were in {layout.worksheet!r}; "
                     f"row {r.plan_index + 1} not written" for r in items
                 )
+                report.skipped_keys.extend((round_id, r.plan_index) for r in items)
                 continue
         else:
             block = allocate_block(sheet, layout, plan, round_id, list(report.blocks.values()))
@@ -727,14 +755,18 @@ def apply_results(
         for result in items:
             if not 0 <= result.plan_index < len(plan):
                 report.skipped.append(f"{round_id}: plan row {result.plan_index + 1} does not exist")
+                report.skipped_keys.append((round_id, result.plan_index))
                 continue
             row = rows[result.plan_index]
             if not _row_key(sheet, layout, row).matches(plan[result.plan_index].key):
                 report.skipped.append(f"{round_id}: row {row} does not hold {plan[result.plan_index].key.label()}; not written")
+                report.skipped_keys.append((round_id, result.plan_index))
                 continue
             changed, problem = _write_row(sheet, layout, row, result)
             if problem:
                 report.skipped.append(f"{round_id}: {problem}")
+                report.skipped_keys.append((round_id, result.plan_index))
+                report.conflicts.append((round_id, result.plan_index))
                 continue
             if changed:
                 report.written.append((round_id, result.plan_index, row))
@@ -900,6 +932,7 @@ class WorkbookQueue:
         data.setdefault("blocks", {})
         data.setdefault("backups", {})
         data.setdefault("written", [])
+        data.setdefault("conflicts", [])
         return data
 
     def _save(self) -> None:
@@ -929,6 +962,17 @@ class WorkbookQueue:
     def was_written(self, round_id: str, plan_index: int) -> bool:
         with self._lock:
             return any(w.get("round_id") == round_id and int(w.get("plan_index", -1)) == plan_index for w in self._data["written"])
+
+    def row_state(self, round_id: str, plan_index: int) -> str:
+        """'written', 'pending', 'retrying' (a write failed), 'conflict' (row holds other entries) or ''."""
+        with self._lock:
+            for item in self._data["pending"]:
+                got = item.get("result") or {}
+                if got.get("round_id") == round_id and int(got.get("plan_index", -1)) == plan_index:
+                    return "retrying" if item.get("last_error") else "pending"
+            if any(c.get("round_id") == round_id and int(c.get("plan_index", -1)) == plan_index for c in self._data.get("conflicts") or []):
+                return "conflict"
+        return "written" if self.was_written(round_id, plan_index) else ""
 
     # ---- changes
     def enqueue(self, workbook: Path, layout: SheetLayout, plan: list[PlanRow], result: RowResult) -> bool:
@@ -971,9 +1015,32 @@ class WorkbookQueue:
                 p for p in self._data["pending"]
                 if (_norm(Path(p.get("workbook") or "")), (p.get("result") or {}).get("round_id"), int((p.get("result") or {}).get("plan_index", -1))) not in keys
             ]
-            for round_id, plan_index, row in written_rows:
-                self._data["written"].append({"round_id": round_id, "plan_index": plan_index, "row": row, "at": datetime.now().isoformat(timespec="seconds")})
+            rows = {(round_id, plan_index): row for round_id, plan_index, row in written_rows}
+            now = datetime.now().isoformat(timespec="seconds")
+            for item in items:
+                # A result already in the sheet unchanged counts as written too (row 0: not changed now).
+                key = (item.result.round_id, item.result.plan_index)
+                self._data["written"].append({"round_id": key[0], "plan_index": key[1], "row": rows.get(key, 0), "at": now})
+            self._data["conflicts"] = [
+                c for c in self._data.get("conflicts") or []
+                if (c.get("round_id"), int(c.get("plan_index", -1))) not in {(i.result.round_id, i.result.plan_index) for i in items}
+            ]
             self._data["written"] = self._data["written"][-5000:]
+            self._save()
+
+    def mark_conflict(self, items: list[PendingItem], reason: str) -> None:
+        """Rows holding entries the application did not write: reported once, not retried."""
+        with self._lock:
+            keys = {(_norm(Path(i.workbook)), i.result.round_id, i.result.plan_index) for i in items}
+            self._data["pending"] = [
+                p for p in self._data["pending"]
+                if (_norm(Path(p.get("workbook") or "")), (p.get("result") or {}).get("round_id"), int((p.get("result") or {}).get("plan_index", -1))) not in keys
+            ]
+            conflicts = self._data.setdefault("conflicts", [])
+            now = datetime.now().isoformat(timespec="seconds")
+            for item in items:
+                conflicts.append({"round_id": item.result.round_id, "plan_index": item.result.plan_index, "reason": reason[:300], "at": now})
+            self._data["conflicts"] = conflicts[-2000:]
             self._save()
 
     def mark_failed(self, items: list[PendingItem], error: str) -> None:
@@ -1068,14 +1135,20 @@ def flush_queue(queue: WorkbookQueue, *, excel_open: Callable[[Path], bool] = ex
                 if rid not in before:
                     report.blocks_created.append((rid, block.ordinal, block.first_row))
             queue.record_blocks(file, written.blocks)
-            done = [item for item in group if item.result.round_id in written.blocks and not any(
-                s.startswith(f"{item.result.round_id}:") and f"row {item.result.plan_index + 1}" in s for s in written.skipped
-            )]
+            skipped = set(written.skipped_keys)
+            conflicts = set(written.conflicts)
+            done = [
+                item for item in group
+                if item.result.round_id in written.blocks and (item.result.round_id, item.result.plan_index) not in skipped
+            ]
             queue.mark_done(done, written_rows=written.written)
             report.written += len(written.written)
             report.unchanged += written.unchanged
             report.notes.extend(written.skipped)
-            left = [item for item in group if item not in done]
+            clashing = [item for item in group if (item.result.round_id, item.result.plan_index) in conflicts]
+            if clashing:
+                queue.mark_conflict(clashing, "; ".join(written.skipped)[:300])
+            left = [item for item in group if item not in done and item not in clashing]
             if left:
                 queue.mark_failed(left, "; ".join(written.skipped)[:300] or "not written")
         except ExcelBusyError as exc:

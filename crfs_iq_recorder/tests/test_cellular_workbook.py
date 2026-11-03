@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -208,6 +208,52 @@ def test_a_row_that_lists_other_files_is_left_alone(tmp_path: Path):
     assert _values(path)[1][6] == "renamed_by_hand.wav"
 
 
+def test_a_hand_typed_duration_is_a_conflict_reported_once_never_retried_or_appended(tmp_path: Path):
+    """Retry rule: a row the application did not fill (a duration or time typed in, no file
+    listed) is left unchanged, reported, and not queued again; no row is added for it."""
+    path = make_workbook(tmp_path / "p.xlsx")
+    wb = load_workbook(path)
+    wb["Cellular Protocol"]["H3"].value = 5
+    wb.save(path)
+    wb.close()
+    imported = _import(path)
+    layout, plan = layout_from_import(imported), plan_rows_from_import(imported)
+    queue = WorkbookQueue(tmp_path / "state" / "workbook_queue.json")
+    t = datetime(2026, 11, 3, 9)
+    queue.enqueue(path, layout, plan, _result("r1", 0, ["a0.wav"], 2.0, t))
+    queue.enqueue(path, layout, plan, _result("r1", 1, ["a1.wav"], 2.0, t))
+    assert queue.row_state("r1", 0) == "pending" and queue.row_state("r1", 1) == "pending"
+    report = flush_queue(queue, excel_open=lambda p: False)
+    assert report.written == 1 and report.pending == 0
+    assert any("entered by hand" in note for note in report.notes)
+    assert queue.row_state("r1", 0) == "written"
+    assert queue.row_state("r1", 1) == "conflict"
+    values = _values(path)
+    assert values[2][6] is None and values[2][7] == 5, "the typed duration stays; no file is added"
+    assert len(values) == 5, "no row appended"
+    # The same result queued again is reported again and still not written or appended.
+    queue.enqueue(path, layout, plan, _result("r1", 1, ["a1.wav"], 2.0, t))
+    again = flush_queue(queue, excel_open=lambda p: False)
+    assert again.written == 0 and again.pending == 0 and queue.row_state("r1", 1) == "conflict"
+    assert len(_values(path)) == 5
+
+
+def test_row_state_reports_a_failed_write_as_retrying_until_it_lands(tmp_path: Path):
+    path = make_workbook(tmp_path / "p.xlsx")
+    imported = _import(path)
+    layout, plan = layout_from_import(imported), plan_rows_from_import(imported)
+    queue = WorkbookQueue(tmp_path / "state" / "workbook_queue.json")
+    queue.enqueue(path, layout, plan, _result("r1", 2, ["b.wav"], 1.0, datetime(2026, 11, 3, 9)))
+    moved = path.with_name("away.xlsx")
+    path.rename(moved)
+    report = flush_queue(queue, excel_open=lambda p: False)
+    assert "not found" in report.error and queue.row_state("r1", 2) == "retrying"
+    moved.rename(path)
+    report = flush_queue(queue, excel_open=lambda p: False)
+    assert report.ok and report.written == 1 and queue.row_state("r1", 2) == "written"
+    assert queue.row_state("r1", 3) == "" and queue.row_state("r2", 2) == ""
+
+
 def test_rewriting_the_same_result_changes_nothing(tmp_path: Path):
     path = make_workbook(tmp_path / "p.xlsx")
     imported = _import(path)
@@ -234,6 +280,32 @@ def test_split_files_of_several_windows_are_grouped_in_one_cell():
     assert result.complete is True and result.task_keys == ["k1", "k2"]
     partial = build_row_result("r1", 4, tasks + [{"task_key": "k3", "status": "failed"}], sensor="CRFS 100-18")
     assert partial.complete is False and partial.duration_s == pytest.approx(10.004)
+
+
+def test_row_result_writes_only_what_the_files_say():
+    """Measured duration or nothing; the start from the files' metadata or name, never the request time."""
+    unmeasured = [
+        {"task_key": "k1", "status": "confirmed", "files": [{"name": "iq_20261103_171321_0001.wav"}],
+         "summary": {"held_s": None, "requested_s": 2.0, "stem": "iq_20261103_171321", "started_at": "2026-11-03T19:13:00"}},
+    ]
+    result = build_row_result("r1", 0, unmeasured, sensor="CRFS 100-18")
+    assert result.duration_s is None, "the requested 2 s is never written as the duration"
+    assert result.recorded_at == capture_start_from_stem("iq_20261103_171321")
+    # One of two recordings unmeasured: the row's total is unknown, not the measured half.
+    mixed = unmeasured + [{"task_key": "k2", "status": "confirmed", "files": [{"name": "iq_20261103_171405_0001.wav"}],
+                           "summary": {"held_s": 1.98, "stem": "iq_20261103_171405"}}]
+    assert build_row_result("r1", 0, mixed, sensor="CRFS 100-18").duration_s is None
+    # No time in the files and none in the name: unknown, not the moment the request was sent.
+    nameless = [{"task_key": "k1", "status": "confirmed", "files": [{"name": "capture.wav"}],
+                 "summary": {"held_s": 1.5, "stem": "capture", "started_at": "2026-11-03T19:13:00"},
+                 "started_utc": "2026-11-03T17:13:00+00:00"}]
+    blind = build_row_result("r1", 0, nameless, sensor="CRFS 100-18")
+    assert blind.recorded_at is None and blind.duration_s == pytest.approx(1.5)
+    # The CRFS metadata time wins over the file name (both UTC, shown as local time).
+    nameless[0]["files"][0]["signal_time"] = "2026-11-03T17:13:21.250000+00:00"
+    stamped = build_row_result("r1", 0, nameless, sensor="CRFS 100-18")
+    expected = datetime(2026, 11, 3, 17, 13, 21, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    assert stamped.recorded_at == expected
 
 
 def test_capture_start_is_local_time_from_the_utc_stem():

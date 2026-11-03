@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -44,7 +45,8 @@ from PySide6.QtWidgets import (
 from . import APP_NAME, __version__
 from .api_client import EmpClient, HttpOutcome
 from .cellular_panel import CellularPanel
-from .cellular_runner import CellularRunner
+from .cellular_plan import REQUEST_SENTENCE
+from .cellular_runner import OWNER, S_INTERRUPTED, CellularRunner
 from .capture_api import (
     OUTCOME_BUSY,
     OUTCOME_CONFIRMED,
@@ -78,6 +80,25 @@ from .constants import (
 )
 from .demo import DemoTransport
 from .demo_sftp import shared_demo_browser
+from .capture_measure import (
+    HEADER_RETRIES,
+    HEADER_RETRY_S,
+    RESULT_COMPLETED,
+    RESULT_FAILED,
+    RESULT_PARTIAL,
+    CaptureMeasurement,
+    PartMeasurement,
+    Verdict,
+    classify,
+    coverage_differs,
+    coverage_text,
+    measure_parts,
+    received_text,
+)
+from . import desktop_open, diagnostic_log
+from .diagnostic_log import diag, register_secret, scrub_operator
+from .diagnostic_report import RECENT_LINES, build_report
+from .operator_text import files_text, measured_text, range_text, seconds_text, sensor_notice
 from .excel_log import ExcelLogStore, flush_excel_queue, pending_from_row
 from .excel_writer import ExcelRow
 from .file_watch import (
@@ -116,10 +137,16 @@ from .recording_history import (
     remote_directory,
     remove_recording,
 )
+from .recording_download import RecordingDownload
+from .result_card import ResultCard
+from .result_view import ResultView, view_from_summary
+from .waterfall_dialog import WaterfallDialog
 from .recording_status import (
     CONFIRMED,
+    FAILED,
     FINALIZING,
     IDLE,
+    PARTIAL,
     PHASE_LABELS,
     RECORDING,
     SUBMITTING,
@@ -146,11 +173,10 @@ from .sensor_storage import (
 from .size_estimate import (
     SizeEstimateError,
     format_estimate,
-    recorded_seconds_from_bytes,
     wave_size_model,
 )
 from .merge_controller import MergeController
-from .sftp_window import SftpWindow, _open_browser
+from .sftp_window import SftpWindow, _normalise_dir, _open_browser
 from .cellular_panel import FieldLabel
 from .theme import (
     CONTROL_H,
@@ -171,6 +197,10 @@ from .theme import (
 from .validation import ValidationError, parse_connection, parse_recorded_time
 from .worker_threads import stop_worker_threads
 from .worker_threads import track as track_worker_thread
+
+TAB_MANUAL = "Manual Recording"
+TAB_EXCEL = "Excel Collection"
+
 
 def configure_appearance(app: QApplication, mode: str | None = None) -> None:
     apply_theme(app, mode)
@@ -240,6 +270,8 @@ class MainWindow(QMainWindow):
     # Carries a capture_api.CaptureSummary; emitted on the UI thread for every
     # capture, manual or programmatic, exactly once.
     capture_finished = Signal(object)
+    # The same summary, for the result cards (emitted just before capture_finished).
+    last_capture_changed = Signal(object)
 
     def __init__(self, *, demo: bool = False) -> None:
         super().__init__()
@@ -277,6 +309,19 @@ class MainWindow(QMainWindow):
         self._sensor_parts: list[str] = []
         self._sensor_warnings: list[str] = []
         self._sensor_message_counts: dict[str, int] = {}
+        # Sensor notices shown once per session in the Activity panel (counted in the diagnostic log).
+        self._noted_sensor_messages: set[str] = set()
+        self._sensor_error = ""
+        self._sensor_reply: dict[str, Any] = {}
+        self._sent_scan: dict[str, Any] = {}
+        self._sent_range: tuple[int, int] = (0, 0)
+        self._coverage_noted = False
+        self._watch_error_noted = False
+        self._measurement = None
+        self._measuring = False
+        self._measure_cancel: threading.Event | None = None
+        self._measure_token = 0
+        self._last_summary: CaptureSummary | None = None
         self._expected_bytes = 0
         self._pending_excel_entries: list = []
         self.record_event.connect(self._on_record_event, Qt.ConnectionType.QueuedConnection)
@@ -300,6 +345,15 @@ class MainWindow(QMainWindow):
         self._series_active = False
         self._series_remaining: int | None = None
         self._stop_after_current = False
+        # Pause of a manual series: requested during a recording, effective after it.
+        self._pause_requested = False
+        self._series_paused = False
+        self._paused_wait_s = 0.0
+        self._paused_at = 0.0
+        self._last_manual_summary: CaptureSummary | None = None
+        self._manual_download: RecordingDownload | None = None
+        self._manual_download_text = ""
+        self._waterfall: WaterfallDialog | None = None
         self._watching = False
         self._waiting = False
         self._wait_deadline = 0.0
@@ -312,6 +366,8 @@ class MainWindow(QMainWindow):
         self._watch_token = 0
         self._watch_in_flight = False
         self._demo_parts = 1
+        # Share of the requested seconds the demo sensor writes (tests set it below 1 for a partial recording).
+        self._demo_fraction = 1.0
         self._settle_s = 8.0
         self._stable_needed = 2
         self._record_timer = QTimer(self)
@@ -340,6 +396,8 @@ class MainWindow(QMainWindow):
         self._link_timer.setInterval(LINK_CHECK_INTERVAL_MS)
         self._link_timer.timeout.connect(self._poll_link)
         self._conn = ConnectionState.from_settings(load_settings(), demo=demo)
+        register_secret(self._conn.http_password)
+        register_secret(self._conn.sftp_password)
         self._plan = self._conn.frequency_plan()
         self._merge.enabled = bool(self._conn.merge_parts)
         # Cellular Collection drives captures through start_capture()/capture_finished
@@ -390,6 +448,8 @@ class MainWindow(QMainWindow):
         self._sync_connection_label()
         self._catalog_token = 0
         self._update_collection_status()
+        self.last_capture_changed.connect(self._on_last_capture)
+        self._restore_tab()
         if current_mode() != self._conn.ui_theme:
             app = QApplication.instance()
             if app is not None:
@@ -412,6 +472,7 @@ class MainWindow(QMainWindow):
     def _start_background_init(self) -> None:
         if not self._alive:
             return
+        self._report_missing_locations()
         if self._conn.excel_workbook:
             if self._conn.demo:
                 self._load_workbook(self._conn.excel_workbook, quiet=True)
@@ -432,6 +493,42 @@ class MainWindow(QMainWindow):
             # Excel COM checks run on the UI thread; give the window a moment
             # to paint and settle before the first queue flush.
             QTimer.singleShot(1500, self._flush_excel)
+
+    def _report_missing_locations(self) -> None:
+        """Restored settings that point nowhere: one actionable line each, nothing else changes."""
+        stored = str(self._conn.download_dir or "").strip()
+        if stored and not self._conn.demo:
+            folder = resolved_download_dir(stored)
+            if not folder.exists():
+                drive = Path(folder.anchor) if folder.anchor else None
+                diag("download_dir_missing", folder.name, drive_present=bool(drive and drive.exists()))
+                if drive is not None and not drive.exists():
+                    self.log("Download folder not found. Choose it again in Settings.", level="error")
+                else:
+                    self.log("Download folder not found. It is created again at the first download.")
+        book = str(self._conn.excel_workbook or "").strip()
+        if book and self.excel_check.isChecked() and not Path(book).is_file():
+            diag("excel_log_missing", Path(book).name)
+            self.log("Excel log workbook not found. Choose the file again.", level="error")
+            self.collection_status.setText("Excel log workbook not found. Choose the file again.")
+
+    def _restore_tab(self) -> None:
+        """The tab of the last session; a collection that needs attention opens its own tab."""
+        status = self._cellular.status()
+        attention = bool(status.get("active")) or status.get("state") == S_INTERRUPTED or bool(status.get("missed_rounds"))
+        excel = self._conn.ui_tab == "excel" or attention
+        if excel:
+            self.tabs.setCurrentIndex(1)
+            self.cellular_panel.ensure_built()
+        self._sync_other_tab_reasons()
+
+    def _on_tab_changed(self, index: int) -> None:
+        """Only what is shown changes; any running operation carries on."""
+        self._conn.ui_tab = "excel" if index == 1 else "manual"
+        if index == 1:
+            self.cellular_panel.ensure_built()
+        else:
+            self._refresh_manual_card()
 
     def _header(self) -> QWidget:
         bar = QFrame()
@@ -474,6 +571,12 @@ class MainWindow(QMainWindow):
         self.activity_btn.setAutoDefault(False)
         self.activity_btn.clicked.connect(self._toggle_log)
         layout.addWidget(self.activity_btn)
+        self.sftp_btn = QPushButton("Sensor Files")
+        self.sftp_btn.setObjectName("ghost")
+        self.sftp_btn.setAutoDefault(False)
+        self.sftp_btn.setToolTip("Browse, download and merge the recordings stored on the sensor")
+        self.sftp_btn.clicked.connect(self._open_sftp)
+        layout.addWidget(self.sftp_btn)
         settings_btn = QPushButton("Settings")
         settings_btn.setObjectName("ghost")
         settings_btn.setAutoDefault(False)
@@ -550,17 +653,42 @@ class MainWindow(QMainWindow):
         return button
 
     def _recording_panel(self) -> QWidget:
-        """The recording card: a scrolling form and, under it, the Cellular
-        action bar that stays in view while the form scrolls."""
-        holder = QWidget()
-        outer = QVBoxLayout(holder)
-        outer.setContentsMargins(0, 0, 0, 0)
+        """Two workflows under the shared sensor card: Manual Recording and
+        Excel Collection. Each tab is a card with a scrolling form and, pinned
+        under it, its own action bar. One workflow controls the sensor at a
+        time; switching tabs never stops, pauses or moves an operation."""
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("workflowTabs")
+        self.tabs.tabBar().setObjectName("workflowTabBar")
+        self.tabs.setDocumentMode(True)
+        self.tabs.addTab(self._manual_tab(), TAB_MANUAL)
+        self.tabs.addTab(self._excel_tab(), TAB_EXCEL)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        return self.tabs
+
+    @staticmethod
+    def _tab_page(form: QWidget, bar: QWidget) -> tuple[QWidget, QScrollArea]:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 8, 0, 0)
         card = QFrame()
         card.setObjectName("card")
         card_l = QVBoxLayout(card)
         card_l.setContentsMargins(0, 0, 0, 0)
         card_l.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setObjectName("formScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(form)
+        card_l.addWidget(scroll, 1)
+        card_l.addWidget(bar, 0)
+        outer.addWidget(card)
+        return page, scroll
 
+    def _manual_tab(self) -> QWidget:
         form = QWidget()
         form.setObjectName("section")
         layout = QVBoxLayout(form)
@@ -568,15 +696,9 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
-        head = QHBoxLayout()
-        head.setSpacing(12)
-        heading = QLabel("Recording")
-        heading.setObjectName("sectionTitle")
-        head.addWidget(heading)
         intro = QLabel("Set the band and time, then start.")
         intro.setObjectName("muted")
-        head.addWidget(intro, 1)
-        layout.addLayout(head)
+        layout.addWidget(intro)
 
         self.mode_start = QRadioButton("Start / End")
         self.mode_center = QRadioButton("Center / Bandwidth")
@@ -652,40 +774,21 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.format_combo, 2, 1)
         grid.addWidget(time_label, 3, 0)
         grid.addWidget(time_box, 3, 1)
-        for row in range(4):
+        self._repeat_rows(grid, 4)
+        for row in range(5):
             grid.setRowMinimumHeight(row, CONTROL_H)
         layout.addWidget(fields)
 
         self.msg = QLabel("")
         self.msg.setWordWrap(True)
+        self.msg.setVisible(False)
         layout.addWidget(self.msg)
 
-        layout.addWidget(divider(form))
-        layout.addWidget(self._collection_section())
-
-        self.start_btn = QPushButton("Start Recording")
-        self.start_btn.setObjectName("primary")
-        self.start_btn.setDefault(True)
-        self.start_btn.setFixedHeight(PRIMARY_H)
-        self.start_btn.clicked.connect(self._on_start)
-        layout.addWidget(self.start_btn)
-
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        self.stop_btn = self._ghost_button("Stop after current recording", "Finish the recording in progress, then stop the series")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self._on_stop_after_current)
-        actions.addWidget(self.stop_btn)
-        actions.addStretch(1)
-        self.sftp_btn = self._ghost_button("Sensor Files", "Browse, download and merge the recordings stored on the sensor")
-        self.sftp_btn.clicked.connect(self._open_sftp)
-        actions.addWidget(self.sftp_btn)
-        layout.addLayout(actions)
-
-        self.phase_label = QLabel(PHASE_LABELS[IDLE])
-        self.phase_label.setObjectName("muted")
-        self.phase_label.setWordWrap(True)
-        layout.addWidget(self.phase_label)
+        self.manual_result = ResultCard("Last recording", downloadable=True)
+        self.manual_result.download_clicked.connect(self._download_last_recording)
+        self.manual_result.open_folder_clicked.connect(self._open_last_recording_folder)
+        self.manual_result.waterfall_clicked.connect(self._show_last_recording_waterfall)
+        layout.addWidget(self.manual_result)
 
         merge_row = QHBoxLayout()
         merge_row.setSpacing(8)
@@ -718,24 +821,134 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.merge_progress)
 
         layout.addWidget(divider(form))
+        layout.addWidget(self._collection_section())
+        layout.addStretch(1)
+
+        page, self.form_scroll = self._tab_page(form, self._manual_action_bar())
+        return page
+
+    def _manual_action_bar(self) -> QFrame:
+        """Status and Start / Pause / Resume / Stop of the manual tab, pinned under its form."""
+        bar = QFrame()
+        bar.setObjectName("actionBar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(14, 8, 14, 8)
+        row.setSpacing(8)
+        texts = QVBoxLayout()
+        texts.setContentsMargins(0, 0, 0, 0)
+        texts.setSpacing(1)
+        self.phase_label = QLabel(PHASE_LABELS[IDLE])
+        self.phase_label.setObjectName("muted")
+        self.phase_label.setWordWrap(True)
+        # Why Start is not available right now ("Excel Collection is running.").
+        self.manual_reason = QLabel("")
+        self.manual_reason.setObjectName("reasonText")
+        self.manual_reason.setWordWrap(True)
+        self.manual_reason.setVisible(False)
+        texts.addWidget(self.phase_label)
+        texts.addWidget(self.manual_reason)
+        row.addLayout(texts, 1)
+        self.start_btn = QPushButton("Start Recording")
+        self.start_btn.setObjectName("primary")
+        self.start_btn.setDefault(True)
+        self.start_btn.setFixedHeight(PRIMARY_H)
+        self.start_btn.setMinimumWidth(170)
+        self.start_btn.clicked.connect(self._on_start)
+        self.pause_btn = self._ghost_button("Pause", "Pauses after the current recording")
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.clicked.connect(self._on_pause_series)
+        self.resume_btn = self._ghost_button("Resume", "Continue the series with the next recording")
+        self.resume_btn.setVisible(False)
+        self.resume_btn.clicked.connect(self._on_resume_series)
+        self.stop_btn = self._ghost_button("Stop", "Stops after the current recording")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._on_stop_after_current)
+        for button in (self.start_btn, self.pause_btn, self.resume_btn, self.stop_btn):
+            row.addWidget(button, 0, Qt.AlignmentFlag.AlignVCenter)
+        return bar
+
+    def _excel_tab(self) -> QWidget:
+        form = QWidget()
+        form.setObjectName("section")
+        layout = QVBoxLayout(form)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(10)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        intro = QLabel(REQUEST_SENTENCE)
+        intro.setObjectName("muted")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
         self.cellular_panel = CellularPanel(self._cellular, host=self, config_dir=user_config_dir())
         layout.addWidget(self.cellular_panel)
         layout.addStretch(1)
-
-        scroll = QScrollArea()
-        scroll.setObjectName("formScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setWidget(form)
-        self.form_scroll = scroll
-        card_l.addWidget(scroll, 1)
-        # The Cellular action bar is pinned under the form; it shows with the section.
         self.cellular_bar = self.cellular_panel.detach_action_bar()
-        card_l.addWidget(self.cellular_bar, 0)
-        outer.addWidget(card)
-        return holder
+        page, self.excel_scroll = self._tab_page(form, self.cellular_bar)
+        return page
+
+    def _repeat_rows(self, grid: QGridLayout, first_row: int) -> None:
+        """Repeat and wait of the manual series (rows of the manual form)."""
+        repeat_row = QHBoxLayout()
+        repeat_row.setSpacing(12)
+        self.repeat_off = QRadioButton("Off")
+        self.repeat_n = QRadioButton("Count")
+        self.repeat_until = QRadioButton("Until stopped")
+        self.repeat_off.setChecked(self._conn.repeat_mode == "off" or not self._conn.repeat_mode)
+        self.repeat_n.setChecked(self._conn.repeat_mode == "count")
+        self.repeat_until.setChecked(self._conn.repeat_mode == "until")
+        group = QButtonGroup(self)
+        group.addButton(self.repeat_off)
+        group.addButton(self.repeat_n)
+        group.addButton(self.repeat_until)
+        self.repeat_spin = QSpinBox()
+        self.repeat_spin.setRange(1, 999)
+        self.repeat_spin.setFixedSize(96, CONTROL_H)
+        self.repeat_spin.setValue(int(self._conn.repeat_count or 2))
+        self.repeat_spin.setEnabled(self.repeat_n.isChecked())
+        self.repeat_n.toggled.connect(lambda on: self.repeat_spin.setEnabled(on))
+        repeat_row.addWidget(self.repeat_off)
+        repeat_row.addWidget(self.repeat_n)
+        repeat_row.addWidget(self.repeat_spin)
+        repeat_row.addWidget(self.repeat_until)
+        repeat_row.addStretch(1)
+        grid.addWidget(FieldLabel("Repeat recording"), first_row, 0)
+        grid.addLayout(repeat_row, first_row, 1)
+
+        # In its own widget so that hiding it leaves an empty grid row (no spacing kept).
+        wait_box = QWidget()
+        wait_row = QHBoxLayout(wait_box)
+        wait_row.setContentsMargins(0, 0, 0, 0)
+        wait_row.setSpacing(8)
+        self.wait_spin = QDoubleSpinBox()
+        self.wait_spin.setRange(0, 10_000)
+        self.wait_spin.setDecimals(2)
+        self.wait_spin.setSingleStep(1)
+        self.wait_spin.setFixedSize(124, CONTROL_H)
+        self.wait_unit = QComboBox()
+        self.wait_unit.addItems(["Seconds", "Minutes"])
+        self.wait_unit.setFixedHeight(CONTROL_H)
+        self.wait_unit.setMinimumWidth(112)
+        apply_combo_popup_palette(self.wait_unit, dark=False)
+        unit = "Minutes" if self._conn.repeat_wait_unit == "minutes" else "Seconds"
+        self.wait_unit.setCurrentText(unit)
+        wait_s = max(float(self._conn.repeat_wait_s), 0.0)
+        self.wait_spin.setValue(wait_s / 60.0 if unit == "Minutes" else wait_s)
+        wait_row.addWidget(self.wait_spin)
+        wait_row.addWidget(self.wait_unit)
+        wait_row.addStretch(1)
+        self.wait_label = FieldLabel("Wait between recordings")
+        grid.addWidget(self.wait_label, first_row + 1, 0)
+        grid.addWidget(wait_box, first_row + 1, 1)
+        # The wait applies only to a repeated recording.
+        self._wait_widgets = (self.wait_label, wait_box)
+        for button in (self.repeat_off, self.repeat_n, self.repeat_until):
+            button.toggled.connect(self._sync_repeat_widgets)
+        self._sync_repeat_widgets()
+
+    def _sync_repeat_widgets(self, *_args) -> None:
+        repeating = self._repeat_mode() != "off"
+        for widget in self._wait_widgets:
+            widget.setVisible(repeating)
+        self._sync_series_buttons()
 
     def _collection_section(self) -> QWidget:
         box = QWidget()
@@ -746,8 +959,11 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 2, 0, 2)
         layout.setSpacing(10)
 
-        self.excel_check = QCheckBox("Log recordings to Excel")
-        self.excel_check.setToolTip("Append every recording to a worksheet of the collection workbook")
+        self.excel_check = QCheckBox("Log each recording to an Excel log workbook (.xlsm)")
+        self.excel_check.setToolTip(
+            "Adds a row per recording to a worksheet of your .xlsm collection log.\n"
+            "This is not the protocol workbook of the Excel Collection tab."
+        )
         self.excel_check.setChecked(bool(self._conn.excel_enabled))
         self.excel_check.toggled.connect(self._on_excel_toggled)
         layout.addWidget(self.excel_check)
@@ -800,58 +1016,10 @@ class MainWindow(QMainWindow):
         grid.addWidget(FieldLabel("Worksheet"), 3, 0)
         grid.addWidget(self.sheet_combo, 3, 1)
 
-        repeat_row = QHBoxLayout()
-        repeat_row.setSpacing(12)
-        self.repeat_off = QRadioButton("Off")
-        self.repeat_n = QRadioButton("Count")
-        self.repeat_until = QRadioButton("Until stopped")
-        self.repeat_off.setChecked(self._conn.repeat_mode == "off" or not self._conn.repeat_mode)
-        self.repeat_n.setChecked(self._conn.repeat_mode == "count")
-        self.repeat_until.setChecked(self._conn.repeat_mode == "until")
-        group = QButtonGroup(self)
-        group.addButton(self.repeat_off)
-        group.addButton(self.repeat_n)
-        group.addButton(self.repeat_until)
-        self.repeat_spin = QSpinBox()
-        self.repeat_spin.setRange(1, 999)
-        self.repeat_spin.setFixedSize(96, CONTROL_H)
-        self.repeat_spin.setValue(int(self._conn.repeat_count or 2))
-        self.repeat_spin.setEnabled(self.repeat_n.isChecked())
-        self.repeat_n.toggled.connect(lambda on: self.repeat_spin.setEnabled(on))
-        repeat_row.addWidget(self.repeat_off)
-        repeat_row.addWidget(self.repeat_n)
-        repeat_row.addWidget(self.repeat_spin)
-        repeat_row.addWidget(self.repeat_until)
-        repeat_row.addStretch(1)
-        grid.addWidget(FieldLabel("Repeat recording"), 4, 0)
-        grid.addLayout(repeat_row, 4, 1)
-
-        wait_row = QHBoxLayout()
-        wait_row.setSpacing(8)
-        self.wait_spin = QDoubleSpinBox()
-        self.wait_spin.setRange(0, 10_000)
-        self.wait_spin.setDecimals(2)
-        self.wait_spin.setSingleStep(1)
-        self.wait_spin.setFixedSize(124, CONTROL_H)
-        self.wait_unit = QComboBox()
-        self.wait_unit.addItems(["Seconds", "Minutes"])
-        self.wait_unit.setFixedHeight(CONTROL_H)
-        self.wait_unit.setMinimumWidth(112)
-        apply_combo_popup_palette(self.wait_unit, dark=False)
-        unit = "Minutes" if self._conn.repeat_wait_unit == "minutes" else "Seconds"
-        self.wait_unit.setCurrentText(unit)
-        wait_s = max(float(self._conn.repeat_wait_s), 0.0)
-        self.wait_spin.setValue(wait_s / 60.0 if unit == "Minutes" else wait_s)
-        wait_row.addWidget(self.wait_spin)
-        wait_row.addWidget(self.wait_unit)
-        wait_row.addStretch(1)
-        grid.addWidget(FieldLabel("Wait between recordings"), 5, 0)
-        grid.addLayout(wait_row, 5, 1)
-
         self.collection_status = QLabel("Recordings completed: 0  ·  Files found: 0  ·  Excel: Idle")
         self.collection_status.setObjectName("muted")
         self.collection_status.setWordWrap(True)
-        grid.addWidget(self.collection_status, 6, 1)
+        grid.addWidget(self.collection_status, 4, 1)
         layout.addWidget(details)
         self._sync_excel_details()
         return box
@@ -868,8 +1036,17 @@ class MainWindow(QMainWindow):
         title.setObjectName("sectionTitle")
         self.clear_btn = self._ghost_button("Clear", "Empty the activity log")
         self.clear_btn.clicked.connect(self._clear_log)
+        self.details_btn = self._ghost_button("See details", "Open the diagnostic log: sensor replies, exact requests and errors")
+        self.details_btn.clicked.connect(self._open_diagnostic_log)
+        self.copy_details_btn = self._ghost_button(
+            "Copy details",
+            "Copy diagnostic details of the last recording for support (no passwords or sensor address)",
+        )
+        self.copy_details_btn.clicked.connect(self._copy_diagnostic_details)
         head.addWidget(title)
         head.addStretch()
+        head.addWidget(self.details_btn)
+        head.addWidget(self.copy_details_btn)
         head.addWidget(self.clear_btn)
         layout.addLayout(head)
         self.log_edit = QPlainTextEdit()
@@ -963,6 +1140,9 @@ class MainWindow(QMainWindow):
             self._storage_cancel.set()
         self._close_watch_browser()
         self._abort_record_stream()
+        if self._manual_download is not None:
+            self._manual_download.abort()
+            self._manual_download = None
         if self._pending_excel_entries and self._open_record_id:
             # Closing mid-capture: queue what finished so far with the requested time.
             record = next((item for item in load_recordings() if item.id == self._open_record_id), None)
@@ -1061,6 +1241,8 @@ class MainWindow(QMainWindow):
             self._conn.repeat_count = int(self.repeat_spin.value())
             self._conn.repeat_wait_unit = "minutes" if self.wait_unit.currentText() == "Minutes" else "seconds"
             self._conn.repeat_wait_s = self._repeat_wait_s()
+        if hasattr(self, "tabs"):
+            self._conn.ui_tab = "excel" if self.tabs.currentIndex() == 1 else "manual"
 
     def _repeat_mode(self) -> str:
         if hasattr(self, "repeat_until") and self.repeat_until.isChecked():
@@ -1176,7 +1358,7 @@ class MainWindow(QMainWindow):
         self._class_user_set = False
         self._refresh_class_suggestion()
         if not quiet:
-            self.log(f"Workbook: {file.name} ({len(catalog.mappings)} class ranges).")
+            self.log(f"Logging workbook loaded: {file.name}.")
         self._update_collection_status()
 
     def _on_class_edited(self, _text: str = "") -> None:
@@ -1245,6 +1427,7 @@ class MainWindow(QMainWindow):
             f"Recordings completed: {self._recordings_completed}  ·  "
             f"Files found: {self._files_found}  ·  {excel}"
         )
+        self._refresh_manual_card()
 
     def _flush_excel(self) -> None:
         """Write queued rows. Real workbooks are written on a worker thread.
@@ -1278,9 +1461,9 @@ class MainWindow(QMainWindow):
             return
         saved, pending = result if isinstance(result, tuple) and len(result) == 2 else (0, 0)
         if saved:
-            self.log(f"Excel: saved {saved} row(s).")
+            self.log(f"Excel updated: {saved} row" + ("" if saved == 1 else "s") + ".")
         if pending:
-            self.log(f"Pending Excel updates: {pending}.")
+            self.log(f"Excel update pending: {pending} row" + ("" if pending == 1 else "s") + ".")
         self._update_collection_status()
         if self._excel_flush_again:
             self._excel_flush_again = False
@@ -1297,6 +1480,11 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_stop_after_current(self) -> None:
+        if self._series_paused:
+            self.log("Series stopped.")
+            self._set_msg("Stopped.")
+            self._end_series()
+            return
         if self._waiting:
             self._cancel_wait("Stopped. The next recording was cancelled.")
             self._end_series()
@@ -1304,9 +1492,47 @@ class MainWindow(QMainWindow):
         if not self._series_active:
             return
         self._stop_after_current = True
-        self.stop_btn.setEnabled(False)
+        self._sync_series_buttons()
         self.log("Stop after the current recording. No further recordings will start.")
         self._set_msg("Stopping after this recording.")
+
+    def _on_pause_series(self) -> None:
+        if self._series_paused or not (self._series_active or self._waiting):
+            return
+        if self._waiting:
+            left = max(self._wait_deadline - time.monotonic(), 0.0)
+            self._wait_timer.stop()
+            self._waiting = False
+            self._enter_series_pause(left)
+            return
+        self._pause_requested = True
+        self.log("Pausing after the current recording.")
+        self._set_msg("Pausing after this recording.")
+        self._sync_series_buttons()
+
+    def _enter_series_pause(self, wait_left_s: float) -> None:
+        self._series_paused = True
+        self._pause_requested = False
+        self._paused_wait_s = max(wait_left_s, 0.0)
+        self._paused_at = time.monotonic()
+        self._set_phase(IDLE, "Paused")
+        self._set_msg("Paused. Resume continues the series.")
+        self.log("Series paused.")
+        self._set_recording_ui(False)
+
+    def _on_resume_series(self) -> None:
+        if not self._series_paused:
+            return
+        self._series_paused = False
+        # Time spent paused counts towards the wait between recordings.
+        left = max(self._paused_wait_s - (time.monotonic() - self._paused_at), 0.0)
+        self._paused_wait_s = 0.0
+        self.log("Series resumed.")
+        if left > 0:
+            self._begin_wait(left)
+        else:
+            self._start_next_now()
+        self._set_recording_ui(self._recording_active)
 
     def _sync_connection_label(self) -> None:
         self.conn_label.setText(self._conn.host or "not set")
@@ -1373,7 +1599,7 @@ class MainWindow(QMainWindow):
         if state == CONNECTED:
             self.log("Sensor connected." if not self._link.demo else "Demo sensor ready.")
         elif state == RECONNECTING:
-            self.log("Sensor reconnecting...")
+            self.log("Sensor reconnecting…")
         elif state == DISCONNECTED:
             self.log("Sensor disconnected.", level="error")
 
@@ -1617,23 +1843,28 @@ class MainWindow(QMainWindow):
             return
         self._apply_sensor_info(info)
         if info.connected:
-            self.log(
-                f"{info.display_serial()} · {info.display_model()} · {info.display_firmware()}"
-            )
+            from .cellular_capabilities import readable_sensor_name
+
+            diag("sensor_identity", serial=info.serial, model=info.model, firmware=info.display_firmware())
+            self.log(f"Connected to {readable_sensor_name(info.model, info.display_model())}.")
         elif info.status not in {"Checking…", "No sensor IP", "Demo"}:
-            self.log(f"Could not read sensor details: {info.status}")
+            diag("sensor_identity_failed", str(info.status))
+            self.log("Could not read the sensor's details. See details.")
 
     def _open_settings(self) -> None:
         dialog = ConnectionDialog(self._conn, self)
         dialog.test_requested.connect(self._test_connection)
         if dialog.exec():
             self._conn = dialog.result_state()
+            register_secret(self._conn.http_password)
+            register_secret(self._conn.sftp_password)
             if self._demo_forced:
                 self._conn.demo = True
             try:
                 self._conn.download_dir = str(ensure_download_dir(self._conn.download_dir))
             except OSError as exc:
-                self.log(f"Could not create download folder: {exc}", level="error")
+                diag("download_folder", "could not create", error=str(exc))
+                self.log("Could not create the download folder. Choose another one in Settings.", level="error")
             self._capture_session_into_conn()
             save_settings(self._conn.persistable())
             if self._sftp_win is not None:
@@ -1642,7 +1873,7 @@ class MainWindow(QMainWindow):
             self._restart_link_monitor()
             self._refresh_sensor_info()
             self._refresh_storage()
-            self.log(f"Saved settings for {self._conn.host or '(no host)'}.")
+            self.log("Settings saved.")
 
     def _on_mode_changed(self) -> None:
         self._apply_mode_fields(self._plan)
@@ -1739,6 +1970,7 @@ class MainWindow(QMainWindow):
         self._refresh_size()
         if keep_text and keep_name != "error" and not self.msg.text():
             self.msg.setText(keep_text)
+            self.msg.setVisible(True)
             self.msg.setObjectName(keep_name)
             restyle(self.msg)
 
@@ -1753,16 +1985,131 @@ class MainWindow(QMainWindow):
 
     def _set_msg(self, text: str, *, error: bool = False) -> None:
         self.msg.setText(text)
+        self.msg.setVisible(bool(text))
         self.msg.setObjectName("error" if error and text else "muted")
         restyle(self.msg)
 
     def log(self, message: str, *, level: str = "info") -> None:
+        """One short operator message in the Activity panel (also kept in the diagnostic log)."""
+        text = scrub_operator(message)
         stamp = datetime.now().strftime("%H:%M:%S")
-        self.log_edit.appendPlainText(f"[{stamp}] {redact_text(message)}")
+        self.log_edit.appendPlainText(f"[{stamp}] {text}")
         self.log_edit.moveCursor(QTextCursor.MoveOperation.End)
+        diag("activity", text, level=level)
 
     def _clear_log(self) -> None:
         self.log_edit.clear()
+
+    def _open_diagnostic_log(self) -> None:
+        path = diagnostic_log.log_path()
+        if not path.is_file():
+            diag("details_opened", "the diagnostic log was empty")
+        if not path.is_file() or not desktop_open.open_path(path):
+            self.log("Could not open the diagnostic log.", level="error")
+
+    def diagnostic_details_text(self) -> str:
+        return build_report(
+            version=__version__,
+            sensor=self._sensor_info if (self._sensor_info.connected or self._sensor_info.demo) else None,
+            summary=self._last_summary,
+            diagnostic_lines=diagnostic_log.recent(RECENT_LINES),
+            secrets=[self._conn.http_password, self._conn.sftp_password],
+            hosts=[self._conn.host, self._sensor_info.host],
+        )
+
+    def _copy_diagnostic_details(self) -> None:
+        QApplication.clipboard().setText(self.diagnostic_details_text())
+        self.log("Diagnostic details copied.")
+
+    # ------------------------------------------------------------------ last manual recording
+    def _on_last_capture(self, summary: object) -> None:
+        if not isinstance(summary, CaptureSummary) or summary.request is not None:
+            return  # Excel Collection recordings are shown on their own tab
+        if self._manual_download is not None:
+            self._manual_download.abort()
+            self._manual_download = None
+        self._last_manual_summary = summary
+        self._refresh_manual_card()
+
+    def _manual_view(self) -> ResultView | None:
+        summary = self._last_manual_summary
+        if summary is None:
+            return None
+        payload = summary.payload or {}
+        try:
+            centre, bandwidth = float(payload["center_frequency"]), float(payload["bandwidth"])
+            title = range_text(centre - bandwidth / 2, centre + bandwidth / 2)
+        except (KeyError, TypeError, ValueError):
+            title = "Not sent"
+        view = view_from_summary(summary, title=title, local_dir=resolved_download_dir(self._conn.download_dir))
+        if summary.finalized_paths and self.excel_check.isChecked():
+            serial = str(getattr(self._sensor_info, "serial", "") or "")
+            logged = all(self._excel_store.is_logged(serial, path) for path in summary.finalized_paths)
+            view.excel_state = "Excel updated" if logged else "Excel update pending"
+        return view
+
+    def _refresh_manual_card(self) -> None:
+        if not hasattr(self, "manual_result"):
+            return
+        view = self._manual_view()
+        if view is not None and self._manual_download is not None and not view.local_ready:
+            view.transfer_state = self._manual_download_text
+        self.manual_result.set_view(view)
+
+    def _download_last_recording(self) -> None:
+        view = self.manual_result.view
+        summary = self._last_manual_summary
+        if view is None or summary is None or not view.remote_paths or self._manual_download is not None:
+            return
+        try:
+            folder = ensure_download_dir(self._conn.download_dir)
+        except OSError:
+            self.log("The download folder cannot be used. Check Settings.", level="error")
+            return
+        job = RecordingDownload(self._conn, view.remote_paths, dict(summary.sizes), folder, parent=self)
+        job.progress.connect(self._on_manual_download_progress)
+        job.finished.connect(self._on_manual_download_done)
+        job.failed.connect(self._on_manual_download_failed)
+        self._manual_download = job
+        self._manual_download_text = "Downloading"
+        self.manual_result.set_downloading(True, self._manual_download_text)
+        self.log(f"Downloading {files_text(len(view.remote_paths))}…")
+        job.start()
+
+    def _on_manual_download_progress(self, text: str) -> None:
+        self._manual_download_text = text
+        self.manual_result.set_downloading(True, text)
+
+    def _on_manual_download_done(self, paths: list) -> None:
+        self._manual_download = None
+        self.manual_result.set_downloading(False)
+        self._refresh_manual_card()
+        names = [Path(p).name for p in paths]
+        self.log("Saved locally: " + (names[0] if len(names) == 1 else f"{len(names)} files") + ".")
+        summary = self._last_manual_summary
+        if len(paths) > 1 and summary is not None and self.merge_check.isChecked():
+            first = summary.finalized_paths[0]
+            stem = iq_group_key(first.replace("\\", "/").rsplit("/", 1)[-1])
+            key = f"{self._conn.host}|{_normalise_dir(remote_directory(first))}|{stem}"
+            self._merge.request(key, stem, [Path(p) for p in paths], Path(paths[0]).parent, auto=True)
+
+    def _on_manual_download_failed(self, text: str) -> None:
+        self._manual_download = None
+        self.manual_result.set_downloading(False)
+        self._refresh_manual_card()
+        self.log(text, level="error")
+
+    def _open_last_recording_folder(self) -> None:
+        view = self.manual_result.view
+        if view is not None and view.local_paths and not desktop_open.reveal(view.local_paths[0]):
+            self.log("Could not open the folder.", level="error")
+
+    def _show_last_recording_waterfall(self) -> None:
+        view = self.manual_result.view
+        if view is None or not view.local_paths:
+            return
+        self._waterfall = WaterfallDialog(view.local_paths[0], center_hz=view.centre_hz, bandwidth_hz=view.bandwidth_hz, parent=self)
+        self._waterfall.show()
 
     def _client(self) -> EmpClient:
         if self._conn.demo:
@@ -1788,7 +2135,7 @@ class MainWindow(QMainWindow):
                 name = "phaseBusy"
             elif phase == CONFIRMED:
                 name = "phaseOk"
-            elif phase == UNKNOWN:
+            elif phase in {UNKNOWN, FAILED, PARTIAL}:
                 name = "phaseBad"
             else:
                 name = "muted"
@@ -1802,24 +2149,68 @@ class MainWindow(QMainWindow):
         if active:
             label = f"{seconds:g} s" if seconds is not None else ""
             self.start_btn.setEnabled(False)
-            self.start_btn.setText(f"Recording… {label}".strip())
+            # During an Excel Collection capture the manual Start keeps its name; the reason line says who records.
+            self.start_btn.setText("Start Recording" if self._external_owner else f"Recording… {label}".strip())
             self._set_phase(RECORDING)
             self._set_msg(f"Recording {label}.")
+            self._sync_series_buttons()
+            self._sync_other_tab_reasons()
             return
-        hold = self._series_active or self._watching or self._waiting or bool(self._external_owner)
+        hold = self._series_active or self._watching or self._measuring or self._waiting or bool(self._external_owner)
         self.start_btn.setEnabled(not hold)
         if self._external_owner:
-            self.start_btn.setText(f"{self._external_owner} running…")
+            self.start_btn.setText("Start Recording")
+        elif self._series_paused:
+            self.start_btn.setText("Series paused")
         elif self._series_active or self._waiting:
             self.start_btn.setText("Recording series…")
-        elif self._watching:
+        elif self._watching or self._measuring:
             # The capture is being confirmed from the sensor's files; starting
             # another recording now would abandon that check half-way.
             self.start_btn.setText("Confirming files…")
         else:
             self.start_btn.setText("Start Recording")
-        if hasattr(self, "stop_btn"):
-            self.stop_btn.setEnabled((self._series_active or self._waiting) and not self._stop_after_current)
+        self._sync_series_buttons()
+        self._sync_other_tab_reasons()
+
+    def manual_busy_reason(self) -> str | None:
+        """Why the Excel Collection cannot start: the manual tab holds the sensor."""
+        if self._external_owner:
+            return None
+        if self._series_paused:
+            return "Manual recording is paused. Stop it first."
+        if self.capture_busy_reason():
+            return "Manual recording is running."
+        return None
+
+    def _sync_other_tab_reasons(self) -> None:
+        """Each tab's Start says why it waits for the other one."""
+        if hasattr(self, "manual_reason"):
+            text = ""
+            if self._external_owner:
+                held = getattr(self, "cellular_panel", None)
+                paused = held.host_reason() if held is not None and self._external_owner == OWNER else ""
+                text = paused or f"{self._external_owner} is running."
+            self.manual_reason.setText(text)
+            self.manual_reason.setVisible(bool(text))
+            self.start_btn.setToolTip(text or "Send this recording request to the sensor")
+        panel = getattr(self, "cellular_panel", None)
+        if panel is not None:
+            panel.host_state_changed()
+
+    def _sync_series_buttons(self) -> None:
+        if not hasattr(self, "pause_btn"):
+            return
+        series = self._series_active or self._waiting
+        paused = self._series_paused
+        self.pause_btn.setVisible(not paused)
+        self.resume_btn.setVisible(paused)
+        self.pause_btn.setEnabled(series and not paused and not self._pause_requested and not self._stop_after_current)
+        self.resume_btn.setEnabled(paused)
+        repeating = self._repeat_mode() != "off"
+        self.pause_btn.setToolTip("Pauses after the current recording" if (series or repeating) else "Pause applies to a repeated recording.")
+        self.stop_btn.setEnabled((series or paused) and not self._stop_after_current)
+        self.stop_btn.setToolTip("Stops after the current recording" if (series or paused or repeating) else "Stop applies to a repeated recording.")
 
     def _start_job(
         self,
@@ -1864,10 +2255,11 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _job_failed(self, text: str) -> None:
         worker = self.sender()
+        diag("job_failed", "background task raised", traceback=text)
         if getattr(worker, "_is_excel", False):
             self._excel_flush_in_flight = False
             if self._alive:
-                self.log(f"Excel update failed: {text}", level="error")
+                self.log("Excel update failed. See details.", level="error")
                 self._update_collection_status()
             return
         if getattr(worker, "_is_record", False):
@@ -1878,9 +2270,9 @@ class MainWindow(QMainWindow):
             if self._recording_active:
                 self._record_timer.stop()
                 self._set_recording_ui(False)
-                self._set_phase(IDLE)
+                self._set_phase(UNKNOWN)
                 self._end_series()
-                self.log(text, level="error")
+                self.log("The recording request failed. See details.", level="error")
                 # The request may or may not have reached the sensor: an
                 # exception on the worker says nothing about that.
                 self._emit_capture_summary(OUTCOME_FAILED, detail=text)
@@ -1888,7 +2280,7 @@ class MainWindow(QMainWindow):
             if self._ignore_late_http:
                 self._ignore_late_http = False
                 return
-            self.log(text, level="error")
+            self.log("The recording request failed. See details.", level="error")
             return
         if getattr(worker, "_is_link", False):
             token = getattr(worker, "_link_token", None)
@@ -1902,7 +2294,8 @@ class MainWindow(QMainWindow):
                 return
             self.log("Could not read sensor details.", level="error")
             return
-        self.log(text, level="error")
+        if self._alive:
+            self.log("A background task failed. See details.", level="error")
 
     @Slot()
     def _job_thread_finished(self) -> None:
@@ -1923,7 +2316,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Connection", str(exc))
             return
         client = EmpClient(transport=DemoTransport(), demo=True) if state.demo else EmpClient(demo=False)
-        self.log(f"Testing connection to {target.origin}/ …")
+        diag("connection_test", target=target.origin)
+        self.log("Testing the connection…")
 
         def work() -> HttpOutcome:
             return client.test_connection(target, state.http_password)
@@ -1949,7 +2343,7 @@ class MainWindow(QMainWindow):
             return "A recording is in progress."
         if self._record_phase in {SUBMITTING, RECORDING}:
             return "A recording is in progress."
-        if self._watching or self._record_phase == FINALIZING:
+        if self._watching or self._measuring or self._record_phase == FINALIZING:
             return "The previous recording is still being confirmed from the sensor's files."
         if self._series_active or self._waiting:
             return "A repeat series is running. Stop it first."
@@ -1989,7 +2383,7 @@ class MainWindow(QMainWindow):
             return f"{self._external_owner} is using the sensor."
         if self._recording_active or self._submit_lock or self._http_in_flight:
             return "A recording is in progress."
-        if self._watching or self._record_phase in {SUBMITTING, RECORDING, FINALIZING}:
+        if self._watching or self._measuring or self._record_phase in {SUBMITTING, RECORDING, FINALIZING}:
             return "The previous recording is still being confirmed from the sensor's files."
         if self._series_active or self._waiting:
             return "A repeat series is running."
@@ -2023,8 +2417,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 - report instead of leaving the lock set
             self._external_capture = None
             self._submit_lock = False
-            self.log(f"Could not start the capture: {exc}", level="error")
-            return f"Could not start the capture: {exc}"
+            diag("capture_start_failed", traceback=traceback.format_exc(limit=8))
+            self.log("Could not start the recording. See details.", level="error")
+            return f"Could not start the recording ({type(exc).__name__})."
         return None
 
     def fetch_sensor_identity(self, on_result) -> None:
@@ -2118,7 +2513,14 @@ class MainWindow(QMainWindow):
 
         self._start_job(work, apply)
 
-    def _emit_capture_summary(self, outcome: str, *, detail: str = "", record=None) -> None:
+    def _emit_capture_summary(
+        self,
+        outcome: str,
+        *,
+        detail: str = "",
+        record=None,
+        verdict: Verdict | None = None,
+    ) -> None:
         """Report the end of the current capture once, to whoever is listening."""
         if self._summary_emitted:
             return
@@ -2127,11 +2529,22 @@ class MainWindow(QMainWindow):
         self._external_capture = None
         if record is None and self._open_record_id:
             record = next((item for item in load_recordings() if item.id == self._open_record_id), None)
-        total, parts, held_s = self._measured_capture(record) if record is not None else (0, 0, None)
-        if outcome in {OUTCOME_NOT_SENT, OUTCOME_BUSY}:
-            total, parts, held_s = 0, 0, None
+        sent = outcome not in {OUTCOME_NOT_SENT, OUTCOME_BUSY}
         state = self._watch_state
-        finalized = sorted(state.finalized)
+        finalized = sorted(state.finalized) if sent else []
+        measurement = self._measurement if sent else None
+        if verdict is None:
+            if not sent:
+                verdict = Verdict(RESULT_FAILED, "not sent")
+            elif outcome == OUTCOME_SENSOR_ERROR:
+                verdict = Verdict(RESULT_FAILED, "rejected by the sensor")
+            else:
+                verdict = classify(
+                    requested_s=float(record.duration_s) if record is not None else 0.0,
+                    measurement=measurement,
+                    named_parts=list(self._sensor_parts),
+                    sensor_error=self._sensor_error,
+                )
         stem = ""
         if self._sensor_parts:
             from .recording_history import iq_group_key
@@ -2148,13 +2561,13 @@ class MainWindow(QMainWindow):
             requested_s=float(record.duration_s) if record is not None else (
                 float(request.seconds) if request is not None else 0.0
             ),
-            held_s=held_s,
-            parts=parts,
-            total_bytes=total,
+            held_s=measurement.duration_s if measurement is not None else None,
+            parts=len(finalized),
+            total_bytes=sum(int(state.sizes.get(path, 0)) for path in finalized),
             expected_bytes=int(self._expected_bytes or 0),
             sensor_finished=bool(self._sensor_finished),
             stream_lost=bool(self._stream_lost),
-            request_sent=outcome not in {OUTCOME_NOT_SENT, OUTCOME_BUSY},
+            request_sent=sent,
             sensor_parts=list(self._sensor_parts),
             finalized_paths=finalized,
             sizes={path: int(state.sizes.get(path, 0)) for path in finalized},
@@ -2162,12 +2575,21 @@ class MainWindow(QMainWindow):
             started_at=record.started_at if record is not None else None,
             finished_at=datetime.now(),
             stem=stem,
-            recording_format="" if outcome in {OUTCOME_NOT_SENT, OUTCOME_BUSY} else self._sent_recording_format,
+            recording_format=self._sent_recording_format if sent else "",
+            result=verdict.result,
+            result_reason=verdict.reason,
+            measurement=measurement.to_dict() if measurement is not None else {},
+            sensor_reply=dict(self._sensor_reply),
+            sensor_error=self._sensor_error,
+            payload=dict(self._sent_scan) if sent else {},
         )
+        self._last_summary = summary
+        self.last_capture_changed.emit(summary)
         try:
             self.capture_finished.emit(summary)
         except Exception:  # noqa: BLE001 - a listener must not break the recorder
-            self.log(traceback.format_exc(limit=4), level="error")
+            diag("listener_failed", "capture_finished", traceback=traceback.format_exc(limit=8))
+            self.log("Internal error after the recording. See details.", level="error")
 
     def _on_start(self) -> None:
         if self._recording_active or self._submit_lock:
@@ -2179,7 +2601,7 @@ class MainWindow(QMainWindow):
                 f"{self._external_owner} is running its own recording sequence. Stop it before recording manually.",
             )
             return
-        if self._watching or self._record_phase == FINALIZING:
+        if self._watching or self._measuring or self._record_phase == FINALIZING:
             # The manual button is disabled in this state; a programmatic or
             # keyboard trigger must not abandon the confirmation half-way.
             return
@@ -2282,6 +2704,9 @@ class MainWindow(QMainWindow):
         scan = payload["remote_recording_scans"][0]
         self._last_recording_s = seconds
         self._sent_recording_format = str(scan.get("recording_format") or recording_format)
+        self._sent_scan = dict(scan)
+        self._sent_range = (int(plan.start_hz), int(plan.end_hz))
+        self._coverage_noted = False
         self._ignore_late_http = False
         self._sensor_finished = False
         self._sensor_finished_at = 0.0
@@ -2289,6 +2714,11 @@ class MainWindow(QMainWindow):
         self._sensor_parts = []
         self._sensor_warnings = []
         self._sensor_message_counts = {}
+        self._sensor_error = ""
+        self._sensor_reply = {}
+        self._measurement = None
+        self._measure_token += 1
+        self._measuring = False
         self._pending_excel_entries = []
         self._summary_emitted = False
         try:
@@ -2332,16 +2762,18 @@ class MainWindow(QMainWindow):
         cancel = self._record_cancel
         self._record_gen += 1
         gen = self._record_gen
-        unit = self._freq_unit()
-        prefix = f"{request.owner}: {request.label} — " if request is not None and request.label else (
-            f"{request.owner}: " if request is not None else ""
+        diag(
+            "request",
+            "POST /emp/ remote_recording_scans",
+            owner=request.owner if request is not None else "manual",
+            label=request.label if request is not None else "",
+            start_hz=plan.start_hz,
+            stop_hz=plan.end_hz,
+            payload=payload,
+            demo=bool(self._conn.demo),
         )
-        self.log(
-            f"{prefix}Start: {display_from_hz(int(scan['center_frequency']), unit)} {unit}, "
-            f"{display_from_hz(int(scan['bandwidth']), unit)} {unit} BW, {seconds} s, "
-            f"{scan['recording_format']}"
-            + (" (demo)" if self._conn.demo else "")
-        )
+        if request is None:
+            self.log(f"Recording {range_text(plan.start_hz, plan.end_hz)} for {seconds_text(seconds)}.")
         self._set_phase(SUBMITTING)
         self._set_recording_ui(True, seconds=seconds)
         self._http_in_flight = True
@@ -2386,7 +2818,7 @@ class MainWindow(QMainWindow):
             if client is not None:
                 self._ignore_late_http = True
                 client.close()
-        if self._record_phase in {FINALIZING, CONFIRMED, UNKNOWN}:
+        if self._record_phase in {FINALIZING, CONFIRMED, PARTIAL, UNKNOWN, FAILED}:
             return
         self._set_phase(FINALIZING)
         self._elapsed_at = datetime.now()
@@ -2411,13 +2843,16 @@ class MainWindow(QMainWindow):
                 parts = shared_demo_browser().publish_capture(
                     stem,
                     parts=max(int(self._demo_parts), 1),
-                    when=datetime.now(),
+                    when=record.started_at,
+                    seconds=float(record.duration_s) * max(float(self._demo_fraction), 0.0),
+                    center_hz=float(record.center_hz),
+                    bandwidth_hz=float(record.bandwidth_hz),
                 )
                 if parts:
                     keyed = replace(record, iq_stem=iq_group_key(parts[0].name))
                     add_recording(keyed)
         self._set_msg(self._finalizing_text())
-        self.log("Time elapsed. Looking for recording files.")
+        diag("recording_time_elapsed", sensor_finished=self._sensor_finished, named=list(self._sensor_parts))
         if self._sftp_win is not None:
             self._sftp_win.retry_today()
         self._watch_timer.start()
@@ -2432,19 +2867,13 @@ class MainWindow(QMainWindow):
         """
         found = len(self._watch_state.finalized)
         named = len(self._sensor_parts)
-        if self._sensor_finished:
+        if self._sensor_finished or self._sensor_error:
             if found and named and found < named:
-                return f"Sensor finished. {found} of {named} file(s) confirmed; waiting for the rest…"
+                return f"Waiting for files: {found} of {named} ready."
             if found:
-                return f"Sensor finished. {found} file(s) confirmed; checking for more…"
-            if named:
-                return f"Sensor finished. Confirming {self._sensor_parts[-1]}…"
-            return "Sensor finished. Looking for its file…"
-        if found:
-            return f"Recording file found ({found} part(s)). Waiting for more…"
-        if named:
-            return f"Time elapsed. Sensor is writing {self._sensor_parts[-1]}…"
-        return "Time elapsed. Waiting for files…"
+                return f"Waiting for files: {files_text(found)} ready."
+            return "Sensor finished. Waiting for files."
+        return "Waiting for the sensor to finish."
 
     def _refresh_finalizing_ui(self) -> None:
         """Re-render the status line after a sensor message changed what we know."""
@@ -2464,8 +2893,9 @@ class MainWindow(QMainWindow):
                 self._watching = False
                 self._watch_token += 1
                 self._set_phase(UNKNOWN)
-                self._set_msg("Time elapsed. Check Sensor Files for the recording.", error=True)
-                self.log("No history entry for this recording; its files cannot be confirmed automatically.", level="error")
+                self._set_msg("Recording not confirmed. Check Sensor Files.", error=True)
+                diag("watch_no_record", "no history entry; files cannot be matched")
+                self.log("Recording not confirmed. Check Sensor Files.", level="error")
                 self._emit_capture_summary(OUTCOME_UNKNOWN, detail="No history entry; files not confirmed.")
                 if self._series_active:
                     self._maybe_start_next()
@@ -2479,7 +2909,7 @@ class MainWindow(QMainWindow):
                     self._watch_browser = _open_browser(self._conn)
                 entries = list_watch_entries(self._watch_browser, folders)
             except Exception as exc:
-                self.log(f"Could not list sensor files: {exc}", level="error")
+                diag("watch_failed", "could not list sensor files", error=f"{type(exc).__name__}: {exc}")
                 return
             self._apply_watch_listing(record, entries)
             return
@@ -2540,7 +2970,7 @@ class MainWindow(QMainWindow):
             token, entries, error = result
             session = None
         if note and token == self._watch_token and self._record_phase in {FINALIZING, UNKNOWN}:
-            self.log(str(note), level="error")
+            diag("watch_reconnect", str(note))
         if token != self._watch_token:
             if session is not None and session is not self._watch_browser:
                 try:
@@ -2555,8 +2985,12 @@ class MainWindow(QMainWindow):
             self._watch_browser = None
         if error:
             if self._record_phase in {FINALIZING, UNKNOWN}:
-                self.log(f"Could not list sensor files: {error}", level="error")
+                diag("watch_failed", "could not list sensor files", error=str(error))
+                if not self._watch_error_noted:
+                    self._watch_error_noted = True
+                    self.log("Cannot read the sensor's files right now. Retrying.", level="error")
             return
+        self._watch_error_noted = False
         record_id = self._open_record_id
         if not record_id:
             return
@@ -2590,7 +3024,7 @@ class MainWindow(QMainWindow):
                 before = len(self._pending_excel_entries)
                 self._pending_excel_entries = [e for e in self._pending_excel_entries if e.path not in set(dropped)]
                 self._files_found -= before - len(self._pending_excel_entries)
-                self.log(f"Not part of this recording after all: {', '.join(sorted(names))}.")
+                diag("watch_dropped", "not part of this recording", files=sorted(names))
                 self._update_collection_status()
         if self._sftp_win is not None:
             self._sftp_win.refresh()
@@ -2609,7 +3043,7 @@ class MainWindow(QMainWindow):
             self._update_collection_status()
             self._set_phase(FINALIZING)
             self._set_msg(self._finalizing_text())
-            self.log(f"{len(newly)} IQ file(s) finished writing.")
+            diag("watch_settled", files=[entry.path for entry in newly], sizes=[int(entry.size) for entry in newly])
         if (
             self._sensor_finished
             and not self._sensor_parts
@@ -2620,7 +3054,7 @@ class MainWindow(QMainWindow):
             # e.g. "No suitable antenna found": the sensor ran the task and
             # wrote nothing. No point watching the folder for a minute.
             reason = self._sensor_warnings[-1] if self._sensor_warnings else "no sensor message explains why"
-            self.log(f"The sensor finished without writing a file ({reason}).", level="error")
+            diag("sensor_no_file", "the sensor finished without writing a file", reason=reason)
             self._finish_current_capture()
             return
         if capture_is_settled(
@@ -2636,32 +3070,18 @@ class MainWindow(QMainWindow):
         ):
             self._finish_current_capture()
 
-    def _measured_capture(self, record) -> tuple[int, int, float | None]:
-        """(total bytes, parts, seconds of IQ) held by the finalized files of this capture."""
-        state = self._watch_state
-        sizes = [size for path, size in state.sizes.items() if path in state.finalized]
-        total = sum(sizes)
-        parts = len(sizes)
-        if not parts or record is None or self._conn.demo:
-            # Demo files have made-up sizes; the bytes-to-seconds model is for real Node WAVE files.
-            return total, parts, None
-        try:
-            return total, parts, recorded_seconds_from_bytes(
-                total, int(record.bandwidth_hz), parts, max_rate_hz=self._sensor_max_rate_hz()
-            )
-        except Exception:
-            return total, parts, None
-
     def _log_pending_iq_files(self, record, *, duration_s: float | None) -> None:
         entries = list(self._pending_excel_entries)
         self._pending_excel_entries = []
+        failed = 0
         for entry in entries:
             try:
                 self._log_iq_file(record, entry, duration_s=duration_s)
             except Exception as exc:
-                self.log(f"Excel log failed for {entry.name}: {exc}", level="error")
-        if entries and hasattr(self, "excel_check") and self.excel_check.isChecked():
-            self.log(f"Logged {len(entries)} IQ file(s) to Excel.")
+                failed += 1
+                diag("excel_log_failed", entry.name, error=f"{type(exc).__name__}: {exc}")
+        if failed:
+            self.log("Excel update failed for this recording. See details.", level="error")
 
     def _log_iq_file(self, record, entry, *, duration_s: float | None = None) -> None:
         self._update_collection_status()
@@ -2703,7 +3123,7 @@ class MainWindow(QMainWindow):
             local_path=str(local) if local.is_file() else "",
             remote_path=entry.path,
             sensor_id=sensor_id,
-            duration_s=record.duration_s if duration_s is None else duration_s,
+            duration_s=duration_s,
             record_id=record.id,
             group_key=recording_group_key(
                 sensor_id=sensor_id,
@@ -2717,7 +3137,8 @@ class MainWindow(QMainWindow):
             self._flush_excel()
 
     def _finish_current_capture(self) -> None:
-        if self._record_phase not in {FINALIZING, UNKNOWN}:
+        """The files have settled on the sensor: read their headers, then report the result."""
+        if self._record_phase not in {FINALIZING, UNKNOWN} or self._measuring:
             return
         self._watch_timer.stop()
         self._watching = False
@@ -2726,83 +3147,157 @@ class MainWindow(QMainWindow):
         self._watch_token += 1
         self._abort_record_stream()
         self._log_repeated_sensor_messages()
+        paths = sorted(self._watch_state.finalized)
+        if not paths:
+            self._complete_capture(None)
+            return
+        self._measuring = True
+        self._set_msg(f"Reading {files_text(len(paths))}…")
+        self._measure_token += 1
+        token = self._measure_token
+        sizes = {path: int(self._watch_state.sizes.get(path, 0)) for path in paths}
+        demo = bool(self._conn.demo)
+        state = self._conn
+        shared = None if (demo or self._watch_in_flight) else self._watch_browser
+        cancel = threading.Event()
+        self._measure_cancel = cancel
+
+        def work() -> tuple[int, object, str]:
+            browser = shared_demo_browser() if demo else shared
+            own = None
+            try:
+                if browser is None:
+                    own = _open_browser(state, cancel=cancel)
+                    browser = own
+                measurement = measure_parts(browser, paths, sizes)
+                for _ in range(HEADER_RETRIES):
+                    # A header the sensor has not finished yet is read again; an
+                    # unreadable format is not (its duration stays unknown).
+                    if not any(part.readable and not part.final for part in measurement.parts):
+                        break
+                    if cancel.wait(HEADER_RETRY_S):
+                        break
+                    measurement = measure_parts(browser, paths, sizes)
+                return token, measurement, ""
+            except Exception as exc:  # noqa: BLE001 - reported as "duration unknown"
+                return token, None, f"{type(exc).__name__}: {exc}"
+            finally:
+                if own is not None:
+                    try:
+                        own.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        if demo:
+            # The demo sensor is in-process and its files are final at once.
+            self._apply_measurement(work())
+            return
+        self._start_job(work, self._apply_measurement)
+
+    def _apply_measurement(self, result: object) -> None:
+        if not isinstance(result, tuple) or len(result) != 3:
+            return
+        token, measurement, error = result
+        if token != self._measure_token:
+            return
+        self._measuring = False
+        self._measure_cancel = None
+        if not self._alive:
+            return
+        if error:
+            diag("measure_failed", "could not read the recording headers", error=error)
+        self._complete_capture(measurement if isinstance(measurement, CaptureMeasurement) else None)
+
+    def _result_message(self, verdict: Verdict, measurement, requested_s: float, count: int) -> tuple[str, str, str]:
+        """(operator text, log level, phase) for the end of a capture."""
+        received = received_text(measurement, count)
+        held = measurement.duration_s if measurement is not None else None
+        if verdict.result == RESULT_COMPLETED:
+            return f"Recording confirmed: {received}.", "info", CONFIRMED
+        if verdict.result == RESULT_PARTIAL:
+            if verdict.reason.startswith("missing"):
+                text = f"Partial recording: {count} of {len(self._sensor_parts)} files found."
+            elif verdict.reason == "a file is cut short":
+                text = f"Partial recording: a file is cut short ({received})."
+            elif verdict.reason == "sensor error during the recording":
+                text = f"Partial recording: CRFS reported an error. Received {received}. See details."
+            elif held is not None:
+                text = f"Partial recording: requested {seconds_text(requested_s)}, received {measured_text(held)}."
+            else:
+                text = "Partial recording: files incomplete, duration unknown."
+            return text, "error", PARTIAL
+        if verdict.result == RESULT_FAILED:
+            return "CRFS rejected the request. See details.", "error", FAILED
+        if count:
+            return f"Files found, not confirmed: {received}.", "error", UNKNOWN
+        if self._sensor_finished and self._sensor_parts:
+            return "Recording not confirmed: the file CRFS named was not found.", "error", UNKNOWN
+        if self._sensor_finished:
+            return "Recording not confirmed: CRFS finished without writing a file.", "error", UNKNOWN
+        if self._stream_lost:
+            return "Recording not confirmed: connection lost and no file found.", "error", UNKNOWN
+        return "Recording not confirmed: no file found. See details.", "error", UNKNOWN
+
+    def _complete_capture(self, measurement) -> None:
         record = None
         if self._open_record_id:
             record = next((item for item in load_recordings() if item.id == self._open_record_id), None)
-        total, parts, held_s = self._measured_capture(record)
-        excel_duration: float | None = None
-        named = len(self._sensor_parts)
-        if parts:
-            self._set_phase(CONFIRMED)
-            self._set_msg(f"Recording finished ({parts} file(s)).")
-            source = "sensor confirmed" if self._sensor_finished else "files stable"
-            self.log(f"Capture finished with {parts} file(s), {total / 1_000_000:,.1f} MB ({source}).")
-            if named and parts < named:
-                missing = [name for name in self._sensor_parts if name not in {
-                    path.rsplit("/", 1)[-1] for path in self._watch_state.finalized
-                }]
-                self.log(
-                    f"The sensor named {named} file(s) but {parts} finished writing; "
-                    f"not found or still growing: {', '.join(missing) or 'unknown'}. Check Sensor Files.",
-                    level="error",
-                )
-                self._set_msg(f"Recording finished ({parts} of {named} file(s) found).", error=True)
-            requested = float(record.duration_s) if record is not None else 0.0
-            if held_s is not None and requested > 0:
-                if held_s < 0.95 * requested:
-                    excel_duration = round(held_s, 1)
-                    if self._stream_lost:
-                        why = (
-                            "The connection to the sensor dropped during the capture, and this sensor stops "
-                            "recording when its client disconnects."
-                        )
-                    elif self._sensor_finished:
-                        why = "The sensor reported it finished early; at 62.5 MS/s it cannot sustain long captures."
-                    else:
-                        why = "The sensor stopped early."
-                    self.log(
-                        f"The files hold about {held_s:.1f} s of IQ, not the {requested:g} s requested. "
-                        f"{why} The Excel row gets the measured time.",
-                        level="error",
-                    )
-                    self._set_msg(f"Recording finished short: {held_s:.1f} s of {requested:g} s.", error=True)
-                elif held_s > 1.5 * requested:
-                    self.log(
-                        f"The files hold about {held_s:.1f} s of IQ for a {requested:g} s request; "
-                        "check that the sample-rate model fits this sensor.",
-                        level="error",
-                    )
-        else:
-            # Task completion and file availability are reported separately:
-            # the sensor may have finished its task without a usable file, or we
-            # may simply not have found the file it named within the watch time.
-            self._set_phase(UNKNOWN)
-            if self._sensor_finished and named:
-                names = ", ".join(self._sensor_parts)
-                self._set_msg(f"Sensor finished, but {names} was not found on the sensor.", error=True)
-                self.log(
-                    f"File not confirmed: the sensor reported its task finished and named {names}, "
-                    "but no such file settled in the recording folder. Check Sensor Files.",
-                    level="error",
-                )
-            elif self._sensor_finished:
-                self._set_msg("Sensor finished, but it wrote no file.", error=True)
-                self.log("File not confirmed: the sensor finished its task without naming a file.", level="error")
-            elif self._stream_lost:
-                self._set_msg("Connection to the sensor dropped. No recording file found.", error=True)
-                self.log("File not confirmed: the sensor connection dropped and no file appeared.", level="error")
-            else:
-                self._set_msg("Time elapsed. No matching recording file yet.", error=True)
-                self.log("File not confirmed: no file for this recording appeared within the watch time.", level="error")
+        found = sorted(self._watch_state.finalized)
+        if measurement is None and found:
+            measurement = CaptureMeasurement(parts=[
+                PartMeasurement(path=path, size=int(self._watch_state.sizes.get(path, 0)), problems=["header not read"])
+                for path in found
+            ])
+        self._measurement = measurement
+        requested = float(record.duration_s) if record is not None else float(self._last_recording_s or 0.0)
+        verdict = classify(
+            requested_s=requested,
+            measurement=measurement,
+            named_parts=list(self._sensor_parts),
+            sensor_error=self._sensor_error,
+        )
+        count = len(found)
+        diag(
+            "capture_result",
+            verdict.result,
+            reason=verdict.reason,
+            requested_s=requested,
+            files=found,
+            named_by_sensor=list(self._sensor_parts),
+            sensor_finished=bool(self._sensor_finished),
+            stream_lost=bool(self._stream_lost),
+            sensor_error=self._sensor_error,
+            sensor_reply=dict(self._sensor_reply),
+            measurement=measurement.to_dict() if measurement is not None else None,
+        )
+        text, level, phase = self._result_message(verdict, measurement, requested, count)
+        self._set_phase(phase)
+        self._set_msg(text, error=level == "error")
+        self.log(text, level=level)
+        if (
+            record is not None
+            and not self._coverage_noted
+            and coverage_differs(measurement, int(record.start_hz), int(record.end_hz))
+        ):
+            self.log(
+                f"CRFS recorded {coverage_text(measurement)}; requested {range_text(record.start_hz, record.end_hz)}.",
+                level="error",
+            )
         if record is not None:
-            self._log_pending_iq_files(record, duration_s=excel_duration)
+            self._log_pending_iq_files(record, duration_s=measurement.duration_s if measurement is not None else None)
         else:
             self._pending_excel_entries = []
         self._refresh_storage()
-        if parts:
+        if count:
             self._recordings_completed += 1
         self._update_collection_status()
-        self._emit_capture_summary(OUTCOME_CONFIRMED if parts else OUTCOME_UNKNOWN, record=record)
+        if count:
+            outcome = OUTCOME_CONFIRMED
+        elif verdict.result == RESULT_FAILED:
+            outcome = OUTCOME_SENSOR_ERROR
+        else:
+            outcome = OUTCOME_UNKNOWN
+        self._emit_capture_summary(outcome, record=record, verdict=verdict)
         if self._series_active:
             self._maybe_start_next()
         else:
@@ -2813,17 +3308,23 @@ class MainWindow(QMainWindow):
         self._series_active = False
         self._series_remaining = 0
         self._stop_after_current = False
+        self._pause_requested = False
+        self._series_paused = False
+        self._paused_wait_s = 0.0
         self._watching = False
         self._watch_timer.stop()
         self._watch_token += 1
         if getattr(self, "_watch_cancel", None) is not None:
             self._watch_cancel.set()
-        self._close_watch_browser()
+        if not self._measuring:
+            # A header read in progress uses this session; it ends with the capture.
+            self._close_watch_browser()
         if hasattr(self, "stop_btn"):
             self.stop_btn.setEnabled(False)
         if not self._recording_active:
-            self.start_btn.setEnabled(True)
-            self.start_btn.setText("Start Recording")
+            self._set_recording_ui(False)
+        else:
+            self._sync_series_buttons()
         self._update_collection_status()
 
     def _repeat_wait_s(self) -> float:
@@ -2844,9 +3345,8 @@ class MainWindow(QMainWindow):
         self._waiting = True
         self._wait_deadline = time.monotonic() + max(seconds, 0.0)
         self._set_phase(WAITING)
-        if hasattr(self, "stop_btn"):
-            self.stop_btn.setEnabled(True)
         self.start_btn.setEnabled(False)
+        self._sync_series_buttons()
         self._tick_wait()
         self._wait_timer.start()
 
@@ -2903,6 +3403,9 @@ class MainWindow(QMainWindow):
             self._end_series()
             return
         wait_s = self._repeat_wait_s()
+        if self._pause_requested:
+            self._enter_series_pause(wait_s)
+            return
         if wait_s <= 0:
             self._start_next_now()
             return
@@ -2921,33 +3424,39 @@ class MainWindow(QMainWindow):
         if not self._recording_active:
             self._record_client = None
         if not isinstance(outcome, HttpOutcome):
-            self.log(str(outcome), level="error")
+            diag("request_failed", str(outcome))
+            self.log("The recording request failed. See details.", level="error")
             self._record_timer.stop()
             self._set_recording_ui(False)
             self._set_phase(IDLE)
             self._end_series()
             self._emit_capture_summary(OUTCOME_FAILED, detail=str(outcome))
             return
+        self._diag_http(outcome)
         if outcome.stream_ended:
             self._show_stream_outcome(outcome)
             return
         if self._ignore_late_http and not self._recording_active:
             self._ignore_late_http = False
-            if outcome.kind == "accepted":
-                self.log("Sensor HTTP reply received.")
             return
         if not outcome.request_sent and not outcome.accepted:
             self._record_timer.stop()
             self._ignore_late_http = False
             self._set_recording_ui(False)
-            self._set_phase(IDLE)
+            self._set_phase(FAILED)
             if self._open_record_id:
                 remove_recording(self._open_record_id)
                 self._open_record_id = None
             self._end_series()
-            self._set_msg(outcome.detail, error=True)
-            self._show_http_outcome(outcome, recording=True)
+            text = self._http_problem_text(outcome)
+            self._set_msg(text, error=True)
+            self.log(text, level="error")
             self._emit_capture_summary(OUTCOME_NOT_SENT, detail=outcome.detail)
+            return
+        if not outcome.accepted and outcome.status_code is not None and outcome.status_code >= 400:
+            self._ignore_late_http = False
+            self._sensor_error = f"HTTP {outcome.status_code}: {(outcome.body_text or outcome.detail).strip()[:300]}"
+            self._end_rejected(self._http_problem_text(outcome), detail=outcome.detail)
             return
         if self._ignore_late_http and outcome.kind in (
             "connection_failure",
@@ -2955,56 +3464,81 @@ class MainWindow(QMainWindow):
             "timeout_after_send",
         ):
             self._ignore_late_http = False
-            self.log("Stopped waiting for HTTP. Use Sensor Files if needed.")
             return
         self._show_http_outcome(outcome, recording=True)
+
+    def _diag_http(self, outcome: HttpOutcome) -> None:
+        diag(
+            "http_outcome",
+            outcome.title,
+            kind=outcome.kind,
+            status=outcome.status_code,
+            url=outcome.url,
+            elapsed_s=round(float(outcome.elapsed_s or 0.0), 3),
+            request_sent=outcome.request_sent,
+            outcome_unknown=outcome.outcome_unknown,
+            detail=outcome.detail,
+            body=(outcome.body_text or "")[:4000],
+            stream_ended=outcome.stream_ended,
+            sensor_finished=outcome.sensor_finished,
+            sensor_parts=list(outcome.sensor_parts),
+            sensor_file_dir=outcome.sensor_file_dir,
+            sensor_task_id=outcome.sensor_task_id,
+            sensor_messages=list(outcome.sensor_messages)[:60],
+            sensor_error=outcome.sensor_error,
+        )
+
+    def _end_rejected(self, text: str, *, detail: str) -> None:
+        """The sensor refused the request before naming any file: nothing to watch."""
+        self._record_timer.stop()
+        self._watch_timer.stop()
+        self._watching = False
+        self._watch_token += 1
+        self._set_recording_ui(False)
+        self._set_phase(FAILED)
+        self._set_msg(text, error=True)
+        self.log(text, level="error")
+        self._end_series()
+        self._emit_capture_summary(OUTCOME_SENSOR_ERROR, detail=detail)
 
     def _show_stream_outcome(self, outcome: HttpOutcome) -> None:
         """The EMP event stream ended (sensor finished, error, budget, or we stopped it)."""
         self._ignore_late_http = False
         self._abort_record_stream()
+        for name in outcome.sensor_parts:
+            self._note_sensor_part(outcome.sensor_file_dir, name)
         if outcome.kind == "sensor_error":
-            self.log(outcome.detail, level="error")
-            self._record_timer.stop()
-            self._watch_timer.stop()
-            self._watching = False
-            self._watch_token += 1
-            self._set_recording_ui(False)
-            self._set_phase(UNKNOWN)
-            self._set_msg("The sensor reported an error. Check Sensor Files.", error=True)
-            self._end_series()
-            self._emit_capture_summary(OUTCOME_SENSOR_ERROR, detail=outcome.detail)
+            self._sensor_error = outcome.sensor_error or outcome.detail
+            if not self._sensor_parts:
+                self._end_rejected("CRFS rejected the request. See details.", detail=outcome.detail)
+                return
+            # The sensor had started writing: whatever it wrote is measured and
+            # reported as a partial recording, never resent automatically.
+            self.log("CRFS reported an error during the recording. Checking its files.", level="error")
+            if self._recording_active:
+                self._record_timer.stop()
+                self._on_recording_time_elapsed()
+            else:
+                self._refresh_finalizing_ui()
             return
         if outcome.sensor_finished:
-            for name in outcome.sensor_parts:
-                self._note_sensor_part(outcome.sensor_file_dir, name)
             self._mark_sensor_finished()
             if outcome.sensor_error:
-                # The stream ended on an ERROR that arrived after "finished":
-                # the recording is over and its file is confirmed from the
-                # sensor's folder like any other; the message is kept in the log.
-                self._count_sensor_message(
-                    outcome.sensor_error,
-                    level="error",
-                    suffix=" (after the recording finished; the files decide)",
-                )
+                # An ERROR after "finished" is about the mission the sensor keeps
+                # open while this client holds the stream (Node 100-18: "Unable to
+                # schedule the command" ~45 s after the capture); the files decide.
+                diag("sensor_error_after_finish", outcome.sensor_error)
             return
         if outcome.stream_ended == "cancelled":
             return
         if outcome.stream_ended.startswith("lost"):
+            # This sensor stops recording when its client disconnects.
             self._stream_lost = True
-            self.log(
-                "Connection to the sensor dropped while waiting for its completion message. "
-                "This sensor stops recording when its client disconnects; completion is confirmed from the files.",
-                level="error",
-            )
+            self.log("Connection to the sensor dropped. Checking its files.", level="error")
         elif outcome.stream_ended == "budget":
-            self.log("No completion message from the sensor within the time budget. Checking files.")
+            self.log("No finish message from the sensor. Checking its files.")
         else:
-            self.log("The sensor closed its event stream before reporting completion. Checking files.")
-        if self._recording_active:
-            # The recording time has not elapsed yet; the timer still drives the next phase.
-            return
+            self.log("The sensor closed the connection early. Checking its files.")
 
     def _on_record_event(self, payload: object) -> None:
         """Live event from the sensor's EMP stream (queued onto the UI thread)."""
@@ -3015,7 +3549,7 @@ class MainWindow(QMainWindow):
             return
         from .api_client import (
             SSE_EVENT_HTTP_ACCEPTED,
-            sensor_message_note,
+            SSE_EVENT_REMOTE_TIME,
             sse_message_is_error,
             sse_message_is_finished,
             sse_message_is_noise,
@@ -3023,17 +3557,21 @@ class MainWindow(QMainWindow):
         )
 
         name = getattr(event, "event", "")
+        data = getattr(event, "data", None)
         if name == SSE_EVENT_HTTP_ACCEPTED:
-            status = getattr(event, "data", {}).get("status") if isinstance(getattr(event, "data", None), dict) else None
-            self.log(f"Request accepted (HTTP {status}). Recording…" if status else "Request accepted. Recording…")
+            status = data.get("status") if isinstance(data, dict) else None
+            diag("http_accepted", status=status)
+            if self._record_phase == SUBMITTING:
+                self._set_phase(RECORDING)
             if self._sftp_win is not None:
                 self._sftp_win.retry_today()
             return
-        directory, filename = sse_part_filename(event)
-        if filename:
-            self._note_sensor_part(directory, filename)
+        if name == SSE_EVENT_REMOTE_TIME:
+            self._note_sensor_reply(data)
+            directory, filename = sse_part_filename(event)
+            if filename:
+                self._note_sensor_part(directory, filename)
             return
-        data = getattr(event, "data", None)
         items = data if isinstance(data, list) else [data]
         for item in items:
             if not isinstance(item, dict) or sse_message_is_noise(item):
@@ -3043,38 +3581,63 @@ class MainWindow(QMainWindow):
                 self._mark_sensor_finished()
             elif sse_message_is_error(item):
                 if self._sensor_finished:
-                    # An ERROR after "finished" is about the mission the sensor
-                    # keeps open while this client holds the stream (Node 100-18:
-                    # "Unable to schedule the command" ~45 s after the capture);
-                    # the file is already on the disk and is confirmed from the
-                    # files. Say so once instead of ending the capture.
-                    self._count_sensor_message(text, level="error", suffix=" (after the recording finished; the files decide)")
+                    diag("sensor_error_after_finish", text)
                 else:
-                    self.log(f"Sensor: {text}", level="error")
+                    # Reported once the stream ends (rejected / partial).
+                    self._sensor_error = self._sensor_error or text
+                    diag("sensor_error", text, level=item.get("level"))
             elif text:
-                # The Node 100-18 repeats "Using internal clock because of
-                # ncpd.conf settings" several times a second for the whole
-                # capture. A repeated message is logged once and counted.
-                level = "error" if str(item.get("level", "")).upper() == "WARNING" else "info"
-                # A WARNING is information about the capture (clock source), never a failure.
-                label = "Sensor warning" if level == "error" else "Sensor"
-                self._count_sensor_message(text, level=level, label=label, suffix=sensor_message_note(text))
+                warning = str(item.get("level", "")).upper() == "WARNING"
+                self._count_sensor_message(text, warning=warning)
 
-    def _count_sensor_message(self, text: str, *, level: str, suffix: str = "", label: str = "Sensor") -> None:
-        """Log a sensor message the first time it is seen; count later repeats."""
+    def _note_sensor_reply(self, data: object) -> None:
+        """time.RemoteTimeData: what the sensor says it is recording."""
+        items = data if isinstance(data, list) else [data]
+        reply: dict[str, Any] = {}
+        for item in items:
+            if isinstance(item, dict):
+                for key in ("center_frequency", "bandwidth", "duration", "file_count", "first_filename",
+                            "file_dir", "task_id", "timestamp", "event_uuid"):
+                    if key in item and key not in reply:
+                        reply[key] = item[key]
+        if not reply:
+            return
+        first = not self._sensor_reply
+        self._sensor_reply.update(reply)
+        diag("sensor_reply", **reply)
+        if not first:
+            return
+        try:
+            centre = float(reply["center_frequency"])
+            bandwidth = float(reply["bandwidth"])
+        except (KeyError, TypeError, ValueError):
+            return
+        start, stop = self._sent_range
+        if bandwidth > 0 and (abs((centre - bandwidth / 2) - start) > 1000 or abs((centre + bandwidth / 2) - stop) > 1000):
+            self._coverage_noted = True
+            self.log(
+                f"CRFS is recording {range_text(centre - bandwidth / 2, centre + bandwidth / 2)}; "
+                f"requested {range_text(start, stop)}.",
+                level="error",
+            )
+
+    def _count_sensor_message(self, text: str, *, warning: bool) -> None:
+        """Count a sensor message; a warning is shown once per session (counts go to the diagnostic log)."""
         if not text:
             return
         count = self._sensor_message_counts.get(text, 0) + 1
         self._sensor_message_counts[text] = count
-        if count == 1:
-            self._sensor_warnings.append(text)
-            self.log(f"{label}: {text}{suffix}", level=level)
+        if count > 1:
+            return
+        self._sensor_warnings.append(text)
+        diag("sensor_message", text, warning=warning)
+        if warning and text not in self._noted_sensor_messages:
+            self._noted_sensor_messages.add(text)
+            self.log(sensor_notice(text), level="error")
 
     def _log_repeated_sensor_messages(self) -> None:
-        """One line per message the sensor repeated during the capture."""
-        repeated = [(text, count) for text, count in self._sensor_message_counts.items() if count > 1]
-        for text, count in repeated:
-            self.log(f"Sensor repeated {count}×: {text}")
+        if self._sensor_message_counts:
+            diag("sensor_message_counts", counts=dict(self._sensor_message_counts))
         self._sensor_message_counts = {}
 
     def _mark_sensor_finished(self) -> None:
@@ -3086,10 +3649,8 @@ class MainWindow(QMainWindow):
         if not self._sensor_finished:
             self._sensor_finished = True
             self._sensor_finished_at = time.monotonic()
-            if self._sensor_parts:
-                self.log("Sensor reported: recording finished.")
-            else:
-                self.log("Sensor reported: recording finished, but it named no file.", level="error")
+            diag("sensor_finished", named=list(self._sensor_parts))
+            self.log("Sensor finished. Waiting for files.")
         self._refresh_finalizing_ui()
         if self._record_phase == FINALIZING and self._watching:
             self._poll_collection_files()
@@ -3099,7 +3660,7 @@ class MainWindow(QMainWindow):
         if filename in self._sensor_parts:
             return
         self._sensor_parts.append(filename)
-        self.log(f"Sensor is writing {filename}" + (f" in {directory}" if directory else ""))
+        diag("sensor_file", filename, directory=directory)
         self._refresh_finalizing_ui()
         record_id = self._open_record_id
         if not record_id:
@@ -3109,31 +3670,41 @@ class MainWindow(QMainWindow):
         try:
             set_recording_stem(record_id, iq_group_key(filename))
         except Exception as exc:  # noqa: BLE001 - history is best effort
-            self.log(f"Could not save the file name for this recording: {exc}", level="error")
+            diag("history_failed", "could not save the file name", error=f"{type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _http_problem_text(outcome: HttpOutcome, *, test: bool = False) -> str:
+        status = outcome.status_code
+        if status in (401, 403):
+            return "The sensor refused the login. Check the user name and password in Settings."
+        if status is not None and status >= 400:
+            if test:
+                return f"The sensor answered with HTTP {status}. See details."
+            return f"CRFS rejected the request (HTTP {status}). See details."
+        if outcome.outcome_unknown:
+            return "No reply from the sensor. Checking its files."
+        if outcome.kind == "timeout" and not test:
+            return "The sensor did not answer. Nothing was sent."
+        if not outcome.request_sent:
+            return "Could not reach the sensor. Check the address and network."
+        return "The request failed. See details."
 
     def _show_http_outcome(self, outcome: Any, *, recording: bool) -> None:
         if not isinstance(outcome, HttpOutcome):
-            self.log(str(outcome), level="error")
+            diag("http_failed", str(outcome))
+            self.log("The sensor request failed. See details.", level="error")
             return
-        if outcome.kind == "accepted":
+        if not recording:
+            self._diag_http(outcome)
+        if outcome.kind in ("accepted", "reachable"):
             if self._sftp_win is not None:
                 self._sftp_win.retry_today()
-            if self._recording_active:
-                self.log("Request accepted. Recording…")
-            else:
-                self.log("Sensor HTTP reply received.")
-        elif outcome.kind == "reachable":
-            self.log(outcome.detail)
-        elif outcome.outcome_unknown:
-            self.log("Request sent; no reply in time. Check Sensor Files before starting again.")
-        else:
-            self.log(outcome.detail, level="error")
-        if outcome.status_code is not None:
-            self.log(f"HTTP {outcome.status_code} from {outcome.url}")
-        if outcome.body_text and outcome.kind not in ("accepted", "reachable"):
-            snippet = outcome.body_text.strip().replace("\n", " ")
-            if snippet:
-                self.log(snippet[:400])
+            if not recording:
+                code = f" (HTTP {outcome.status_code})" if outcome.status_code is not None else ""
+                self.log(f"Sensor answered{code}.")
+            return
+        text = self._http_problem_text(outcome, test=not recording)
+        self.log(text, level="info" if outcome.outcome_unknown else "error")
 
     def _open_sftp(self) -> None:
         if not self._conn.host.strip() and not self._conn.demo:
@@ -3143,7 +3714,7 @@ class MainWindow(QMainWindow):
         from .sftp_paths import today_remdata_directory
 
         today = today_remdata_directory()
-        self.log(f"Sensor files: {self._conn.host or 'demo'} {today}")
+        diag("sensor_files_open", host=self._conn.host or "demo", folder=today)
         try:
             if self._sftp_win is not None:
                 self._sftp_win.close()
@@ -3155,8 +3726,9 @@ class MainWindow(QMainWindow):
             self._sftp_win.show()
             self._sftp_win.raise_()
         except Exception:
-            self.log(traceback.format_exc(limit=6), level="error")
-            QMessageBox.warning(self, "SFTP", "Could not open Sensor Files. See the log.")
+            diag("sensor_files_failed", traceback=traceback.format_exc(limit=8))
+            self.log("Could not open Sensor Files. See details.", level="error")
+            QMessageBox.warning(self, "Sensor Files", "Could not open Sensor Files. See the diagnostic log.")
 
     # ------------------------------------------------------------------ merge recording parts
     def _live_recording_stem(self) -> str | None:
@@ -3227,6 +3799,7 @@ def _install_exception_hook() -> None:
     def hook(exc_type, exc, tb) -> None:
         text = "".join(traceback.format_exception(exc_type, exc, tb))
         _write(text)
+        diag("unhandled_exception", traceback=text)
         sys.__excepthook__(exc_type, exc, tb)
 
     sys.excepthook = hook
@@ -3254,7 +3827,8 @@ def run(*, demo: bool = False) -> int:
         folder = ensure_download_dir(window._conn.download_dir)
         window._conn.download_dir = str(folder)
     except OSError as exc:
-        window.log(f"Could not create download folder: {exc}", level="error")
+        diag("download_dir_unusable", f"{type(exc).__name__}: {exc}")
+        window.log("The download folder cannot be used. Check Settings.", level="error")
     window.show()
     rc = app.exec()
     # Worker threads must be finished before Python deletes their QThread

@@ -168,12 +168,11 @@ def recording_blocked_reason(snapshot: StorageSnapshot | None, estimated_bytes: 
     needed = needed_bytes_with_margin(estimated_bytes)
     if snapshot.free_bytes >= needed:
         return None
+    # The need includes a safety margin for split files.
     return (
-        "Not enough IQ storage for this recording. "
-        f"Need about {format_storage_bytes(needed)} free "
-        "(estimate plus a safety margin for split files). "
-        f"Sensor has {format_storage_bytes(snapshot.free_bytes)} free. "
-        "Existing recordings were left in place."
+        "Not enough IQ storage for this recording: "
+        f"about {format_storage_bytes(needed)} needed, {format_storage_bytes(snapshot.free_bytes)} free on the sensor. "
+        "Nothing was deleted."
     )
 
 

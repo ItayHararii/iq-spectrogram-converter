@@ -218,86 +218,92 @@ def inspect_part(path: os.PathLike | str) -> PartInfo:
         size = path.stat().st_size
     except OSError as exc:
         raise MergeError(f"{path.name}: cannot read ({exc.strerror or exc}).") from exc
-    problems: list[str] = []
     with path.open("rb") as fh:
-        head = _read_exact(fh, 12)
-        magic, riff_size32, wave = head[:4], struct.unpack("<I", head[4:8])[0], head[8:12]
-        if wave != b"WAVE" or magic not in (b"RIFF", b"RF64"):
-            raise MergeError(f"{path.name} is not a WAVE file.")
-        container = "RF64" if magic == b"RF64" else "RIFF"
-        riff_size: int | None = None if (container == "RF64" and riff_size32 == 0xFFFFFFFF) else riff_size32
-        ds64_data_size: int | None = None
-        fmt: WaveFormat | None = None
-        data_offset: int | None = None
-        data_size: int | None = None
-        pos = 12
-        # Walk the chunks up to and including "data"; the trailer is read from the end.
-        while pos + 8 <= size:
-            fh.seek(pos)
-            header = fh.read(8)
-            if len(header) < 8:
+        return inspect_stream(fh, size=size, path=path)
+
+
+def inspect_stream(fh, *, size: int, path: os.PathLike | str) -> PartInfo:
+    """Same as `inspect_part` for an open binary file object (local or SFTP) of `size` bytes."""
+    path = Path(str(path).replace("\\", "/")) if not isinstance(path, Path) else path
+    problems: list[str] = []
+    head = _read_exact(fh, 12)
+    magic, riff_size32, wave = head[:4], struct.unpack("<I", head[4:8])[0], head[8:12]
+    if wave != b"WAVE" or magic not in (b"RIFF", b"RF64"):
+        raise MergeError(f"{path.name} is not a WAVE file.")
+    container = "RF64" if magic == b"RF64" else "RIFF"
+    riff_size: int | None = None if (container == "RF64" and riff_size32 == 0xFFFFFFFF) else riff_size32
+    ds64_data_size: int | None = None
+    fmt: WaveFormat | None = None
+    data_offset: int | None = None
+    data_size: int | None = None
+    pos = 12
+    # Walk the chunks up to and including "data"; the trailer is read from the end.
+    while pos + 8 <= size:
+        fh.seek(pos)
+        header = fh.read(8)
+        if len(header) < 8:
+            break
+        cid = header[:4]
+        csize = struct.unpack("<I", header[4:8])[0]
+        if cid == b"ds64":
+            body = _read_exact(fh, min(csize, 28))
+            if len(body) >= 24:
+                riff_lo, riff_hi, data_lo, data_hi = struct.unpack("<IIII", body[:16])
+                riff_size = riff_lo | (riff_hi << 32)
+                ds64_data_size = data_lo | (data_hi << 32)
+        elif cid == b"fmt ":
+            body = _read_exact(fh, min(csize, 64))
+            if len(body) < 16:
+                raise MergeError(f"{path.name}: the fmt chunk is too short.")
+            tag, channels, rate, byte_rate, block_align, bits = struct.unpack("<HHIIHH", body[:16])
+            fmt = WaveFormat(tag, channels, rate, bits, block_align, byte_rate, raw=body)
+        elif cid == b"data":
+            data_offset = pos + 8
+            if csize == 0xFFFFFFFF and ds64_data_size is not None:
+                data_size = ds64_data_size
+            else:
+                data_size = csize
+            break
+        pos += 8 + csize + (csize & 1)
+    if fmt is None or data_offset is None or data_size is None:
+        raise MergeError(f"{path.name}: no fmt/data chunks; not a usable WAVE file.")
+    if not fmt.pcm or fmt.bits % 8 or fmt.channels < 1:
+        problems.append(f"unsupported encoding (format tag {fmt.format_tag}, {fmt.bits} bit)")
+    if fmt.block_align != fmt.channels * (fmt.bits // 8):
+        problems.append("fmt block alignment does not match channels x bits")
+    available = max(0, size - data_offset)
+    if data_size > available:
+        problems.append(
+            f"truncated: header promises {data_size:,} sample bytes, the file holds {available:,}"
+        )
+        frames = available // fmt.block_align if fmt.block_align else 0
+    else:
+        frames = data_size // fmt.block_align if fmt.block_align else 0
+    if fmt.block_align and data_size % fmt.block_align:
+        problems.append("the data chunk ends in the middle of a sample")
+    if data_size == 0:
+        problems.append("no samples (still being written?)")
+    trailer: list[tuple[bytes, bytes]] = []
+    meta: SignalInfo | None = None
+    tail_start = data_offset + data_size + (data_size & 1)
+    if data_size <= available and tail_start < size:
+        fh.seek(tail_start)
+        tail = fh.read(min(size - tail_start, 1 << 20))
+        tpos = 0
+        while tpos + 8 <= len(tail):
+            cid = tail[tpos:tpos + 4]
+            csize = struct.unpack("<I", tail[tpos + 4:tpos + 8])[0]
+            body = tail[tpos + 8:tpos + 8 + csize]
+            if len(body) < csize:
+                problems.append(f"the {cid.decode('latin-1')!r} trailer chunk is cut short")
                 break
-            cid = header[:4]
-            csize = struct.unpack("<I", header[4:8])[0]
-            if cid == b"ds64":
-                body = _read_exact(fh, min(csize, 28))
-                if len(body) >= 24:
-                    riff_lo, riff_hi, data_lo, data_hi = struct.unpack("<IIII", body[:16])
-                    riff_size = riff_lo | (riff_hi << 32)
-                    ds64_data_size = data_lo | (data_hi << 32)
-            elif cid == b"fmt ":
-                body = _read_exact(fh, min(csize, 64))
-                if len(body) < 16:
-                    raise MergeError(f"{path.name}: the fmt chunk is too short.")
-                tag, channels, rate, byte_rate, block_align, bits = struct.unpack("<HHIIHH", body[:16])
-                fmt = WaveFormat(tag, channels, rate, bits, block_align, byte_rate, raw=body)
-            elif cid == b"data":
-                data_offset = pos + 8
-                if csize == 0xFFFFFFFF and ds64_data_size is not None:
-                    data_size = ds64_data_size
-                else:
-                    data_size = csize
-                break
-            pos += 8 + csize + (csize & 1)
-        if fmt is None or data_offset is None or data_size is None:
-            raise MergeError(f"{path.name}: no fmt/data chunks; not a usable WAVE file.")
-        if not fmt.pcm or fmt.bits % 8 or fmt.channels < 1:
-            problems.append(f"unsupported encoding (format tag {fmt.format_tag}, {fmt.bits} bit)")
-        if fmt.block_align != fmt.channels * (fmt.bits // 8):
-            problems.append("fmt block alignment does not match channels x bits")
-        available = max(0, size - data_offset)
-        if data_size > available:
-            problems.append(
-                f"truncated: header promises {data_size:,} sample bytes, the file holds {available:,}"
-            )
-            frames = available // fmt.block_align if fmt.block_align else 0
-        else:
-            frames = data_size // fmt.block_align if fmt.block_align else 0
-        if fmt.block_align and data_size % fmt.block_align:
-            problems.append("the data chunk ends in the middle of a sample")
-        if data_size == 0:
-            problems.append("no samples (still being written?)")
-        trailer: list[tuple[bytes, bytes]] = []
-        meta: SignalInfo | None = None
-        tail_start = data_offset + data_size + (data_size & 1)
-        if data_size <= available and tail_start < size:
-            fh.seek(tail_start)
-            tail = fh.read(min(size - tail_start, 1 << 20))
-            tpos = 0
-            while tpos + 8 <= len(tail):
-                cid = tail[tpos:tpos + 4]
-                csize = struct.unpack("<I", tail[tpos + 4:tpos + 8])[0]
-                body = tail[tpos + 8:tpos + 8 + csize]
-                if len(body) < csize:
-                    problems.append(f"the {cid.decode('latin-1')!r} trailer chunk is cut short")
-                    break
-                trailer.append((cid, body))
-                if cid == b"meta":
-                    meta = SignalInfo.parse(body)
-                tpos += 8 + csize + (csize & 1)
-        if riff_size is not None and riff_size + 8 != size and not problems:
-            # Real Node files match exactly; a copy that grew or was clipped does not.
-            problems.append(f"RIFF size says {riff_size + 8:,} bytes, the file is {size:,}")
+            trailer.append((cid, body))
+            if cid == b"meta":
+                meta = SignalInfo.parse(body)
+            tpos += 8 + csize + (csize & 1)
+    if riff_size is not None and riff_size + 8 != size and not problems:
+        # Real Node files match exactly; a copy that grew or was clipped does not.
+        problems.append(f"RIFF size says {riff_size + 8:,} bytes, the file is {size:,}")
     return PartInfo(
         path=path,
         name=path.name,

@@ -156,8 +156,8 @@ def test_auto_merge_runs_once_after_all_parts_are_downloaded(qapp, tmp_path):
         assert read_sidecar(result.output)["continuity"] == "verified"
         log = window.log_edit.toPlainText()
         assert "Auto-merge queued for file_063929 (3 parts)." in log
-        assert "Merged file_063929:" in log and "originals are kept" in log
-        assert window.merge_status.text().startswith("Merged file_063929 -> file_063929_merged.wav")
+        assert "Merged file_063929: file_063929_merged.wav, " in log and "Originals kept." in log
+        assert window.merge_status.text().startswith("Merged file_063929 into file_063929_merged.wav")
         assert window.merge_cancel_btn.isHidden() and window.merge_progress.isHidden()
         # Recording status is untouched by merging.
         assert window._record_phase == "idle" and window._recordings_completed == 0
@@ -168,7 +168,7 @@ def test_auto_merge_runs_once_after_all_parts_are_downloaded(qapp, tmp_path):
         assert _wait(qapp, lambda: not win._dl_active and not win._dl_pending and not win._busy, 10.0)
         _pump(qapp, 0.5)
         assert len(merged) == 1
-        assert "already merged -> file_063929_merged.wav" in window.log_edit.toPlainText()
+        assert "Already merged: file_063929 into file_063929_merged.wav." in window.log_edit.toPlainText()
         assert not (downloads / "file_063929_merged (2).wav").exists()
     finally:
         window.close()
@@ -187,7 +187,7 @@ def test_auto_merge_runs_once_after_all_parts_are_downloaded(qapp, tmp_path):
         assert _wait(qapp, lambda: not win._dl_active and not win._dl_pending and not win._busy, 10.0)
         _pump(qapp, 0.5)
         assert merged_again == []
-        assert "already merged" in again.log_edit.toPlainText()
+        assert "Already merged" in again.log_edit.toPlainText()
     finally:
         again.close()
         qapp.processEvents()
@@ -285,7 +285,7 @@ def test_failed_merge_does_not_touch_recording_status(qapp, tmp_path):
         assert not list(downloads.glob("*_merged*")), "no output for a failed merge"
         assert window._recordings_completed == 4 and window._record_phase == "idle"
         assert window.merge_status.text().startswith("Merge failed: file_063929.")
-        assert "The recording itself is not affected." in window.log_edit.toPlainText()
+        assert "The recording is not affected." in window.log_edit.toPlainText()
         # Nothing is remembered for a failed merge: fixing the part and downloading again merges.
         write_part(scratch / names[1], frames=250, start=T0 + timedelta(seconds=0.25), seed=2)
         blob = (scratch / names[1]).read_bytes()

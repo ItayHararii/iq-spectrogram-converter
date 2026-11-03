@@ -88,6 +88,82 @@ def isolated_config_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_diagnostic_log():
+    """Each test starts with an empty diagnostic log; its file (in the test's
+    config folder) is closed afterwards so the folder can be removed."""
+    from crfs_iq_recorder import diagnostic_log
+
+    diagnostic_log.reset_for_tests()
+    yield
+    diagnostic_log.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def no_desktop_open(monkeypatch):
+    """Explorer and default applications are never launched by tests; the calls are recorded."""
+    opened: list[tuple[str, str]] = []
+    monkeypatch.setattr("crfs_iq_recorder.desktop_open.open_path", lambda path: opened.append(("open", str(path))) or True)
+    monkeypatch.setattr("crfs_iq_recorder.desktop_open.reveal", lambda path: opened.append(("reveal", str(path))) or True)
+    return opened
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "operator_text_unchecked: the test feeds deliberately bad text to the Activity panel"
+    )
+
+
+@pytest.fixture(autouse=True)
+def operator_messages_follow_the_rules(monkeypatch, request):
+    """Every Activity line and status message a test produces must pass tests/operator_rules.py.
+
+    Only modules the test already imported are watched, so Qt-free tests stay Qt-free.
+    """
+    import sys
+
+    seen: list[tuple[str, str]] = []
+    gui = sys.modules.get("crfs_iq_recorder.gui")
+    if gui is not None:
+        window_log = gui.MainWindow.log
+        window_msg = gui.MainWindow._set_msg
+
+        def log(self, message, *, level="info"):
+            seen.append(("Activity", gui.scrub_operator(str(message))))
+            return window_log(self, message, level=level)
+
+        def set_msg(self, text, *, error=False):
+            seen.append(("Status", str(text)))
+            return window_msg(self, text, error=error)
+
+        monkeypatch.setattr(gui.MainWindow, "log", log)
+        monkeypatch.setattr(gui.MainWindow, "_set_msg", set_msg)
+    runner = sys.modules.get("crfs_iq_recorder.cellular_runner")
+    if runner is not None:
+        runner_log = runner.CellularRunner._log
+
+        def runner_message(self, message, level="info"):
+            seen.append(("Activity", str(message)))
+            return runner_log(self, message, level)
+
+        monkeypatch.setattr(runner.CellularRunner, "_log", runner_message)
+    yield seen
+    if request.node.get_closest_marker("operator_text_unchecked"):
+        return
+    from crfs_iq_recorder import diagnostic_log
+    from operator_rules import problems
+
+    # The Activity panel keeps an ordinary-word password ("pass") as a word; see scrub_operator.
+    secrets = tuple(s for s in diagnostic_log._registered() if not diagnostic_log._ordinary_word(s))  # noqa: SLF001
+    bad = []
+    for where, text in seen:
+        found = problems(text, secrets=secrets)
+        if found:
+            bad.append(f"{where}: {text!r}: {', '.join(found)}")
+    if bad:
+        pytest.fail("Operator messages break the rules:\n" + "\n".join(dict.fromkeys(bad)), pytrace=False)
+
+
+@pytest.fixture(autouse=True)
 def isolated_excel_log(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "crfs_iq_recorder.paths.excel_log_path",

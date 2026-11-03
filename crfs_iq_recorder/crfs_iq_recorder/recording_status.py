@@ -11,17 +11,21 @@ SUBMITTING = "submitting"
 RECORDING = "recording"
 FINALIZING = "finalizing"
 CONFIRMED = "confirmed"
+PARTIAL = "partial"
 UNKNOWN = "unknown"
+FAILED = "failed"
 WAITING = "waiting"
 
 PHASE_LABELS = {
     IDLE: "Idle",
     SUBMITTING: "Sending request…",
-    RECORDING: "Recording…",
-    FINALIZING: "Time elapsed - waiting for files",
-    CONFIRMED: "WAVE file found",
-    UNKNOWN: "Time elapsed - file not confirmed",
-    WAITING: "Next recording",
+    RECORDING: "Recording",
+    FINALIZING: "Waiting for files",
+    CONFIRMED: "Files ready",
+    PARTIAL: "Partial recording",
+    UNKNOWN: "Not confirmed",
+    FAILED: "Failed",
+    WAITING: "Waiting for next recording",
 }
 
 NO_EMP_COMPLETION_API = (

@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 
 from .connection_state import ConnectionState
 from .constants import DEFAULT_SFTP_PORT
+from .diagnostic_log import diag
 from .download_util import DownloadError, unique_destination
 from .listing_sort import (
     COL_MODIFIED,
@@ -1117,7 +1118,8 @@ class SftpWindow(QWidget):
         else:
             self._show_list_state("error", f"Could not list files.\n{detail}")
         self.status.setText("SFTP error.")
-        self.activity.emit(f"SFTP: {detail}")
+        diag("sftp_failed", "Sensor Files could not list the folder", error=str(text or ""))
+        self.activity.emit("Cannot read the sensor's files. See details.")
 
     def refresh(self) -> None:
         self._request_list(self._path)
@@ -1282,7 +1284,8 @@ class SftpWindow(QWidget):
             self._new_paths.discard(path)
         for path, message in failed:
             name = path.replace("\\", "/").rsplit("/", 1)[-1]
-            self.activity.emit(f"Could not delete {name}: {message}")
+            diag("sftp_delete_failed", path, error=message)
+            self.activity.emit(f"Could not delete {name} from the sensor. See details.")
         if preview_path in deleted or (self.preview_file.text() and any(
             path.endswith("/" + self.preview_file.text()) or path.endswith(self.preview_file.text())
             for path in deleted

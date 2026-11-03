@@ -1,30 +1,28 @@
-"""Turn the imported protocol rows into the exact sequence of captures for one round.
+"""Turn the imported protocol rows into the recording requests of one pass.
 
-Rules:
+Rule: each protocol row is sent to the sensor as one recording request, in
+worksheet order, with the row's own start and stop frequencies and the
+duration chosen in the app. The only conversions are the ones the API needs:
+units to Hz and start/stop to centre/bandwidth. A row whose centre is not a
+whole number of Hz cannot be sent exactly and is reported, not changed.
 
-* the worksheet is the plan: rows are recorded top to bottom, in the order
-  and with the frequency edges the workbook lists; a TDD row is one shared
-  allocation (never duplicated as "DL" and "UL");
-* every capture uses the duration chosen in the app; the workbook's duration
-  column is a result of an earlier pass, never an instruction;
-* the capture window is what the connected sensor was verified to record
-  complete for that duration; a row wider than the window becomes
-  consecutive windows whose union covers it, each a separate capture of the
-  full duration (sequential coverage, said so before the start), and the wait
-  between captures applies between windows too.
+Nothing is split, narrowed, shortened, shifted or rounded, and the request
+count does not depend on the duration. What the sensor actually records is
+measured from its files afterwards; the plan only says what is requested.
 
-Nothing is combined into a wider capture and no allocation is cropped,
-retuned or resampled: what is recorded is exactly what the plan shows.
+A TDD row is one shared allocation (never duplicated as "DL" and "UL"). The
+workbook's duration column is a result of an earlier pass, never an
+instruction. A "Repeat" column, when the worksheet has one, sends the same
+unchanged request that many times.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from .cellular_capabilities import MHZ, SensorCapability, normalise_window_hz
+from .cellular_capabilities import MHZ, SensorCapability
 from .cellular_protocol import (
     DIR_DL,
     DIR_UL,
@@ -37,23 +35,29 @@ from .cellular_protocol import (
     ProtocolImport,
     format_mhz,
 )
-from .frequency import FrequencyPlan, from_start_end
+from .frequency import FrequencyPlan
 from .size_estimate import wave_size_model
 
 DURATION_FROM_WORKBOOK = "workbook"
 DURATION_FROM_CAMPAIGN = "campaign"
 
-# Time a capture costs beyond its recording duration: request, the sensor's
-# own finalisation and the file confirmation. Measured 3-13 s on the Node
-# 40-8 for 2-20 s captures; on the Node 100-18 the file reaches the disk at
-# 15-30 MB/s after the capture, so a 625 MB capture settles ~30 s after the
-# POST. Used for the estimate only.
+# Saved plans carry the rule they were built with. Plans saved by 1.10.0-1.12.0
+# have none (and may hold automatically generated sub-band requests).
+REQUEST_RULE = "one_request_per_row"
+REQUEST_SENTENCE = "Each Excel row is sent to CRFS as one recording request using the listed frequency range and selected duration."
+
+# Time a recording costs beyond its duration: request, the sensor's own
+# finalisation and the file confirmation. Used for the time estimate only.
 DEFAULT_OVERHEAD_S = 30.0
 
 
 @dataclass(frozen=True)
 class PlannedTask:
-    """One capture of one frequency window, in execution order."""
+    """One recording request for one protocol row, in execution order.
+
+    `window_*` hold the requested range (kept under these names so plans saved
+    by older versions still load); new plans always have one request per row.
+    """
 
     index: int
     task_key: str
@@ -88,19 +92,19 @@ class PlannedTask:
     extra: dict[str, str] = field(default_factory=dict)
 
     @property
-    def partial(self) -> bool:
-        return self.window_count > 1
+    def range_text(self) -> str:
+        """'3300-3400 MHz' (the requested range, plain hyphen for the activity log)."""
+        return f"{format_mhz(self.window_start_hz)}-{format_mhz(self.window_stop_hz)} MHz"
 
     @property
-    def coverage_label(self) -> str:
-        if self.window_count > 1:
-            return f"window {self.window_index} of {self.window_count} (sequential coverage, partial capture)"
-        return "whole allocation"
+    def request_text(self) -> str:
+        """'100 MHz for 2 s' (what is asked of the sensor)."""
+        return f"{format_mhz(self.bandwidth_hz)} MHz for {self.duration_s:g} s"
 
     def label(self) -> str:
         text = f"{self.band_label} {self.direction} {format_mhz(self.window_start_hz)}–{format_mhz(self.window_stop_hz)} MHz"
         if self.window_count > 1:
-            text += f" ({self.window_index}/{self.window_count})"
+            text += f" (part {self.window_index}/{self.window_count})"
         if self.repetitions > 1:
             text += f" rep {self.repetition}/{self.repetitions}"
         return text
@@ -187,17 +191,15 @@ class PlannedTask:
 
 @dataclass
 class CellularPlan:
-    """The ordered captures of one complete pass plus how they were derived."""
+    """The ordered requests of one complete pass."""
 
     protocol_version: str
     tasks: list[PlannedTask]
     issues: list[Issue]
-    window_hz: int
-    window_note: str
-    edge_margin_hz: int
     fallback_duration_s: float | None
     capability: dict[str, Any]
     band_order: list[str]
+    request_rule: str = REQUEST_RULE
 
     @property
     def errors(self) -> list[Issue]:
@@ -208,6 +210,15 @@ class CellularPlan:
         return bool(self.tasks) and not self.errors
 
     @property
+    def legacy(self) -> bool:
+        """Built by an older version (possibly with automatic sub-band requests): never resumed."""
+        return self.request_rule != REQUEST_RULE or any(task.window_count > 1 for task in self.tasks)
+
+    @property
+    def row_count(self) -> int:
+        return len({task.entry_id for task in self.tasks})
+
+    @property
     def estimated_bytes(self) -> int:
         return sum(task.estimated_bytes for task in self.tasks)
 
@@ -216,7 +227,7 @@ class CellularPlan:
         return sum(task.duration_s for task in self.tasks)
 
     def estimated_round_seconds(self, wait_s: float, overhead_s: float = DEFAULT_OVERHEAD_S) -> float:
-        """Estimate for one pass: captures, the waits between them and per-capture overhead."""
+        """Estimate for one pass: recordings, the waits between them and per-request overhead."""
         count = len(self.tasks)
         if not count:
             return 0.0
@@ -227,10 +238,8 @@ class CellularPlan:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "request_rule": self.request_rule,
             "protocol_version": self.protocol_version,
-            "window_hz": self.window_hz,
-            "window_note": self.window_note,
-            "edge_margin_hz": self.edge_margin_hz,
             "fallback_duration_s": self.fallback_duration_s,
             "capability": dict(self.capability),
             "band_order": list(self.band_order),
@@ -245,12 +254,10 @@ class CellularPlan:
             protocol_version=str(data.get("protocol_version") or ""),
             tasks=[PlannedTask.from_dict(item) for item in data.get("tasks") or []],
             issues=[Issue.from_dict(item) for item in data.get("issues") or []],
-            window_hz=int(data.get("window_hz") or 0),
-            window_note=str(data.get("window_note") or ""),
-            edge_margin_hz=int(data.get("edge_margin_hz") or 0),
             fallback_duration_s=float(fallback) if fallback is not None else None,
             capability=dict(data.get("capability") or {}),
             band_order=[str(item) for item in data.get("band_order") or []],
+            request_rule=str(data.get("request_rule") or ""),
         )
 
 
@@ -281,157 +288,112 @@ def order_entries(entries: list[ProtocolEntry]) -> tuple[list[ProtocolEntry], li
     return ordered, band_order, issues
 
 
-def split_windows(start_hz: int, stop_hz: int, window_hz: int, *, edge_margin_hz: int = 0) -> list[tuple[int, int, int]]:
-    """(start, stop, overlap_with_previous) windows whose union covers [start, stop].
-
-    Each window is `window_hz` wide. Windows step from `start_hz` by the
-    usable width (the window less any edge margin on both sides), so their
-    edges stay on the allocation's own grid (whole MHz for whole-MHz edges);
-    the last window is moved back to end exactly at `stop_hz`, and the extra
-    overlap this gives it is reported instead of leaving a gap.
-    """
-    width = stop_hz - start_hz
-    if width <= 0:
-        return []
-    if width <= window_hz:
-        return [(start_hz, stop_hz, 0)]
-    # The step between neighbouring windows may not exceed the usable width,
-    # so the trusted centre parts tile the allocation without a gap.
-    usable = max(window_hz - 2 * max(edge_margin_hz, 0), window_hz // 2)
-    count = math.ceil((width - window_hz) / usable) + 1
-    windows: list[tuple[int, int, int]] = []
-    previous_stop: int | None = None
-    for index in range(count):
-        w_start = min(start_hz + index * usable, stop_hz - window_hz)
-        w_stop = w_start + window_hz
-        overlap = (previous_stop - w_start) if previous_stop is not None else 0
-        windows.append((w_start, w_stop, max(overlap, 0)))
-        previous_stop = w_stop
-    return windows
-
-
-def _window_plan(start_hz: int, stop_hz: int) -> tuple[FrequencyPlan, tuple[str, ...]]:
-    adjustments: list[str] = []
+def request_range(start_hz: int, stop_hz: int) -> tuple[FrequencyPlan | None, str]:
+    """Exact centre/bandwidth for a row's range, or why it cannot be sent unchanged."""
+    if stop_hz <= start_hz:
+        return None, "the stop frequency is not above the start frequency"
     if (start_hz + stop_hz) % 2:
-        stop_hz += 1
-        adjustments.append("Window widened by 1 Hz at the top so its centre is a whole number of Hz.")
-    return from_start_end(start_hz, stop_hz), tuple(adjustments)
+        centre = Decimal(start_hz + stop_hz) / 2
+        return None, (
+            f"its centre would be {centre} Hz, which the sensor API cannot take (whole Hz only); "
+            "correct the start or stop frequency in the workbook"
+        )
+    return FrequencyPlan(start_hz=start_hz, end_hz=stop_hz, center_hz=(start_hz + stop_hz) // 2, bandwidth_hz=stop_hz - start_hz), ""
 
 
 def build_plan(
     imported: ProtocolImport,
     capability: SensorCapability,
     *,
-    window_hz: int | None = None,
     fallback_duration_s: float | None = None,
-    edge_margin_hz: int = 0,
 ) -> CellularPlan:
-    """The capture sequence for one round. Problems are reported in `issues`, never fixed silently.
+    """The requests of one pass. Problems are reported in `issues`, never fixed.
 
-    Rows are recorded in worksheet order. The recording duration is the one
-    chosen in the app (`fallback_duration_s`) for every row; a duration column
-    in the workbook is a *result* (the measured seconds of an earlier pass)
-    and is never used as an instruction.
-
-    The capture window is chosen from what the connected sensor was verified
-    to record complete for that duration (`SensorCapability.window_for`);
-    `window_hz` overrides it. A row wider than the window is recorded as
-    sequential windows, each of the full duration.
+    Every row becomes one request with its own start/stop and the duration
+    chosen in the app (`fallback_duration_s`); the workbook's duration column
+    is a result of an earlier pass, never an instruction.
     """
-    if fallback_duration_s is not None and not fallback_duration_s > 0:
-        duration_error: Issue | None = Issue(LEVEL_ERROR, "fallback_invalid", "The recording duration must be positive.")
+    issues: list[Issue] = []
+    invalid = fallback_duration_s is not None and not fallback_duration_s > 0
+    if invalid:
+        issues.append(Issue(LEVEL_ERROR, "fallback_invalid", "The recording duration must be positive."))
         fallback_duration_s = None
-    else:
-        duration_error = None
-    if window_hz:
-        window, window_notes = normalise_window_hz(window_hz, capability)
-    else:
-        window, window_notes = normalise_window_hz(capability.window_for(fallback_duration_s or 0.0), capability)
-    issues: list[Issue] = [Issue(LEVEL_INFO, "window", note) for note in window_notes]
-    window_note = capability.window_note(window, fallback_duration_s)
     entries = imported.valid_entries()
     ordered, band_order, order_issues = order_entries(entries)
     issues.extend(order_issues)
-    tasks: list[PlannedTask] = []
-    if duration_error is not None:
-        issues.append(duration_error)
-    if fallback_duration_s is None and ordered:
+    if fallback_duration_s is None and ordered and not invalid:
         issues.append(Issue(LEVEL_ERROR, "duration_missing", "Choose the recording duration (seconds) in the app."))
+    tasks: list[PlannedTask] = []
     for entry in ordered:
         if entry.start_hz is None or entry.stop_hz is None:
             continue
-        coverage = capability.coverage_issue(entry.start_hz, entry.stop_hz)
-        if coverage:
-            issues.append(Issue(LEVEL_ERROR, "outside_coverage", f"{entry.label()}: {coverage}", row=entry.row))
+        plan, problem = request_range(entry.start_hz, entry.stop_hz)
+        if plan is None:
+            issues.append(Issue(LEVEL_ERROR, "unrepresentable", f"Row {entry.row} ({entry.label()}): {problem}.", row=entry.row))
             continue
-        if fallback_duration_s is None:
-            continue
-        duration, source = float(fallback_duration_s), DURATION_FROM_CAMPAIGN
-        windows = split_windows(entry.start_hz, entry.stop_hz, window, edge_margin_hz=edge_margin_hz)
-        if len(windows) > 1:
-            overlaps = sorted({w[2] for w in windows[1:]})
-            overlap_text = ", ".join(f"{o / MHZ:g}" for o in overlaps) + " MHz"
+        tuning = capability.tuning_note(plan.start_hz, plan.end_hz)
+        if tuning:
             issues.append(Issue(
-                LEVEL_INFO,
-                "expanded",
-                f"{entry.label()} ({(entry.stop_hz - entry.start_hz) / MHZ:g} MHz) is wider than the "
-                f"{window / MHZ:g} MHz capture window: recorded as {len(windows)} sequential windows of "
-                f"{duration:g} s each (overlap {overlap_text}). This is sequential coverage, not a simultaneous "
-                "full-band capture.",
+                LEVEL_WARNING,
+                "outside_tuning_range",
+                f"Row {entry.row} ({entry.label()}) {tuning}. It is sent as listed; CRFS decides.",
                 row=entry.row,
             ))
+        if capability.wider_than_receiver(plan.bandwidth_hz):
+            issues.append(Issue(
+                LEVEL_INFO,
+                "wider_than_receiver",
+                f"Row {entry.row}: {format_mhz(plan.bandwidth_hz)} MHz is wider than the "
+                f"{format_mhz(int(capability.ibw_hz or 0))} MHz receiver of this model. It is sent as one request; "
+                "the files show what CRFS recorded.",
+                row=entry.row,
+            ))
+        if fallback_duration_s is None:
+            continue
+        duration = float(fallback_duration_s)
+        model = wave_size_model(plan.bandwidth_hz, Decimal(str(duration)), max_rate_hz=capability.max_sample_rate_hz)
         repetitions = max(int(entry.repeat or 1), 1)
         for repetition in range(1, repetitions + 1):
-            for w_index, (w_start, w_stop, overlap) in enumerate(windows, start=1):
-                plan, adjustments = _window_plan(w_start, w_stop)
-                model = wave_size_model(
-                    plan.bandwidth_hz, Decimal(str(duration)), max_rate_hz=capability.max_sample_rate_hz
-                )
-                key = f"{entry.entry_id}#w{w_index}of{len(windows)}#r{repetition}"
-                tasks.append(PlannedTask(
-                    index=len(tasks),
-                    task_key=key,
-                    entry_id=entry.entry_id,
-                    row=entry.row,
-                    band=entry.band,
-                    band_label=entry.band_label(),
-                    nominal_hz=entry.nominal_hz,
-                    duplex=entry.duplex,
-                    direction=entry.direction,
-                    network=entry.network,
-                    technology=entry.technology,
-                    target_class=entry.target_class,
-                    notes=entry.notes,
-                    requested_start_hz=entry.start_hz,
-                    requested_stop_hz=entry.stop_hz,
-                    window_start_hz=plan.start_hz,
-                    window_stop_hz=plan.end_hz,
-                    window_index=w_index,
-                    window_count=len(windows),
-                    overlap_prev_hz=overlap,
-                    repetition=repetition,
-                    repetitions=repetitions,
-                    duration_s=duration,
-                    duration_source=source,
-                    center_hz=plan.center_hz,
-                    bandwidth_hz=plan.bandwidth_hz,
-                    sample_rate_hz=model.sample_rate_hz,
-                    estimated_bytes=model.total_bytes,
-                    estimated_parts=model.parts,
-                    adjustments=adjustments,
-                    extra=dict(entry.extra),
-                ))
+            tasks.append(PlannedTask(
+                index=len(tasks),
+                task_key=f"{entry.entry_id}#r{repetition}",
+                entry_id=entry.entry_id,
+                row=entry.row,
+                band=entry.band,
+                band_label=entry.band_label(),
+                nominal_hz=entry.nominal_hz,
+                duplex=entry.duplex,
+                direction=entry.direction,
+                network=entry.network,
+                technology=entry.technology,
+                target_class=entry.target_class,
+                notes=entry.notes,
+                requested_start_hz=entry.start_hz,
+                requested_stop_hz=entry.stop_hz,
+                window_start_hz=plan.start_hz,
+                window_stop_hz=plan.end_hz,
+                window_index=1,
+                window_count=1,
+                overlap_prev_hz=0,
+                repetition=repetition,
+                repetitions=repetitions,
+                duration_s=duration,
+                duration_source=DURATION_FROM_CAMPAIGN,
+                center_hz=plan.center_hz,
+                bandwidth_hz=plan.bandwidth_hz,
+                sample_rate_hz=model.sample_rate_hz,
+                estimated_bytes=model.total_bytes,
+                estimated_parts=model.parts,
+                extra=dict(entry.extra),
+            ))
     if not tasks and not issues:
-        issues.append(Issue(LEVEL_ERROR, "empty", "The protocol has no allocation that can be recorded."))
-    elif not tasks:
-        issues.append(Issue(LEVEL_ERROR, "empty", "No capture could be planned; fix the items above."))
+        issues.append(Issue(LEVEL_ERROR, "empty", "The protocol has no row that can be recorded."))
+    elif not tasks and not any(issue.level == LEVEL_ERROR for issue in issues):
+        issues.append(Issue(LEVEL_ERROR, "empty", "No request could be planned; fix the items above."))
     return CellularPlan(
         protocol_version=imported.protocol_version(),
         tasks=tasks,
         issues=issues,
-        window_hz=window,
-        window_note=window_note,
-        edge_margin_hz=max(int(edge_margin_hz or 0), 0),
         fallback_duration_s=fallback_duration_s,
         capability=capability.to_dict(),
         band_order=band_order,
@@ -456,3 +418,37 @@ def format_seconds(seconds: float) -> str:
     if minutes:
         return f"{minutes} min {secs:02d} s"
     return f"{secs} s"
+
+
+def _wait_text(seconds: float) -> str:
+    seconds = max(float(seconds or 0.0), 0.0)
+    return f"{seconds:g} s" if seconds < 60 else format_seconds(seconds)
+
+
+def summary_line(plan: CellularPlan, *, wait_s: float, passes: int) -> str:
+    """'15 rows · 2 s per request · 10 s between recordings · 1 pass' (passes 0 = until stopped)."""
+    rows = plan.row_count
+    parts = [f"{rows} row" + ("" if rows == 1 else "s")]
+    if len(plan.tasks) != rows:
+        parts.append(f"{len(plan.tasks)} requests")
+    if plan.fallback_duration_s:
+        parts.append(f"{plan.fallback_duration_s:g} s per request")
+    parts.append(f"{_wait_text(wait_s)} between recordings")
+    parts.append("until stopped" if passes <= 0 else f"{passes} pass" + ("" if passes == 1 else "es"))
+    return " · ".join(parts)
+
+
+__all__ = [
+    "DEFAULT_OVERHEAD_S",
+    "MHZ",
+    "REQUEST_RULE",
+    "REQUEST_SENTENCE",
+    "CellularPlan",
+    "PlannedTask",
+    "build_plan",
+    "format_bytes",
+    "format_seconds",
+    "order_entries",
+    "request_range",
+    "summary_line",
+]

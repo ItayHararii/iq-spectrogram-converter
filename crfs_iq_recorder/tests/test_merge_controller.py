@@ -57,7 +57,7 @@ def test_auto_requests_need_the_toggle_and_a_finished_recording(qapp, tmp_path):
     assert stem == "file_063929" and result.frames == 600
     assert (tmp_path / "file_063929_merged.wav").exists()
     assert events["busy"][0] is True and events["busy"][-1] is False
-    assert any(t.startswith("Merged file_063929 -> file_063929_merged.wav") for _e, t in events["status"])
+    assert any(t.startswith("Merged file_063929 into file_063929_merged.wav") for _e, t in events["status"])
 
 
 def test_manual_requests_ignore_the_toggle_but_not_the_queue(qapp, tmp_path):

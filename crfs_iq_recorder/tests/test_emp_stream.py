@@ -382,31 +382,17 @@ def test_refused_request_names_no_file_and_is_not_finished(sensor):
     outcome = EmpClient(demo=False).start_recording(sensor(_Script([(0.02, SCHEDULE_ERROR)])), "pw", _payload(), stream_budget_s=10)
     assert outcome.kind == "sensor_error" and outcome.accepted is False and outcome.request_sent is True
     assert outcome.sensor_parts == [] and outcome.sensor_finished is False
-    # What the runner sees for that POST (the window's capture summary) is "refused".
-    from crfs_iq_recorder.capture_api import OUTCOME_CONFIRMED, OUTCOME_SENSOR_ERROR, CaptureSummary
-    from crfs_iq_recorder.cellular_runner import request_refused
-
-    def summary(http):
-        confirmed = http.kind == "accepted" and http.sensor_finished
-        return CaptureSummary(
-            outcome=OUTCOME_CONFIRMED if confirmed else OUTCOME_SENSOR_ERROR,
-            sensor_finished=http.sensor_finished,
-            sensor_parts=list(http.sensor_parts),
-            parts=len(http.sensor_parts),
-            finalized_paths=[f"/mnt/1/remdata/20261031/{n}" for n in http.sensor_parts],
-        )
-
-    assert request_refused(summary(outcome)) is True
+    # A refusal names no file, so the runner records the row as failed and never
+    # re-sends it by itself. An error after a part was named is different: the
+    # sensor did start, so the files decide.
     finished = EmpClient(demo=False).start_recording(
         sensor(_Script([(0.02, remote_time("f.wav")), (0.02, FINISHED)])), "pw", _payload(), stream_budget_s=10
     )
-    assert request_refused(summary(finished)) is False
-    # An error that arrives after a part was named is a failed recording, not a refusal:
-    # the sensor did start, so the files decide and the request is never re-sent blindly.
+    assert finished.kind == "accepted" and finished.sensor_finished is True and finished.sensor_parts == ["f.wav"]
     partial = EmpClient(demo=False).start_recording(
         sensor(_Script([(0.02, remote_time("f.wav")), (0.02, SCHEDULE_ERROR)])), "pw", _payload(), stream_budget_s=10
     )
-    assert partial.kind == "sensor_error" and request_refused(summary(partial)) is False
+    assert partial.kind == "sensor_error" and partial.sensor_parts == ["f.wav"]
 
 
 MISSIONS_HTML = (

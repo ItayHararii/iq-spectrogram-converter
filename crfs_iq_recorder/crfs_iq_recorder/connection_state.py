@@ -86,6 +86,7 @@ class ConnectionState:
     recorded_time_s: float = DEFAULT_RECORDED_TIME_S
     recording_format: str = DEFAULT_RECORDING_FORMAT
     ui_theme: str = "light"
+    ui_tab: str = "manual"  # "manual" or "excel": the workflow tab shown at start
     excel_enabled: bool = False
     excel_workbook: str = ""
     collection_event: str = ""
@@ -137,6 +138,7 @@ class ConnectionState:
             "recorded_time_s": float(self.recorded_time_s),
             "recording_format": self.recording_format,
             "ui_theme": "dark" if self.ui_theme == "dark" else "light",
+            "ui_tab": "excel" if self.ui_tab == "excel" else "manual",
             "excel_enabled": bool(self.excel_enabled),
             "excel_workbook": self.excel_workbook,
             "collection_event": self.collection_event,
@@ -201,6 +203,7 @@ class ConnectionState:
         state.recording_format = fmt if info is not None and info.emp_verified else DEFAULT_RECORDING_FORMAT
         theme = str(data.get("ui_theme") or "light").strip().casefold()
         state.ui_theme = "dark" if theme == "dark" else "light"
+        state.ui_tab = "excel" if str(data.get("ui_tab") or "").strip().casefold() == "excel" else "manual"
         state.excel_enabled = bool(data.get("excel_enabled", False))
         state.excel_workbook = str(data.get("excel_workbook") or "")
         state.collection_event = str(data.get("collection_event") or "")

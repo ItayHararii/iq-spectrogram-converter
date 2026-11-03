@@ -250,7 +250,7 @@ def test_gui_marks_recording_finished_after_recording_time(qapp):
         assert window._watch_timer.isActive()
         assert window.start_btn.text() == "Confirming files…"
         assert not window.start_btn.isEnabled()
-        assert "elapsed" in window.msg.text().lower()
+        assert window.msg.text() == "Waiting for the sensor to finish."
         for _ in range(4):
             window._poll_collection_files()
         qapp.processEvents()
@@ -294,15 +294,15 @@ def test_single_recording_without_excel_is_confirmed_from_the_files(qapp):
             window._poll_collection_files()
         qapp.processEvents()
         assert window._record_phase == CONFIRMED
-        assert window.msg.text() == "Recording finished (1 file(s))."
+        assert window.msg.text() == "Recording confirmed: 1 file, 0.05 s."
         assert window._files_found == 1
         assert window._recordings_completed == 1
         assert window._watching is False
         assert not window._watch_timer.isActive()
         assert window.start_btn.isEnabled()
         log = window.log_edit.toPlainText()
-        assert "File not confirmed" not in log
-        assert "Capture finished with 1 file(s)" in log
+        assert "not confirmed" not in log
+        assert "Recording confirmed: 1 file, 0.05 s." in log
         assert "Recordings completed: 1" in window.collection_status.text()
         assert "Files found: 1" in window.collection_status.text()
     finally:
@@ -330,7 +330,7 @@ def test_sensor_task_completion_is_shown_apart_from_file_confirmation(qapp):
         window._on_recording_time_elapsed()
         qapp.processEvents()
         assert window._record_phase == FINALIZING
-        assert window.msg.text() == "Time elapsed. Waiting for files…"
+        assert window.msg.text() == "Waiting for the sensor to finish."
 
         # The demo transport does not stream events; feed the ones a Node sends.
         from crfs_iq_recorder.recording_history import load_recordings
@@ -352,7 +352,7 @@ def test_sensor_task_completion_is_shown_apart_from_file_confirmation(qapp):
         assert record.id == window._open_record_id
         assert window._sensor_finished is False
         assert window._record_phase == FINALIZING
-        assert window.msg.text() == f"Time elapsed. Sensor is writing {name}…"
+        assert window.msg.text() == "Waiting for the sensor to finish."
 
         # Make the next listing (triggered by the sensor's word) the stable one.
         real_poll = window._poll_collection_files
@@ -371,13 +371,13 @@ def test_sensor_task_completion_is_shown_apart_from_file_confirmation(qapp):
         qapp.processEvents()
         assert window._sensor_finished is True
         log = window.log_edit.toPlainText()
-        assert "Sensor reported: recording finished." in log
+        assert "Sensor finished. Waiting for files." in log
         # Task completion was shown first, on its own, before the file settled...
-        assert polls == [f"Sensor finished. Confirming {name}…"]
+        assert polls == ["Sensor finished. Waiting for files."]
         # ...and the listing it triggered confirmed the file without the settle wait.
         assert window._record_phase == CONFIRMED
-        assert window.msg.text() == "Recording finished (1 file(s))."
-        assert "sensor confirmed" in window.log_edit.toPlainText()
+        assert window.msg.text() == "Recording confirmed: 1 file, 0.05 s."
+        assert "Recording confirmed: 1 file, 0.05 s." in window.log_edit.toPlainText()
         assert window._recordings_completed == 1
     finally:
         window._watch_timer.stop()
@@ -407,16 +407,19 @@ def test_sensor_finished_without_its_file_is_not_reported_as_confirmed(qapp, mon
         # The sensor's file name does not match anything in the folder.
         window._note_sensor_part("/mnt/1/remdata/20261101/", "file_999999_0001.wav")
         window._mark_sensor_finished()
-        assert window.msg.text() == "Sensor finished. Confirming file_999999_0001.wav…"
+        assert window.msg.text() == "Sensor finished. Waiting for files."
         assert window._record_phase == FINALIZING
         # Jump past the watch limit instead of waiting a minute.
         window._elapsed_at = datetime.now() - timedelta(seconds=120)
         window._poll_collection_files()
         qapp.processEvents()
         assert window._record_phase == UNKNOWN
-        assert "file_999999_0001.wav was not found" in window.msg.text()
+        assert window.msg.text() == "Recording not confirmed: the file CRFS named was not found."
         log = window.log_edit.toPlainText()
-        assert "File not confirmed: the sensor reported its task finished and named file_999999_0001.wav" in log
+        assert "Recording not confirmed: the file CRFS named was not found." in log
+        from crfs_iq_recorder.diagnostic_log import recent
+
+        assert any("file_999999_0001.wav" in line for line in recent(400)), "the name goes to the diagnostic log"
         assert window._recordings_completed == 0
         assert window._files_found == 0
         assert window.start_btn.isEnabled()
@@ -766,7 +769,7 @@ def test_link_indicators_follow_failures_and_restore(qapp):
         window._apply_link_result(token, True, "ok")
         assert window.status_value.text() == "Connected"
         assert window.link_status.text() == "Connected"
-        assert logged.count("Sensor reconnecting...") == 1
+        assert logged.count("Sensor reconnecting…") == 1
         assert logged.count("Sensor disconnected.") == 1
         assert logged.count("Sensor connected.") == 1
         stale = token
@@ -1418,7 +1421,12 @@ def test_excel_section_collapses_without_losing_values(qapp, tmp_path):
         assert window.excel_check.isHidden() is False
         assert window.excel_details.isHidden()
         assert window.excel_section.height() < expanded
-        assert window.start_btn.mapTo(window, QPoint(0, 0)).y() < start_y
+        assert window.start_btn.mapTo(window, QPoint(0, 0)).y() == start_y, "the action bar is pinned below the form"
+        assert window.wait_spin.isVisibleTo(window), "the wait between recordings is shown while repeating"
+        window.repeat_off.setChecked(True)
+        qapp.processEvents()
+        assert not window.wait_spin.isVisibleTo(window)
+        window.repeat_n.setChecked(True)
         window.excel_check.setChecked(True)
         qapp.processEvents()
         assert not window.excel_details.isHidden()
@@ -1669,7 +1677,7 @@ def test_gui_connection_failure_before_send_drops_record_and_ends_series(qapp, t
     from crfs_iq_recorder.api_client import HttpOutcome
     from crfs_iq_recorder.gui import MainWindow
     from crfs_iq_recorder.recording_history import load_recordings
-    from crfs_iq_recorder.recording_status import IDLE
+    from crfs_iq_recorder.recording_status import FAILED
 
     window = MainWindow(demo=True)
     client = _ScriptedClient(
@@ -1688,7 +1696,8 @@ def test_gui_connection_failure_before_send_drops_record_and_ends_series(qapp, t
         window._on_start()
         assert window._series_active
         assert len(load_recordings(tmp_path / "recordings.json")) == 1
-        assert _pump_until(qapp, lambda: window._record_phase == IDLE and not window._recording_active)
+        assert _pump_until(qapp, lambda: window._record_phase == FAILED and not window._recording_active)
+        assert "Could not reach the sensor. Check the address and network." in window.log_edit.toPlainText()
         # Nothing was sent, so the saved parameters are discarded and no retry is attempted.
         assert client.calls == 1
         assert load_recordings(tmp_path / "recordings.json") == []
@@ -1730,7 +1739,7 @@ def test_gui_lost_response_after_send_keeps_record_and_never_retries(qapp, tmp_p
         assert window._record_phase == RECORDING
         assert window._recording_active
         assert len(load_recordings(tmp_path / "recordings.json")) == 1
-        assert any("no reply in time" in line.lower() for line in window.log_edit.toPlainText().splitlines())
+        assert "No reply from the sensor. Checking its files." in window.log_edit.toPlainText()
         # Pressing Start again while recording is ignored - no duplicate task.
         window._on_start()
         qapp.processEvents()
@@ -1886,22 +1895,25 @@ def test_gui_follows_the_sensor_stream_and_pins_the_reported_filename(qapp, tmp_
         window.repeat_spin.setValue(1)
         window._on_start()
         assert _pump_until(qapp, lambda: window._sensor_finished, timeout=5)
+        from crfs_iq_recorder.diagnostic_log import recent
+
         log = window.log_edit.toPlainText()
-        assert "Request accepted (HTTP 200)" in log
-        assert "Sensor is writing" in log and box["stem"] in log
-        assert "Sensor reported: recording finished." in log
+        details = "\n".join(recent(400))
+        assert "HTTP" not in log and "http_accepted" in details, "the HTTP reply goes to the diagnostic log"
+        assert box["stem"] not in log and box["stem"] in details, "the sensor's file name goes to the diagnostic log"
+        assert "Sensor finished. Waiting for files." in log
         assert "No GPS reference" not in log
-        # The Node 100-18's clock notice is logged once, with what it means (ncpd.conf
-        # real_time_clock/reference_clock = internal), and the repeats are counted.
-        assert log.count("Sensor warning: Using internal clock because of ncpd.conf settings") == 1
-        assert "real_time_clock" in log and "the recording is not affected" in log
+        # The Node 100-18's clock notice is shown once per session; the repeats are counted in the details.
+        assert log.count("CRFS warning: the sensor uses its internal clock, not GPS. Shown once.") == 1
+        assert "ncpd.conf" not in log
         _drive_capture(window, qapp)
         assert _pump_until(qapp, lambda: window._record_phase == CONFIRMED, timeout=5), (
             window._record_phase,
             window.log_edit.toPlainText(),
         )
-        assert "sensor confirmed" in window.log_edit.toPlainText()
-        assert "Sensor repeated 3×: Using internal clock because of ncpd.conf settings" in window.log_edit.toPlainText()
+        assert "Recording confirmed: 2 files" in window.log_edit.toPlainText()
+        counts = [line for line in recent(400) if "sensor_message_counts" in line]
+        assert counts and "Using internal clock because of ncpd.conf settings" in counts[-1]
         assert window._recordings_completed == 1
         assert window._files_found == 2
         # Finishing the capture releases the stream so the Node drops the mission.
@@ -1947,9 +1959,8 @@ def test_gui_gives_up_quickly_when_the_sensor_finishes_without_a_file(qapp, tmp_
         )
         assert time.time() - started < 8, "must not wait the full 60 s watch"
         log = window.log_edit.toPlainText()
-        assert "Sensor warning: No suitable antenna found" in log
-        assert "finished, but it named no file" in log
-        assert "finished without writing a file (No suitable antenna found)" in log
+        assert "CRFS warning: No suitable antenna found" in log
+        assert "Recording not confirmed: CRFS finished without writing a file." in log
         assert window._recordings_completed == 0
         assert window._files_found == 0
     finally:
@@ -1977,15 +1988,16 @@ def test_gui_logs_the_measured_duration_when_the_capture_is_short(qapp, tmp_path
         window.field_a.setText("1616")
         window.field_b.setText("1626")
         window._refresh_class_suggestion()
-        window.time_edit.setText("40")
-        # 40 MHz x 40 s on the Node 40-8 held 3.3 s of IQ: stand in for the byte count model.
-        monkeypatch.setattr(window, "_measured_capture", lambda record: (823_159_264, 2, 3.29))
+        window.time_edit.setText("4")
+        # Seen on the Node 40-8: 40 MHz for 40 s held 3.3 s of IQ. The demo sensor writes
+        # files whose WAVE headers hold 82.5 % of the request.
+        window._demo_fraction = 0.825
         window._on_start()
         _drive_capture(window, qapp)
         assert _pump_until(qapp, lambda: window._recordings_completed == 1, timeout=5)
         log = window.log_edit.toPlainText()
-        assert "hold about 3.3 s of IQ, not the 40 s requested" in log
-        assert "finished short" in window.msg.text()
+        assert "Partial recording: requested 4 s, received 3.30 s." in log
+        assert window.msg.text() == "Partial recording: requested 4 s, received 3.30 s."
         assert _pump_until(qapp, lambda: "Pending Excel" not in window.collection_status.text(), timeout=10)
         wb = load_workbook(path)
         rows = [cell for cell in wb["SATCOM"]["I"] if cell.row > 1 and split_iq_filenames(cell.value)]

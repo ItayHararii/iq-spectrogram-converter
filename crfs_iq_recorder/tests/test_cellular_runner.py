@@ -24,6 +24,13 @@ from crfs_iq_recorder.capture_api import (
     CaptureRequest,
     CaptureSummary,
 )
+from crfs_iq_recorder.capture_measure import (
+    PARTIAL_TOLERANCE,
+    RESULT_COMPLETED,
+    RESULT_FAILED,
+    RESULT_PARTIAL,
+    RESULT_UNCONFIRMED,
+)
 from crfs_iq_recorder.cellular_capabilities import capability_for
 from crfs_iq_recorder.cellular_plan import build_plan
 from crfs_iq_recorder.cellular_protocol import import_protocol
@@ -38,7 +45,6 @@ from crfs_iq_recorder.cellular_runner import (
     S_WAITING_SCHEDULE,
     T_CONFIRMED,
     T_NOT_SENT,
-    T_QUEUED,
     T_SENSOR_ERROR,
     T_SKIPPED,
     T_SUBMITTING,
@@ -115,15 +121,27 @@ class FakeHost(QObject):
         self.requests.append(request)
         return None
 
-    def finish(self, request, outcome=OUTCOME_CONFIRMED, *, parts=1, held=None, detail="", names=None):
+    def finish(self, request, outcome=OUTCOME_CONFIRMED, *, parts=1, held=None, detail="", names=None, result=None, sensor_error=""):
         names = names or [f"file_{len(self.requests):06d}_{i + 1:04d}.wav" for i in range(parts)]
         paths = [f"/mnt/1/remdata/20261103/{name}" for name in names]
+        measured = held if held is not None else (request.seconds if outcome == OUTCOME_CONFIRMED else None)
+        if result is None:
+            # What MainWindow's classify() would say about these files.
+            if outcome == OUTCOME_CONFIRMED:
+                short = measured is not None and measured < request.seconds * (1 - PARTIAL_TOLERANCE)
+                result = RESULT_PARTIAL if short else RESULT_COMPLETED
+            else:
+                result = RESULT_FAILED if outcome in {OUTCOME_SENSOR_ERROR, OUTCOME_NOT_SENT} else RESULT_UNCONFIRMED
         summary = CaptureSummary(
+            result=result,
+            result_reason=detail,
+            sensor_error=sensor_error or (detail if outcome == OUTCOME_SENSOR_ERROR else ""),
+            payload={"center_frequency": request.plan.center_hz, "bandwidth": request.plan.bandwidth_hz, "duration": request.seconds},
             outcome=outcome,
             request=request,
             record_id=f"rec-{len(self.requests)}",
             requested_s=request.seconds,
-            held_s=held if held is not None else (request.seconds if outcome == OUTCOME_CONFIRMED else None),
+            held_s=measured,
             parts=parts if outcome == OUTCOME_CONFIRMED else 0,
             total_bytes=1000 * parts,
             sensor_finished=outcome == OUTCOME_CONFIRMED,
@@ -195,7 +213,7 @@ def test_run_now_sequence_follows_the_worksheet_waits_after_confirmation_and_fin
     assert first.collection_event.startswith("Camp / Site A / Camp_")
     state = runner.current_tasks()[0]
     assert state.status == T_SUBMITTING and state.attempts == 1
-    assert runner.status()["text"] == "700 MHz UL - row 1 of 3 - recording"
+    assert runner.status()["text"] == "Recording row 1 of 3: 703-713 MHz"
     # Nothing else starts while the capture runs.
     runner._tick()
     assert len(host.requests) == 1
@@ -208,14 +226,15 @@ def test_run_now_sequence_follows_the_worksheet_waits_after_confirmation_and_fin
     manifest = Path(runner.current_tasks()[0].manifest_path)
     assert manifest.name == "file_000001.cellular.json"
     data = json.loads(manifest.read_text(encoding="utf-8"))
-    assert data["allocation"]["window_start_hz"] == 703 * MHZ
+    assert data["allocation"]["requested_start_hz"] == 703 * MHZ
+    assert data["request"]["payload_sent"]["center_frequency"] == 708 * MHZ
     assert data["target"]["direction"] == "UL"
     assert data["recording"]["outcome"] == "confirmed"
     assert data["identifiers"]["protocol_version"] == plan.protocol_version
     assert data["sensor"]["gnss_status"] == "unknown"
     status = runner.status()
     assert status["countdown_s"] is not None and status["task_done"] == 1 and status["tasks_total"] == 3
-    assert status["text"].startswith("Next recording in ") and status["text"].endswith(" seconds")
+    assert status["text"].startswith("Next recording in ") and status["text"].endswith(" s")
     time.sleep(0.25)
     runner._tick()
     assert len(host.requests) == 2
@@ -247,38 +266,46 @@ def test_short_unknown_sensor_error_and_not_sent_outcomes(qapp, tmp_path):
     runner = _runner(tmp_path, host)
     plan = _plan(tmp_path)
     runner.start_session(plan, Schedule(mode=MODE_NOW), _settings())
-    # 1: short capture is confirmed but marked short and logged.
-    host.finish(host.requests[0], held=0.3)
+    # 1: files shorter than requested: kept as a partial recording, never re-sent.
+    host.finish(host.requests[0], held=0.3, detail="files hold less than requested")
     _pump(qapp)
     tasks = runner.current_tasks()
-    assert tasks[0].status == T_CONFIRMED and tasks[0].short is True
-    assert any("Short capture" in n for n in tasks[0].notes)
+    assert tasks[0].status == T_CONFIRMED and tasks[0].short is True and tasks[0].result == RESULT_PARTIAL
+    assert any(n.startswith("Partial:") and "0.300 s of 1 s" in n for n in tasks[0].notes)
     # 2: uncertain outcome is never counted as collected.
     assert len(host.requests) == 2
     host.finish(host.requests[1], OUTCOME_UNKNOWN, detail="no file settled")
     _pump(qapp)
     assert tasks[1].status == T_UNKNOWN
-    # 3: nothing reached the sensor -> one automatic retry, then not_sent.
+    # 3: nothing reached the sensor -> sent once more, unchanged, then not_sent.
     assert len(host.requests) == 3
     host.finish(host.requests[2], OUTCOME_NOT_SENT, detail="refused")
     _pump(qapp)
-    assert len(host.requests) == 4, "retry sent at once (wait 0) because nothing reached the sensor"
+    assert len(host.requests) == 4, "sent again at once (wait 0) because nothing reached the sensor"
     assert tasks[2].status == T_SUBMITTING and tasks[2].attempts == 2
-    assert any("retried once" in n for n in tasks[2].notes)
+    assert any("sent once more, unchanged" in n for n in tasks[2].notes)
+    again, before = host.requests[3], host.requests[2]
+    assert (again.plan.center_hz, again.plan.bandwidth_hz, again.seconds) == (before.plan.center_hz, before.plan.bandwidth_hz, before.seconds)
+    assert [h["attempt"] for h in tasks[2].history] == [1]
     host.finish(host.requests[3], OUTCOME_NOT_SENT, detail="refused again")
     _pump(qapp)
     assert tasks[2].status == T_NOT_SENT and tasks[2].attempts == 2
     runner._tick()
     record = runner.session.rounds[0]
     assert record.status == ROUND_PARTIAL
-    assert (record.tasks_confirmed, record.tasks_uncertain, record.tasks_failed) == (1, 1, 1)
+    assert (record.tasks_confirmed, record.tasks_partial, record.tasks_uncertain, record.tasks_failed) == (0, 1, 1, 1)
+    assert runner.pass_summary_text(record.round_id) == "Completed 0 · Partial 1 · Failed 1 · Uncertain 1"
     assert runner.state == S_DONE
-    # A sensor error on an explicit retry ends as sensor_error.
+    # A rejection on an explicit retry ends as sensor_error and is never sent again with other parameters.
     assert runner.retry_task(record.round_id, tasks[2].task_key) is None
     assert runner.state == S_RUNNING and len(host.requests) == 5
     host.finish(host.requests[4], OUTCOME_SENSOR_ERROR, detail="No suitable antenna")
     _pump(qapp)
-    assert tasks[2].status == T_SENSOR_ERROR
+    assert tasks[2].status == T_SENSOR_ERROR and tasks[2].result == RESULT_FAILED
+    assert len(host.requests) == 5
+    assert [h["attempt"] for h in tasks[2].history] == [1, 2] and tasks[2].attempts == 3
+    # A partial row is kept, not retried.
+    assert runner.retry_task(record.round_id, tasks[0].task_key) is not None
     runner._tick()
     assert runner.state == S_DONE
 
@@ -576,6 +603,42 @@ def test_restart_recovers_an_interrupted_session_without_resending(qapp, tmp_pat
     assert runner2.session.rounds[0].status == ROUND_PARTIAL
 
 
+def test_a_new_collection_waits_for_the_last_downloads_and_a_restart_offers_them_again(qapp, tmp_path):
+    """Hardware, 3 Nov: a collection started while the last one's downloads ran took them over in
+    memory only; the ones finished afterwards were never recorded, and after a restart the rest
+    were forgotten (the files stayed on the sensor and nothing said so)."""
+    host = FakeHost()
+    runner = _runner(tmp_path, host)
+    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True))
+    runner._drain_downloads = lambda: None
+    for index in range(3):
+        host.finish(host.requests[index])
+        _pump(qapp)
+    runner._tick()
+    assert runner.state == S_DONE and len(host.requests) == 3
+    reason = runner.previous_work_reason()
+    assert reason.startswith("The last collection is still downloading"), reason
+    assert runner.status()["previous_work"] == reason
+    first = runner.session.created_utc
+    assert runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True)) == reason
+    runner.discard_session()
+    assert runner.session is not None and runner.session.created_utc == first and len(host.requests) == 3
+    runner.shutdown()  # closed before the downloads finished
+
+    host2 = FakeHost()
+    runner2 = _runner(tmp_path, host2)
+    assert runner2.state == S_INTERRUPTED and runner2.downloads_only()
+    assert runner2.unfinished_downloads() == 3
+    assert runner2.status()["text"] == "Downloads did not finish: press Continue to download 3 more"
+    assert runner2.status()["missed_rounds"] == [] and runner2.uncertain_tasks() == []
+    started: list[str] = []
+    runner2._start_download = lambda task_key, round_id, item: started.append(item["name"])
+    assert runner2.resume_after_restart() is None
+    assert started == ["file_000001_0001.wav", "file_000002_0001.wav", "file_000003_0001.wav"]
+    assert runner2.state == S_DONE and not runner2.downloads_only()
+    assert host2.requests == [] and host2.owner == "", "only downloads: nothing is sent and the sensor is not held"
+
+
 def test_reconcile_confirms_from_the_sensor_files_or_marks_unknown(qapp, tmp_path, monkeypatch):
     from crfs_iq_recorder import recording_history
     from crfs_iq_recorder.sftp_client import RemoteEntry
@@ -597,14 +660,25 @@ def test_reconcile_confirms_from_the_sensor_files_or_marks_unknown(qapp, tmp_pat
     runner2 = _runner(tmp_path, FakeHost())
     assert runner2.state == S_INTERRUPTED
 
+    from crfs_iq_recorder.iq_merge import inspect_stream
+    from crfs_iq_recorder.iq_wav import crfs_style_wav_bytes
+
+    payload = crfs_style_wav_bytes(frames=990, sample_rate=1000, center_hz=planned.center_hz,
+                                   bandwidth_hz=planned.bandwidth_hz, signal_time="2026-11-03T10:00:00.000Z")
+
     class Browser:
         def listdir(self, path):
             if path.rstrip("/").endswith(record.started_at.strftime("%Y%m%d")):
-                return [RemoteEntry("file_120000_0001.wav", path.rstrip("/") + "/file_120000_0001.wav", False, 62_544_000 + 692, datetime.now())]
+                return [RemoteEntry("file_120000_0001.wav", path.rstrip("/") + "/file_120000_0001.wav", False, len(payload), datetime.now())]
             return []
 
         def directory_exists(self, path):
             return True
+
+        def inspect_wave(self, path):
+            import io
+
+            return inspect_stream(io.BytesIO(payload), size=len(payload), path=path)
 
         def close(self):
             pass
@@ -612,11 +686,13 @@ def test_reconcile_confirms_from_the_sensor_files_or_marks_unknown(qapp, tmp_pat
     monkeypatch.setattr("crfs_iq_recorder.sftp_window._open_browser", lambda *_a, **_k: Browser())
     messages = []
     runner2.reconcile(messages.append)
-    assert messages and "1 capture(s) confirmed" in messages[0]
+    assert messages == ["Checked with the sensor: 1 recording found, 0 without a file."]
     task = runner2.session.tasks[runner2.session.current_round_id][0]
     assert task.status == T_CONFIRMED and task.files[0]["name"] == "file_120000_0001.wav"
-    assert task.summary["held_s"] == pytest.approx(1.0, rel=0.01), "duration measured from the file size at 15.625 MS/s"
-    assert any("after restart" in n for n in task.notes)
+    assert task.summary["held_s"] == pytest.approx(0.99), "duration read from the WAVE header"
+    assert task.result == RESULT_COMPLETED and task.attempts == 1, "found, so it is not sent again"
+    assert task.files[0]["signal_time"].startswith("2026-11-03T10:00:00")
+    assert any("Found later on the sensor" in n and "Not sent again" in n for n in task.notes)
     assert runner2.resume_after_restart() is None
 
 
@@ -630,7 +706,7 @@ def test_backlog_pauses_new_captures_until_downloads_drain(qapp, tmp_path):
     host.finish(host.requests[0])
     _pump(qapp)
     assert runner.state == S_PAUSED_BACKLOG
-    assert "backlog" in runner.status()["pause_reason"].casefold()
+    assert runner.status()["pause_reason"].startswith("Downloads: 3 waiting")
     assert len(host.requests) == 1
     runner._downloads_pending = []
     runner._tick()
@@ -718,7 +794,7 @@ def test_low_local_storage_pauses_before_the_next_capture_and_never_deletes(qapp
     _pump(qapp)
     assert runner.state == S_PAUSED_BACKLOG
     reason = runner.status()["pause_reason"]
-    assert "free" in reason and "No recording is deleted automatically" in reason
+    assert "free" in reason and "nothing is deleted automatically" in reason
     assert len(host.requests) == 1
     assert marker.read_bytes() == b"keep me"
     assert runner.current_tasks()[0].status == T_CONFIRMED
@@ -786,10 +862,10 @@ def test_connection_loss_during_a_capture_is_uncertain_and_never_resent(qapp, tm
     assert runner.state == S_DONE
     record = runner.session.rounds[0]
     assert record.status == ROUND_STOPPED
-    # The refusal named no file: nothing was recorded. It would be sent once more after the
-    # idle check, but Stop was requested, so it ends as not recorded (skipped), not failed.
-    assert (record.tasks_confirmed, record.tasks_uncertain, record.tasks_failed, record.tasks_skipped) == (0, 1, 0, 2)
-    assert any("nothing was recorded" in n for n in tasks[1].notes)
+    # The sensor rejected the request: a failed row, never re-sent on its own.
+    assert (record.tasks_confirmed, record.tasks_uncertain, record.tasks_failed, record.tasks_skipped) == (0, 1, 1, 1)
+    assert tasks[1].status == T_SENSOR_ERROR and len(host.requests) == 2
+    assert any(n.startswith("Rejected by the sensor: ERROR: Unable to schedule") for n in tasks[1].notes)
     assert len(runner.uncertain_tasks()) == 1, "the uncertain capture stays listed for Reconcile"
 
 
@@ -883,11 +959,13 @@ def test_demo_main_window_runs_a_round_with_downloads_quality_excel_and_blocks_m
         plan = _plan(tmp_path, fallback=0.05)
         assert runner.start_session(plan, Schedule(mode=MODE_NOW), _settings(wait_s=0.0, auto_download=True, verify_checksums=True)) is None
         assert window._external_owner == OWNER
-        # Manual Start is held while the session owns the sensor: the button says who has it
-        # and a programmatic trigger changes nothing.
+        # Manual Start is held while the session owns the sensor: the line under the button
+        # says who has it and a programmatic trigger changes nothing.
         window.time_edit.setText("0.05")
         assert not window.start_btn.isEnabled()
-        assert window.start_btn.text().startswith("Recording") or "Cellular Collection" in window.start_btn.text()
+        assert window.start_btn.text() == "Start Recording"
+        assert window.manual_reason.text() == "Excel Collection is running."
+        assert not window.manual_reason.isHidden()
         window._on_start()
         assert window._external_owner == OWNER
         assert runner.current_tasks()[0].status == T_SUBMITTING
@@ -943,9 +1021,13 @@ def test_demo_main_window_runs_a_round_with_downloads_quality_excel_and_blocks_m
 
 
 def test_capture_summary_dict_and_properties():
-    summary = CaptureSummary(outcome=OUTCOME_CONFIRMED, requested_s=20, held_s=14.1, parts=7)
+    summary = CaptureSummary(outcome=OUTCOME_CONFIRMED, requested_s=20, held_s=14.1, parts=7, result=RESULT_PARTIAL)
     assert summary.short and summary.confirmed and not summary.retry_is_safe
-    assert summary.as_dict()["held_s"] == 14.1
+    data = summary.as_dict()
+    assert data["held_s"] == 14.1 and data["result"] == RESULT_PARTIAL
+    assert {"measurement", "sensor_reply", "sensor_error", "payload", "result_reason"} <= set(data)
+    # "Partial" is the result of measuring the files, not a comparison the summary makes itself.
+    assert not CaptureSummary(outcome=OUTCOME_CONFIRMED, requested_s=20, held_s=14.1, parts=7, result=RESULT_COMPLETED).short
     assert CaptureSummary(outcome=OUTCOME_NOT_SENT).retry_is_safe
 
 
@@ -965,65 +1047,98 @@ class IdleHost(FakeHost):
         callback(ok, detail)
 
 
-def test_every_request_waits_for_the_mission_list_and_a_refusal_is_sent_once_more(qapp, tmp_path):
+def test_every_request_waits_for_the_mission_list_and_a_rejection_is_never_resent(qapp, tmp_path):
     """Node 100-18, 18:44 run: a POST sent 2 s after the previous stream closed was refused
     ("ERROR: Unable to schedule the command") with no file and no 'finished'. The runner reads
-    the mission list before every request, counts the refusal as not recorded, and re-sends
-    once after the list shows the sensor idle — never on a timer alone."""
+    the mission list before every request; a rejected request is a failed row, kept for
+    "Retry failed rows", and never sent again on its own."""
     host = IdleHost()
     runner = _runner(tmp_path, host)
     runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings())
     assert host.requests == [] and len(host.idle_callbacks) == 1, "the first request also waits for the list"
-    assert runner.status()["text"] == "checking the sensor is idle"
+    assert runner.status()["text"] == "Checking the sensor is free"
     runner._tick()
     assert len(host.idle_callbacks) == 1, "one check at a time"
     host.answer_idle(True)
     assert len(host.requests) == 1
-    first = host.requests[0]
-    host.finish(first, OUTCOME_SENSOR_ERROR, detail="ERROR: Unable to schedule the command")
+    host.finish(host.requests[0], OUTCOME_SENSOR_ERROR, detail="ERROR: Unable to schedule the command")
     _pump(qapp)
-    task = runner.current_tasks()[0]
-    assert task.status == T_QUEUED and task.attempts == 1
-    assert any("nothing was recorded" in n for n in task.notes)
-    assert len(host.requests) == 1 and len(host.idle_callbacks) == 1, "re-sent only after the list is read again"
+    tasks = runner.current_tasks()
+    task = tasks[0]
+    assert task.status == T_SENSOR_ERROR and task.result == RESULT_FAILED and task.attempts == 1
+    assert any(n.startswith("Rejected by the sensor:") for n in task.notes)
+    assert len(host.requests) == 1 and len(host.idle_callbacks) == 1, "the next row waits for the list; the rejected one is not re-sent"
+    # Seen on the Node 100-18 (22:26): the sensor named a file, then reported an error 0.2 s in,
+    # and no file could be confirmed. The window reports it as not confirmed: it stays listed
+    # for "Check with the sensor" and is not sent again.
     host.answer_idle(True, "waited 3 s for the previous mission to close")
-    assert len(host.requests) == 2 and task.status == T_SUBMITTING and task.attempts == 2
-    host.finish(host.requests[1], OUTCOME_SENSOR_ERROR, detail="ERROR: Unable to schedule the command")
+    host.finish(host.requests[1], OUTCOME_UNKNOWN, detail="no file confirmed",
+                sensor_error="ERROR: Collection was modified; enumeration operation may not execute.")
     _pump(qapp)
-    assert task.status == T_SENSOR_ERROR, "at most one re-submission"
-    assert any("Not recorded" in n for n in task.notes)
-    # Seen on the Node 100-18 (22:26): the sensor named a file, then reported "ERROR: Collection
-    # was modified; enumeration operation may not execute" 0.2 s in; 58 MB of 251 MB stayed on
-    # the disk. Nothing finished and no file was confirmed: the partial file is named in the
-    # note, not counted, and the request is sent once more after the idle check.
+    broken = tasks[1]
+    assert broken.status == T_UNKNOWN and broken.attempts == 1 and len(host.requests) == 2
+    # An error after the files were written: a partial recording with files; never re-sent.
     host.answer_idle(True)
-    second = host.requests[2]
-    summary = CaptureSummary(
-        outcome=OUTCOME_SENSOR_ERROR, request=second, requested_s=1.0, sensor_parts=["iq_x_0001.wav"],
-        detail="ERROR: Collection was modified; enumeration operation may not execute.",
-    )
-    host.capture_finished.emit(summary)
+    host.finish(host.requests[2], held=0.4, names=["iq_z_0001.wav"], result=RESULT_PARTIAL,
+                sensor_error="FATAL: disk", detail="sensor error during the recording")
     _pump(qapp)
-    broken = runner.current_tasks()[1]
-    assert broken.status == T_QUEUED and broken.attempts == 1
-    assert any("partial file (iq_x_0001.wav)" in n and "not counted" in n for n in broken.notes)
-    assert len(host.requests) == 3, "re-sent only after the mission list is read again"
-    host.answer_idle(True)
-    assert len(host.requests) == 4 and broken.attempts == 2
-    host.finish(host.requests[3], held=1.0, names=["iq_y_0001.wav"])
+    last = tasks[2]
+    assert last.status == T_CONFIRMED and last.short and last.attempts == 1
+    assert len(host.requests) == 3, "never re-sent"
+    runner._tick()
+    record = runner.session.rounds[0]
+    assert runner.pass_summary_text(record.round_id) == "Completed 0 · Partial 1 · Failed 1 · Uncertain 1"
+    # Only the rejected row is offered for "Retry failed rows" until the uncertain one is checked.
+    assert [state.task_key for state, _p in runner.retryable_tasks(record.round_id)] == [task.task_key]
+
+
+def test_retry_failed_rows_checks_uncertain_rows_first_and_keeps_partial_rows(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr("crfs_iq_recorder.recording_history.recordings_path", lambda: tmp_path / "rec.json")
+
+    class EmptySensor:
+        def listdir(self, path):
+            return []
+
+        def directory_exists(self, path):
+            return True
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("crfs_iq_recorder.sftp_window._open_browser", lambda *_a, **_k: EmptySensor())
+    host = FakeHost()
+    runner = _runner(tmp_path, host)
+    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings())
+    host.finish(host.requests[0], OUTCOME_SENSOR_ERROR, detail="ERROR: Unable to schedule the command")
     _pump(qapp)
-    assert broken.status == T_CONFIRMED
-    # An error after a file was CONFIRMED is a failed capture with files; never re-sent.
-    host.answer_idle(True)
-    third = host.requests[4]
-    last = runner.current_tasks()[2]
-    host.capture_finished.emit(CaptureSummary(
-        outcome=OUTCOME_SENSOR_ERROR, request=third, requested_s=1.0, parts=1, sensor_parts=["iq_z_0001.wav"],
-        finalized_paths=["/mnt/1/remdata/20261103/iq_z_0001.wav"], detail="FATAL: disk",
-    ))
+    runner._tick()
+    host.finish(host.requests[1], OUTCOME_UNKNOWN, detail="no file confirmed")
     _pump(qapp)
-    assert last.status == T_SENSOR_ERROR and last.attempts == 1
-    assert len(host.requests) == 5, "never re-sent"
+    runner._tick()
+    host.finish(host.requests[2], held=0.5)
+    _pump(qapp)
+    runner._tick()
+    round_id = runner.session.rounds[0].round_id
+    assert runner.pass_summary_text(round_id) == "Completed 0 · Partial 1 · Failed 1 · Uncertain 1"
+    assert runner.status()["retryable"] == 1, "only the rejected row until the uncertain one is checked"
+    messages = []
+    runner.retry_failed(round_id, messages.append)
+    assert messages == ["Retrying 2 rows."], "the uncertain row had no file on the sensor, so it is retried too"
+    rejected, unknown, partial = runner.session.tasks[round_id]
+    assert len(host.requests) == 4 and host.requests[3].plan.center_hz == host.requests[0].plan.center_hz
+    assert rejected.attempts == 2 and len(rejected.history) == 1, "a new attempt; the first is kept in the history"
+    assert partial.status == T_CONFIRMED and partial.attempts == 1, "partial rows are kept and not retried"
+    host.finish(host.requests[3])
+    _pump(qapp)
+    runner._tick()
+    assert len(host.requests) == 5 and unknown.attempts == 2
+    host.finish(host.requests[4])
+    _pump(qapp)
+    runner._tick()
+    assert runner.pass_summary_text(round_id) == "Completed 2 · Partial 1 · Failed 0 · Uncertain 0"
+    view = runner.task_view(round_id, rejected.task_key)
+    assert view.title.startswith("Row 1 of 3: ") and view.title.endswith(" (attempt 2)") and view.tag == "Complete"
+    assert len(host.requests) == 5, "the partial row is never sent again"
 
 
 def test_a_sensor_that_still_lists_a_mission_delays_the_request_then_pauses(qapp, tmp_path):
@@ -1039,7 +1154,7 @@ def test_a_sensor_that_still_lists_a_mission_delays_the_request_then_pauses(qapp
         runner._tick()
         assert len(host.idle_callbacks) == 1
     host.answer_idle(False, "EMP Remote Recording [Center:0.708 GHz,Span:10 MHz]")
-    assert runner.state == S_PAUSED and "still lists a remote recording" in runner.session.pause_reason
+    assert runner.state == S_PAUSED and "still busy with another recording" in runner.session.pause_reason
     assert host.requests == []
     runner.resume()
     host.answer_idle(True)
@@ -1174,8 +1289,9 @@ def test_results_land_in_the_protocol_rows_then_in_an_appended_block(qapp, tmp_p
     )
     imported, settings = _protocol_settings(workbook)
     plan = build_plan(imported, capability_for("R100-18"), fallback_duration_s=2.0)
-    # 2 s on the 100-18 -> 50 MHz windows: three single-window rows and n78 in three windows.
-    assert plan.ready and len(plan.tasks) == 6, [t.label() for t in plan.tasks]
+    # One request per row, the 150 MHz n78 row included.
+    assert plan.ready and len(plan.tasks) == 4, [t.label() for t in plan.tasks]
+    assert (plan.tasks[3].center_hz, plan.tasks[3].bandwidth_hz) == (3375 * MHZ, 150 * MHZ)
     host = FakeHost()
     host._sensor_info = type("Info", (), {"model": "R100-18", "serial": "rfeye100400", "firmware": "2.25"})()
     runner = _runner(tmp_path, host)
@@ -1183,7 +1299,8 @@ def test_results_land_in_the_protocol_rows_then_in_an_appended_block(qapp, tmp_p
     runner.log.connect(lambda m, lvl: logs.append(m))
     assert runner.start_session(plan, Schedule(mode=MODE_NOW), settings) is None
     assert runner.protocol_results_enabled()
-    # Row 1 (700 DL): one window, two files, 2.011 s measured.
+    assert "Recording row 1 of 4: 753-773 MHz for 2 s." in logs
+    # Row 1 (700 DL): two files, 2.011 s measured from their headers.
     host.finish(host.requests[0], parts=2, held=2.011, names=["iq_20261103_070001_0000.wav", "iq_20261103_070001_0001.wav"])
     _pump(qapp)
     assert runner.workbook_pending() == 0, runner.status()
@@ -1195,36 +1312,28 @@ def test_results_land_in_the_protocol_rows_then_in_an_appended_block(qapp, tmp_p
     assert ws["F2"].value == "CRFS 100-18"
     assert ws["G3"].value is None
     wb.close()
-    assert any("row 1 of 4): complete" in m for m in logs), logs
-    # Row 2 (700 UL): refused twice -> nothing written, reported as incomplete coverage.
+    # Row 2 (700 UL): rejected -> nothing written and not sent again; row 3 comes next.
     host.finish(host.requests[1], OUTCOME_SENSOR_ERROR, detail="ERROR: Unable to schedule the command")
     _pump(qapp)
-    host.finish(host.requests[2], OUTCOME_SENSOR_ERROR, detail="ERROR: Unable to schedule the command")
+    assert len(host.requests) == 3 and host.requests[2].label.startswith("1800 MHz (B3) DL")
+    host.finish(host.requests[2], held=2.0, names=["iq_20261103_070100_0000.wav"])
     _pump(qapp)
-    assert any("row 2 of 4): incomplete" in m for m in logs)
-    # Row 3 (1800 DL) one window; row 4 (n78) two of three windows recorded.
-    host.finish(host.requests[3], held=2.0, names=["iq_20261103_070100_0000.wav"])
-    _pump(qapp)
-    n78 = [r for r in host.requests[4:]]
-    host.finish(n78[0], held=2.0, names=["iq_20261103_070200_0000.wav"])
-    _pump(qapp)
-    host.finish(host.requests[5], OUTCOME_UNKNOWN, detail="no file settled")
-    _pump(qapp)
-    host.finish(host.requests[6], held=2.0, names=["iq_20261103_070300_0000.wav"])
+    # Row 4 (n78): the files hold 1.4 s of the 2 s requested -> a partial row, written as measured.
+    host.finish(host.requests[3], held=1.4, names=["iq_20261103_070200_0000.wav"])
     _pump(qapp)
     runner._tick()
-    assert runner.state == S_DONE
+    assert runner.state == S_DONE and len(host.requests) == 4
     assert _pump_until(qapp, lambda: runner.workbook_pending() == 0 and not runner._workbook_flushing, timeout=5.0), runner.status()
     wb = load_workbook(workbook)
     ws = wb["Cellular Protocol"]
     assert ws["G3"].value is None and ws["H3"].value is None, "a row with nothing recorded stays empty"
     assert ws["G4"].value == "iq_20261103_070100_0000.wav"
-    assert ws["G5"].value == "iq_20261103_070200_0000.wav\niq_20261103_070300_0000.wav", "windows of one row grouped in its cell"
-    assert ws["H5"].value == pytest.approx(4.0), "seconds of IQ held by the files of both windows"
+    assert ws["G5"].value == "iq_20261103_070200_0000.wav"
+    assert ws["H5"].value == pytest.approx(1.4), "the measured seconds, never the requested 2 s"
+    assert ws["D5"].value == 3300 and ws["E5"].value == 3450, "the protocol's own range is left as it is"
     assert ws.max_row == 5 and dict(ws.tables.items()) == {"CellularProtocol": "A1:I5"}
     wb.close()
-    assert any("Incomplete coverage this pass" in m and "700 MHz" in m and "2 of 3 windows" in m for m in logs), logs
-    assert any("Pass 1 partial: 2 of 4 protocol row(s) complete" in m for m in logs), logs
+    assert "Pass 1 finished: Completed 2 · Partial 1 · Failed 1 · Uncertain 0." in logs, logs
     # Second pass (new session, same workbook): appended block, first block untouched.
     host2 = FakeHost()
     host2._sensor_info = host._sensor_info
@@ -1274,7 +1383,7 @@ def test_pending_workbook_results_survive_a_restart_and_a_locked_file(qapp, tmp_
     assert runner.workbook_pending() == 1
     status = runner.status()
     assert status["workbook_pending"] == 1 and status["workbook_status"] == "busy"
-    assert any("Excel update pending" in m for m in logs)
+    assert "Excel is busy. Update queued." in logs
     assert load_workbook(workbook)["Cellular Protocol"]["G2"].value is None
     runner.shutdown()
     # Restart with the workbook free: the queued result is written, once.

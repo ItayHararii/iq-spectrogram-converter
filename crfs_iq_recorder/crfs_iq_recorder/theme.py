@@ -596,6 +596,49 @@ QFrame#actionBar {{
     border-bottom-right-radius: 12px;
 }}
 QFrame#actionBar QLabel {{ background: transparent; }}
+QLabel#reasonText {{
+    color: {p.muted};
+    font-size: 12px;
+}}
+QFrame#resultCard {{
+    background: {mix(p.surface, p.bg, 0.5)};
+    border: 1px solid {p.border};
+    border-radius: 10px;
+}}
+QLabel#resultHeading {{
+    color: {p.muted};
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+}}
+QLabel#resultTitle {{
+    color: {p.text};
+    font-weight: 600;
+}}
+QTabWidget#workflowTabs::pane {{
+    border: none;
+    background: transparent;
+}}
+QTabBar#workflowTabBar {{
+    background: transparent;
+}}
+QTabBar#workflowTabBar::tab {{
+    background: transparent;
+    color: {p.muted};
+    border: none;
+    border-bottom: 3px solid transparent;
+    padding: 8px 18px;
+    margin-right: 6px;
+    font-size: 14px;
+    font-weight: 700;
+}}
+QTabBar#workflowTabBar::tab:selected {{
+    color: {p.text};
+    border-bottom: 3px solid {p.accent};
+}}
+QTabBar#workflowTabBar::tab:hover:!selected {{
+    color: {p.text};
+}}
 QFrame#section, QWidget#section {{
     background: transparent;
     border: none;

@@ -33,6 +33,43 @@ def stereo_iq_tone_wav_bytes(
     return buf.getvalue()
 
 
+def crfs_style_wav_bytes(
+    *,
+    frames: int,
+    sample_rate: int,
+    center_hz: float,
+    bandwidth_hz: float,
+    signal_time: str,
+    receiver: str = "demo",
+) -> bytes:
+    """16-bit stereo I/Q WAVE laid out like a CRFS Node file: RIFF, fmt, data, then a `meta` signalinfo chunk.
+
+    The samples are a tone at a tenth of the sample rate (I cosine, Q sine), so
+    previews and level checks see a signal rather than silence.
+    """
+    import struct
+
+    frames = max(int(frames), 0)
+    step = 2.0 * math.pi / 10.0
+    samples = array("h")
+    for i in range(frames):
+        samples.append(int(8000 * math.cos(step * i)))
+        samples.append(int(8000 * math.sin(step * i)))
+    data = samples.tobytes()
+    meta = (
+        '<?xml version="1.0" encoding="utf-8"?><signalinfo><base>'
+        f"<signaltime>{signal_time}</signaltime><rf_frequency>{float(center_hz):g}</rf_frequency>"
+        f"<bandwidth>{float(bandwidth_hz):g}</bandwidth><data_type>complex</data_type>"
+        f"<sample_rate>{float(sample_rate):g}</sample_rate></base><extended><receiver>{receiver}</receiver>"
+        "</extended></signalinfo>"
+    ).encode("utf-8")
+    meta += b"\x00" * (len(meta) & 1)
+    fmt = struct.pack("<HHIIHH", 1, 2, int(sample_rate), int(sample_rate) * 4, 4, 16)
+    body = b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", len(data)) + data
+    body += b"meta" + struct.pack("<I", len(meta)) + meta
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
 def write_stereo_iq_tone_wav(path, **kwargs) -> int:
     payload = stereo_iq_tone_wav_bytes(**kwargs)
     path.write_bytes(payload)

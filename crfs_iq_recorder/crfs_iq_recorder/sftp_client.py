@@ -6,7 +6,7 @@ import logging
 import stat
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -79,6 +79,32 @@ class SftpBrowser:
 
     def read_prefix(self, remote_path: str, local_path: Path, max_bytes: int) -> int:
         raise NotImplementedError
+
+    def open_read(self, remote_path: str):
+        """(binary file object supporting seek/read, size in bytes) for a remote file."""
+        raise NotImplementedError
+
+    def inspect_wave(self, remote_path: str):
+        """The WAVE header and CRFS metadata of a file on the sensor (reads only its header and trailer)."""
+        from .iq_merge import MergeError, inspect_stream
+
+        try:
+            handle, size = self.open_read(remote_path)
+        except SftpError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - reported as an SFTP failure
+            raise SftpError(f"Could not open {remote_path}: {exc}") from exc
+        try:
+            return inspect_stream(handle, size=size, path=remote_path)
+        except MergeError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise SftpError(f"Could not read {remote_path}: {exc}") from exc
+        finally:
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def remove_file(self, remote_path: str) -> None:
         raise NotImplementedError
@@ -207,6 +233,15 @@ class ParamikoSftpBrowser(SftpBrowser):
             raise SftpError(f"Could not read {remote_path}: {exc}") from exc
         local_path.write_bytes(data)
         return len(data)
+
+    def open_read(self, remote_path: str):
+        try:
+            size = int(self._sftp.stat(remote_path).st_size or 0)
+            return self._sftp.open(remote_path, "rb"), size
+        except FileNotFoundError as exc:
+            raise SftpNotFoundError(f"File not found: {remote_path}") from exc
+        except OSError as exc:
+            raise SftpError(f"Could not open {remote_path}: {exc}") from exc
 
     def download(
         self,
@@ -401,6 +436,9 @@ def _demo_dir_key(path: str) -> str:
     return text
 
 
+DEMO_SAMPLE_RATE = 20_000
+
+
 class DemoSftpBrowser(SftpBrowser):
     """In-memory folders. Tests and demo mode must not open sockets."""
 
@@ -542,9 +580,23 @@ class DemoSftpBrowser(SftpBrowser):
         directory: str | None = None,
         when: datetime | None = None,
         size: int | None = None,
+        seconds: float | None = None,
+        center_hz: float = 0.0,
+        bandwidth_hz: float = 0.0,
+        sample_rate: int = DEMO_SAMPLE_RATE,
     ) -> list[RemoteEntry]:
+        """Files of one simulated capture.
+
+        With `seconds`, every part is a CRFS-style WAVE whose header holds its
+        share of that many seconds at `sample_rate` (a small rate keeps the
+        files tiny) and whose metadata names the centre and bandwidth; without
+        it, the tone file padded to `size` bytes.
+        """
         with self._lock:
-            return self._publish_capture_locked(stem, parts=parts, directory=directory, when=when, size=size)
+            return self._publish_capture_locked(
+                stem, parts=parts, directory=directory, when=when, size=size,
+                seconds=seconds, center_hz=center_hz, bandwidth_hz=bandwidth_hz, sample_rate=sample_rate,
+            )
 
     def _publish_capture_locked(
         self,
@@ -554,25 +606,53 @@ class DemoSftpBrowser(SftpBrowser):
         directory: str | None = None,
         when: datetime | None = None,
         size: int | None = None,
+        seconds: float | None = None,
+        center_hz: float = 0.0,
+        bandwidth_hz: float = 0.0,
+        sample_rate: int = DEMO_SAMPLE_RATE,
     ) -> list[RemoteEntry]:
+        from .iq_wav import crfs_style_wav_bytes
+
         folder = directory or today_remdata_directory()
         stamp = when or datetime.now()
-        wav = stereo_iq_tone_wav_bytes()
-        nbytes = int(size if size is not None else len(wav))
         out: list[RemoteEntry] = []
         count = max(1, int(parts))
+        total_frames = int(round(max(float(seconds or 0.0), 0.0) * int(sample_rate)))
         for index in range(1, count + 1):
             name = f"{stem}_{index:04d}.wav"
+            if seconds is not None:
+                share = total_frames // count + (1 if index <= total_frames % count else 0)
+                start = stamp.astimezone() + timedelta(seconds=(total_frames // count) * (index - 1) / float(sample_rate))
+                payload = crfs_style_wav_bytes(
+                    frames=share,
+                    sample_rate=int(sample_rate),
+                    center_hz=center_hz,
+                    bandwidth_hz=bandwidth_hz,
+                    signal_time=start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+                )
+                nbytes = len(payload)
+            else:
+                payload = stereo_iq_tone_wav_bytes()
+                nbytes = int(size if size is not None else len(payload))
             out.append(
                 self._add_file_locked(
                     name,
                     folder,
-                    payload=wav,
+                    payload=payload,
                     size=nbytes,
                     modified=stamp + timedelta(seconds=index - 1),
                 )
             )
         return out
+
+    def open_read(self, remote_path: str):
+        import io
+
+        with self._lock:
+            payload = self._files.get((remote_path or "").replace("\\", "/"))
+        if payload is None:
+            raise SftpNotFoundError(f"File not found: {remote_path}")
+        return io.BytesIO(payload), len(payload)
 
     def directory_exists(self, path: str) -> bool:
         with self._lock:

@@ -32,6 +32,8 @@ from .iq_merge import (
     plan_merge,
     read_sidecar,
 )
+from .diagnostic_log import diag
+from .operator_text import clip
 from .paths import user_config_dir
 from .worker_threads import track as track_worker_thread
 
@@ -231,7 +233,7 @@ class MergeController(QObject):
             return "merging is off"
         live = self.live_stem()
         if auto and live and live == stem:
-            self.log.emit(f"{stem}: not merged yet; the recording is still in progress.", "info")
+            self.log.emit(f"Not merged yet: {stem} is still recording.", "info")
             return "the recording is still in progress"
         if self._active is not None and self._active[2].group_key == group_key:
             return "already merging"
@@ -241,12 +243,12 @@ class MergeController(QObject):
         if existing is not None and auto:
             # Same parts, output still present: a refresh, a reconnect, a second
             # download or a restart must not produce a second merged file.
-            self.log.emit(f"{stem}: already merged -> {existing.name}.", "info")
+            self.log.emit(f"Already merged: {stem} into {existing.name}.", "info")
             return f"already merged ({existing.name})"
         if existing is None and auto and group_key in self._seen:
             # Merged earlier in this session but the output is gone (or the parts
             # changed): merge again only when the operator asks.
-            self.log.emit(f"{stem}: merged earlier in this session; not merging again automatically.", "info")
+            self.log.emit(f"{stem} was merged earlier in this session. Not merged again automatically.", "info")
             return "merged earlier in this session"
         # A manual request for already merged parts gets a fresh, uniquely named file.
         request = MergeRequest(group_key=group_key, stem=stem, paths=list(paths), folder=Path(folder), auto=auto)
@@ -290,13 +292,12 @@ class MergeController(QObject):
             self._finish_failed(request, "; ".join(plan.errors), cancelled=False)
             return
         for warning in plan.warnings:
-            self.log.emit(f"{request.stem}: {warning}", "error")
+            diag("merge_warning", request.stem, warning=str(warning))
+            self.log.emit(f"Merge warning for {request.stem}: {clip(str(warning), 90)}", "error")
         request.plan = plan
         request.output = merged_output_path(request.stem, request.folder)
-        self.log.emit(
-            f"Merging {request.stem}: {plan.describe()} -> {request.output.name}",
-            "info",
-        )
+        diag("merge_plan", request.stem, plan=plan.describe(), output=request.output.name)
+        self.log.emit(f"Merging {request.stem}: {len(plan.parts)} parts into {request.output.name}.", "info")
         thread = QThread()
         job = MergeJob(request)
         job.moveToThread(thread)
@@ -335,13 +336,13 @@ class MergeController(QObject):
         self._registry.record(request.group_key, request.paths, result.output)
         note = ""
         if result.continuity != "verified":
-            note = " Continuity across the joins is not verified (see the .merge.json file)."
+            note = " Joins not verified; see the .merge.json file."
+        diag("merge_done", request.stem, summary=result.summary(), elapsed_s=round(result.elapsed_s, 1), continuity=result.continuity)
         self.log.emit(
-            f"Merged {request.stem}: {result.summary()} Written in {result.elapsed_s:.1f} s "
-            f"next to the parts; the originals are kept.{note}",
+            f"Merged {request.stem}: {result.output.name}, {result.duration_s:.2f} s. Originals kept.{note}",
             "info" if not note else "error",
         )
-        self._set_status(f"Merged {request.stem} -> {result.output.name} ({result.duration_s:.2f} s, {result.container}).", bool(note))
+        self._set_status(f"Merged {request.stem} into {result.output.name} ({result.duration_s:.2f} s, {result.container}).", bool(note))
         self.progress_changed.emit(-1)
         self.merged.emit(request.stem, result)
 
@@ -359,8 +360,9 @@ class MergeController(QObject):
             self.log.emit(f"Merge cancelled for {request.stem}. The recording itself is not affected.", level)
             self._set_status(f"Merge cancelled: {request.stem}.", False)
         else:
-            self.log.emit(f"Merge failed for {request.stem}: {message} The recording itself is not affected.", level)
-            self._set_status(f"Merge failed: {request.stem}. {message}", True)
+            diag("merge_failed", request.stem, error=str(message))
+            self.log.emit(f"Merge failed for {request.stem}. The recording is not affected. See details.", level)
+            self._set_status(f"Merge failed: {request.stem}. {clip(str(message).splitlines()[-1] if message else '', 100)}", True)
         self.progress_changed.emit(-1)
         self.merge_failed.emit(request.stem, message)
         if self._active is None:

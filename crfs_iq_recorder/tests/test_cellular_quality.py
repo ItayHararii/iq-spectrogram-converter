@@ -154,7 +154,7 @@ def _plan(ready=True, estimated=5 * 1024 ** 3):
     from crfs_iq_recorder.cellular_plan import PlannedTask
 
     task = PlannedTask.from_dict({**_task_dict(), "estimated_bytes": estimated, "duration_s": 30.0})
-    plan = CellularPlan(protocol_version="abc", tasks=[task], issues=[], window_hz=20 * MHZ, window_note="", edge_margin_hz=0, fallback_duration_s=10.0, capability={}, band_order=["700"])
+    plan = CellularPlan(protocol_version="abc", tasks=[task], issues=[], fallback_duration_s=10.0, capability={}, band_order=["700"])
     if not ready:
         from crfs_iq_recorder.cellular_protocol import LEVEL_ERROR, Issue
 
@@ -238,14 +238,16 @@ def test_capture_manifest_keeps_requested_and_actual_windows_apart_and_says_unkn
     data = build_capture_manifest(
         campaign={"campaign": "Camp", "campaign_id": "C1", "site": "Site", "site_id": "S1", "visit_id": "V1", "scenario": {"environment": "indoor"}},
         round_record=_round_dict(), task=_task_dict(), task_state=state,
-        sensor={"model": "R40-8", "serial": "rfeye000123"}, protocol_version="abc123", plan_window_hz=20 * MHZ, timezone_label="Computer local time (UTC+02:00)",
+        sensor={"model": "R40-8", "serial": "rfeye000123"}, protocol_version="abc123", timezone_label="Computer local time (UTC+02:00)",
     )
     assert data["identifiers"]["protocol_version"] == "abc123"
-    assert data["allocation"]["requested_start_hz"] == 768 * MHZ and data["allocation"]["window_start_hz"] == 768 * MHZ
-    assert data["allocation"]["coverage"] == "whole allocation"
-    assert data["allocation"]["capture_window_limit_hz"] == 20 * MHZ
-    assert data["recording"]["held_duration_s"] == 9.98 and data["recording"]["requested_duration_s"] == 10.0
-    assert data["recording"]["sample_rate_hz_model"] == 15_625_000
+    assert data["allocation"]["requested_start_hz"] == 768 * MHZ and data["allocation"]["requested_stop_hz"] == 778 * MHZ
+    assert data["allocation"]["request_rule"].startswith("one request per protocol row")
+    assert data["allocation"]["recorded_range_hz_from_metadata"] == "unknown"
+    assert data["recording"]["measured_duration_s"] == 9.98 and data["recording"]["requested_duration_s"] == 10.0
+    # Nothing measured from the files: the sample rate and the request reply are unknown, not modelled.
+    assert data["recording"]["sample_rate_hz"] == "unknown" and data["recording"]["sample_count"] == "unknown"
+    assert data["request"]["payload_sent"] == "unknown" and data["request"]["earlier_attempts"] == []
     assert "repeat interval" in data["recording"]["sample_rate_note"]
     assert data["sensor"]["firmware"] == "unknown" and data["sensor"]["gnss_status"] == "unknown"
     assert data["scenario"] == {"environment": "indoor"}
@@ -256,18 +258,35 @@ def test_capture_manifest_keeps_requested_and_actual_windows_apart_and_says_unkn
     state["summary"]["recording_format"] = "XDAT"
     again = build_capture_manifest(
         campaign={}, round_record=_round_dict(), task=_task_dict(), task_state=state, sensor={}, protocol_version="abc123",
-        plan_window_hz=20 * MHZ, timezone_label="",
+        timezone_label="",
     )
     assert again["recording"]["recording_format"] == "XDAT" and again["recording"]["encoding"].startswith("XDAT (sensor format")
     state["summary"]["recording_format"] = "WAVE"
     wave = build_capture_manifest(
         campaign={}, round_record=_round_dict(), task=_task_dict(), task_state=state, sensor={}, protocol_version="abc123",
-        plan_window_hz=20 * MHZ, timezone_label="",
+        timezone_label="",
     )
     assert wave["recording"]["encoding"].startswith("WAVE, 16-bit PCM")
     path = manifest_path(tmp_path, "file_080005", fallback_name="x")
     write_manifest(path, data)
     assert path.name == "file_080005.cellular.json" and read_manifest(path)["identifiers"]["protocol_version"] == "abc123"
+    # What the sensor's files say is kept next to the request; an earlier attempt stays listed.
+    state["summary"].update(
+        measurement={"centre_hz": 773_000_000, "bandwidth_hz": 10_000_000, "sample_rate_hz": 15_625_000,
+                     "parts": [{"name": "file_080005_0001.wav", "duration_s": 9.98, "sample_rate_hz": 15_625_000}]},
+        payload={"center_frequency": 773_000_000, "bandwidth": 10_000_000, "duration": 10.0},
+        sensor_reply={"bandwidth": 10_000_000},
+    )
+    state.update(attempts=2, result="completed", history=[{"attempt": 1, "status": "unknown", "result": "unconfirmed", "files": []}])
+    measured = build_capture_manifest(
+        campaign={}, round_record=_round_dict(), task=_task_dict(), task_state=state, sensor={}, protocol_version="abc123",
+        timezone_label="",
+    )
+    assert measured["allocation"]["recorded_range_hz_from_metadata"] == [768_000_000.0, 778_000_000.0]
+    assert measured["recording"]["sample_rate_hz"] == 15_625_000 and measured["recording"]["sample_count"] == 155_937_500
+    assert measured["recording"]["result"] == "completed"
+    assert measured["request"]["attempt"] == 2 and measured["request"]["payload_sent"]["center_frequency"] == 773_000_000
+    assert measured["request"]["earlier_attempts"][0]["result"] == "unconfirmed"
 
 
 def test_handover_counts_logical_captures_files_images_and_merged_separately():
@@ -389,7 +408,7 @@ def test_coverage_rows_summary_and_filter(tmp_path):
     from crfs_iq_recorder.cellular_scheduler import RoundRecord
 
     tasks = [PlannedTask.from_dict({**_task_dict(), "task_key": "a", "direction": "DL"}), PlannedTask.from_dict({**_task_dict(), "task_key": "b", "direction": "UL", "window_start_hz": 713 * MHZ, "window_stop_hz": 723 * MHZ})]
-    plan = CellularPlan(protocol_version="v", tasks=tasks, issues=[], window_hz=20 * MHZ, window_note="", edge_margin_hz=0, fallback_duration_s=None, capability={}, band_order=["700"])
+    plan = CellularPlan(protocol_version="v", tasks=tasks, issues=[], fallback_duration_s=None, capability={}, band_order=["700"])
     rounds = [
         RoundRecord(round_id="R1", scheduled_local=datetime(2026, 11, 3, 8, 0, tzinfo=timezone(timedelta(hours=2))), scheduled_utc=datetime(2026, 11, 3, 6, 0, tzinfo=timezone.utc), status="done"),
         RoundRecord(round_id="R2", scheduled_local=datetime(2026, 11, 3, 12, 0, tzinfo=timezone(timedelta(hours=2))), scheduled_utc=datetime(2026, 11, 3, 10, 0, tzinfo=timezone.utc), status="partial"),

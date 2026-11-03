@@ -41,7 +41,9 @@ def redact_url(url: str) -> str:
 
 def _is_secret_key(key: str) -> bool:
     lowered = key.lower()
-    return bool(_AUTH_HEADER_RE.match(key)) or lowered in _PASSWORD_KEYS or "password" in lowered
+    return bool(_AUTH_HEADER_RE.match(key)) or lowered in _PASSWORD_KEYS or any(
+        word in lowered for word in ("password", "secret", "token")
+    )
 
 
 def _redact_value(key: str, value: Any) -> Any:

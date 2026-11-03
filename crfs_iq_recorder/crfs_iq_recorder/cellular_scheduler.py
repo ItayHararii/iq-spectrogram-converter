@@ -245,7 +245,9 @@ class RoundRecord:
     actual_start_utc: datetime | None = None
     finished_utc: datetime | None = None
     tasks_total: int = 0
+    # Completed (full duration measured); partial recordings are counted apart.
     tasks_confirmed: int = 0
+    tasks_partial: int = 0
     tasks_failed: int = 0
     tasks_uncertain: int = 0
     tasks_skipped: int = 0
@@ -268,6 +270,7 @@ class RoundRecord:
             "finished_utc": self.finished_utc.isoformat() if self.finished_utc else None,
             "tasks_total": self.tasks_total,
             "tasks_confirmed": self.tasks_confirmed,
+            "tasks_partial": self.tasks_partial,
             "tasks_failed": self.tasks_failed,
             "tasks_uncertain": self.tasks_uncertain,
             "tasks_skipped": self.tasks_skipped,
@@ -300,6 +303,7 @@ class RoundRecord:
             finished_utc=_dt(data.get("finished_utc")),
             tasks_total=int(data.get("tasks_total") or 0),
             tasks_confirmed=int(data.get("tasks_confirmed") or 0),
+            tasks_partial=int(data.get("tasks_partial") or 0),
             tasks_failed=int(data.get("tasks_failed") or 0),
             tasks_uncertain=int(data.get("tasks_uncertain") or 0),
             tasks_skipped=int(data.get("tasks_skipped") or 0),

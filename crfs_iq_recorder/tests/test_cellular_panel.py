@@ -137,9 +137,9 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         window._stable_needed = 2
         window._demo_parts = 1
         panel = window.cellular_panel
-        assert panel.body.isHidden(), "collapsed by default"
-        panel._set_expanded(True)
-        assert not panel.body.isHidden()
+        assert window.tabs.currentIndex() == 0 and panel.body.isHidden(), "the form is built when its tab opens"
+        window.tabs.setCurrentIndex(1)
+        assert panel._built and not panel.body.isHidden()
         assert panel.start_btn.isEnabled() is False
         # Only the essential controls exist: no campaign, site, scenario, UTC or mapping widgets.
         for gone in ("campaign_edit", "site_combo", "tz_combo", "map_btn", "template_btn", "window_spin", "format_combo", "test_btn"):
@@ -147,8 +147,8 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         assert panel.duration_spin.value() == 5.0 and panel.wait_spin.value() == 10, "defaults: 5 s recordings, 10 s wait"
         _load(panel, qapp, book)
         assert panel.imported is not None and panel.plan is not None
-        assert panel.import_label.text().startswith("2 rows · Estimated "), panel.import_label.text()
-        assert "'Plan'" in panel.details_label.text() and panel.details_btn.isVisibleTo(panel.body)
+        assert panel.import_label.text() == "2 rows · 5 s per request · 10 s between recordings · 1 pass", panel.import_label.text()
+        assert "Estimate only" in panel.details_label.text() and panel.details_btn.isVisibleTo(panel.body)
         assert panel.plan.ready and panel.start_btn.isEnabled()
         assert [t.direction for t in panel.plan.tasks] == ["UL", "DL"], "worksheet order"
         panel.duration_spin.setValue(1.0)
@@ -156,7 +156,7 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         panel.wait_spin.setValue(0)
         assert panel.wait_seconds() == 0
         dialog = PlanPreviewDialog(panel.plan, wait_s=0, rows_total=2, notes=panel._notes_before_start(None), start_label="Start")
-        assert dialog.windowTitle() == "Cellular Collection"
+        assert dialog.windowTitle() == "Excel Collection"
         dialog.close()
         # Settings persisted separately from the ordinary recorder settings.
         panel.until_stopped.setChecked(True)
@@ -174,7 +174,7 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         assert window._external_owner == OWNER
         assert panel.chip.text() == "Recording"
         assert not panel.start_btn.isEnabled() and panel.stop_btn.isEnabled() and panel.pause_btn.isEnabled()
-        assert _pump_until(qapp, lambda: "recording" in panel.status_label.text() or "idle" in panel.status_label.text().casefold(), timeout=5.0)
+        assert _pump_until(qapp, lambda: "recording" in panel.status_label.text().casefold() or "idle" in panel.status_label.text().casefold(), timeout=5.0)
         for _ in range(2):
             assert _pump_until(qapp, lambda: window._http_in_flight is False)
             _drive_capture(window, qapp)
@@ -186,7 +186,15 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         assert tasks[0].quality.get("level") in {"ok", "warning"}
         qapp.processEvents()
         assert panel.chip.text() == "Finished"
-        assert not panel.recovery.isHidden() and "finished" in panel.recovery_label.text().casefold()
+        assert panel.recovery.isHidden(), "a finished collection is summarised, not a recovery notice"
+        assert not panel.pass_box.isHidden() and panel.pass_title.text() == "Pass 1 finished"
+        assert panel.pass_counts.text() == "Completed 2 · Partial 0 · Failed 0 · Uncertain 0"
+        assert panel.retry_btn.isHidden(), "nothing failed, nothing to retry"
+        card = panel.result_card
+        assert not card.isHidden() and card.title.text().startswith("Row 2 of 2: ")
+        assert card.requested.text() == "Requested: 10 MHz for 1 s" and card.received.text().startswith("Received: 1 file, ")
+        assert card.tag.text() == "Complete" and "Saved locally" in card.states.text()
+        assert card.open_btn.isEnabled() and card.waterfall_btn.isEnabled()
         assert window._external_owner == ""
         panel._discard()
         qapp.processEvents()
@@ -208,7 +216,7 @@ def test_start_button_verifies_the_sensor_identity_then_previews(qapp, tmp_path,
     window = MainWindow(demo=True)
     try:
         panel = window.cellular_panel
-        panel._set_expanded(True)
+        window.tabs.setCurrentIndex(1)
         _load(panel, qapp, book)
         panel.duration_spin.setValue(1.0)
         panel.wait_spin.setValue(0)
@@ -223,7 +231,7 @@ def test_start_button_verifies_the_sensor_identity_then_previews(qapp, tmp_path,
         assert panel._identity_pending is True and not panel.start_btn.isEnabled()
         assert panel.status_label.text().startswith("Checking the sensor")
         assert _pump_until(qapp, lambda: not panel._identity_pending, timeout=6.0)
-        assert shown and shown[0]["title"] == "Cellular Collection"
+        assert shown and shown[0]["title"] == "Excel Collection"
         assert panel.settings.last_sensor == {} or True
         assert window._cellular.session is None, "rejecting the preview starts nothing"
         assert panel.start_btn.isEnabled()
@@ -239,7 +247,7 @@ def test_schedule_uses_the_pickers_and_the_local_clock(qapp, tmp_path):
     window = MainWindow(demo=True)
     try:
         panel = window.cellular_panel
-        panel._set_expanded(True)
+        window.tabs.setCurrentIndex(1)
         _load(panel, qapp, book)
         panel.run_times.setChecked(True)
         assert panel.schedule_box.isVisibleTo(panel.body) and not panel.repeat_spin.isVisibleTo(panel.body)
@@ -282,7 +290,7 @@ def test_panel_fills_the_protocol_rows_through_the_demo_window(qapp, tmp_path):
         window._stable_needed = 2
         window._demo_parts = 1
         panel = window.cellular_panel
-        panel._set_expanded(True)
+        window.tabs.setCurrentIndex(1)
         _load(panel, qapp, book)
         assert panel.imported is not None and panel.plan is not None
         assert panel.imported.mapping.result == "IQ Recording" and panel.imported.mapping.result_time == "Recording Date & Time"
@@ -354,7 +362,7 @@ def test_a_workbook_that_cannot_be_read_keeps_the_stored_import_and_queues_resul
         window._stable_needed = 2
         window._demo_parts = 1
         panel = window.cellular_panel
-        panel._set_expanded(True)
+        window.tabs.setCurrentIndex(1)
         _load(panel, qapp, book)
         assert panel.imported is not None
         # The file becomes unreadable (locked); the user re-reads it.
@@ -364,7 +372,13 @@ def test_a_workbook_that_cannot_be_read_keeps_the_stored_import_and_queues_resul
         panel._import(force=True)
         assert _pump_until(qapp, lambda: not panel._importing)
         assert panel.imported is not None and panel._current_sheet() == "Cellular Protocol"
-        assert "Permission denied" in panel.import_label.text() and "imported earlier" in panel.import_label.text()
+        assert panel.import_label.text() == (
+            "Protocol.xlsx cannot be opened right now. Is it open in another program? "
+            "Using the 2 rows imported earlier; results are queued."
+        )
+        from crfs_iq_recorder import diagnostic_log
+
+        assert any("Permission denied" in line for line in diagnostic_log.recent(50))
         settings = panel._campaign_settings()
         assert settings.protocol_results is True and settings.protocol_sheet == "Cellular Protocol" and len(settings.plan_rows) == 2
         # A different workbook path gets no such fallback, nor does a worksheet that changed.
@@ -425,7 +439,7 @@ _original_list_worksheets = __import__("crfs_iq_recorder.cellular_panel", fromli
 _original_read_headers = __import__("crfs_iq_recorder.cellular_panel", fromlist=["read_headers"]).read_headers
 
 
-def test_collapsed_panel_builds_nothing_until_opened_and_opens_for_a_saved_session(qapp, tmp_path):
+def test_excel_form_is_built_when_its_tab_opens_and_for_a_saved_session(qapp, tmp_path):
     from PySide6.QtWidgets import QWidget
     from crfs_iq_recorder.cellular_plan import build_plan
     from crfs_iq_recorder.cellular_capabilities import capability_for
@@ -436,18 +450,20 @@ def test_collapsed_panel_builds_nothing_until_opened_and_opens_for_a_saved_sessi
     window = MainWindow(demo=True)
     try:
         panel = window.cellular_panel
+        assert window.tabs.currentIndex() == 0 and window.tabs.tabText(0) == "Manual Recording" and window.tabs.tabText(1) == "Excel Collection"
         assert not panel._built and panel.body.isHidden()
-        assert len(panel.findChildren(QWidget)) < 10, "only the header exists while collapsed"
+        assert len(panel.findChildren(QWidget)) < 10, "the Excel form is not built while the manual tab is shown"
         assert panel.chip.text() == "Idle"
-        assert panel.action_bar.isHidden(), "the action bar follows the form"
+        assert window.cellular_bar is panel.action_bar and not panel.start_btn.isEnabled()
+        assert panel.start_btn.toolTip() == "Load a protocol workbook first."
         window.close()
         qapp.processEvents()
         saved = json.loads((tmp_path / "config" / "cellular" / "settings.json").read_text(encoding="utf-8"))
-        assert saved["expanded"] is False
+        assert "expanded" not in saved and saved["wait_unit"] == "seconds"
     finally:
         window.close()
         qapp.processEvents()
-    # A session left behind by a previous run opens the panel on the next start.
+    # A session left behind by a previous run opens the Excel tab on the next start.
     book = _plan_book(tmp_path / "plan.xlsx")
     plan = build_plan(import_protocol(book, "Plan"), capability_for("R40-8"), fallback_duration_s=1.0)
 
@@ -471,6 +487,7 @@ def test_collapsed_panel_builds_nothing_until_opened_and_opens_for_a_saved_sessi
     try:
         panel2 = window2.cellular_panel
         assert panel2._built and not panel2.body.isHidden()
+        assert window2.tabs.currentIndex() == 1, "a collection that needs attention opens its tab"
         assert panel2.chip.text() == "Interrupted"
         assert not panel2.recovery.isHidden() and "interrupted" in panel2.recovery_label.text().casefold()
         # Closed during a pass whose capture was refused: nothing is uncertain, so
@@ -478,12 +495,11 @@ def test_collapsed_panel_builds_nothing_until_opened_and_opens_for_a_saved_sessi
         assert window2._cellular.uncertain_tasks() == [] and window2._cellular.current_round() is not None
         assert panel2.reconcile_btn.isHidden() and not panel2.resume_session_btn.isHidden()
         assert "during a pass" in panel2.recovery_label.text()
-        # The docked bar is on screen next to the manual "Start Recording" button
-        # while the section is scrolled away: it names its owner.
-        assert window2.cellular_bar is panel2.action_bar and not panel2.action_bar.isHidden()
-        assert panel2.bar_caption.text().casefold() == "cellular collection"
-        assert not panel2.bar_caption.isHidden()
-        assert "cellular" in panel2.start_btn.accessibleName().casefold()
+        # The bar is pinned under the Excel tab's form; the manual Start is on the other tab.
+        assert window2.cellular_bar is panel2.action_bar and panel2.action_bar.isVisibleTo(window2)
+        assert not window2.start_btn.isVisibleTo(window2)
+        assert panel2.start_btn.accessibleName() == "Start Excel Collection"
+        assert panel2.reason_label.text() == "Continue or dismiss the interrupted collection first."
     finally:
         window2.close()
         qapp.processEvents()
@@ -559,7 +575,7 @@ def test_chip_says_stopped_when_the_operator_stopped_the_collection(qapp, tmp_pa
     window = MainWindow(demo=True)
     try:
         panel = window.cellular_panel
-        panel._set_expanded(True)
+        window.tabs.setCurrentIndex(1)
         qapp.processEvents()
         panel._on_status({"state": S_DONE, "text": "Stopped", "active": False})
         assert (panel.chip.text(), panel.chip.objectName()) == ("Stopped", "badgeWait")
@@ -567,6 +583,145 @@ def test_chip_says_stopped_when_the_operator_stopped_the_collection(qapp, tmp_pa
         assert (panel.chip.text(), panel.chip.objectName()) == ("Finished", "badgeWait")
         panel._on_status({"state": S_DONE, "text": "Finished", "active": False})
         assert (panel.chip.text(), panel.chip.objectName()) == ("Finished", "badgeOk")
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_a_download_backlog_pause_is_said_once(qapp, tmp_path):
+    """Hardware, 3 Nov (VPN at ~2 MB/s): the status line already held the backlog reason and the
+    detail line repeated it twice ("Downloads: 10 waiting · Downloads: 10 waiting (limit 8)…")."""
+    from crfs_iq_recorder.cellular_runner import S_PAUSED, S_PAUSED_BACKLOG
+    from crfs_iq_recorder.gui import MainWindow
+
+    window = MainWindow(demo=True)
+    try:
+        panel = window.cellular_panel
+        window.tabs.setCurrentIndex(1)
+        qapp.processEvents()
+        reason = "Downloads: 10 waiting (limit 8). Recording resumes when they catch up."
+        panel._on_status({"state": S_PAUSED_BACKLOG, "text": f"Paused: {reason}", "active": True, "pending_downloads": 10, "pause_reason": reason})
+        assert panel.status_label.text() == f"Paused: {reason}"
+        assert panel.detail_label.isHidden(), panel.detail_label.text()
+        panel._on_status({"state": S_PAUSED, "text": "Paused", "active": True, "pending_downloads": 4, "pause_reason": "Paused by the operator."})
+        assert panel.detail_label.text() == "Downloads: 4 waiting · Paused by the operator."
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_start_says_it_waits_for_the_last_collections_downloads(qapp, tmp_path):
+    from crfs_iq_recorder.cellular_runner import S_DONE
+    from crfs_iq_recorder.gui import MainWindow
+
+    book = _plan_book(tmp_path / "plan.xlsx")
+    window = MainWindow(demo=True)
+    try:
+        panel = window.cellular_panel
+        window.tabs.setCurrentIndex(1)
+        _load(panel, qapp, book)
+        waiting = "The last collection is still downloading (2 waiting). Start the next one when the downloads finish."
+        panel._on_status({"state": S_DONE, "text": "Finished", "active": False, "previous_work": waiting})
+        assert not panel.start_btn.isEnabled()
+        assert panel.reason_label.text() == waiting and not panel.reason_label.isHidden()
+        panel._on_status({"state": S_DONE, "text": "Finished", "active": False, "previous_work": ""})
+        assert panel.start_btn.isEnabled() and panel.reason_label.isHidden()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_retry_failed_rows_from_the_pass_summary_sends_the_rejected_row_as_attempt_2(qapp, tmp_path, monkeypatch):
+    from PySide6.QtCore import QTimer
+    from crfs_iq_recorder.capture_api import OUTCOME_SENSOR_ERROR, CaptureSummary
+    from crfs_iq_recorder.capture_measure import RESULT_FAILED
+    from crfs_iq_recorder.gui import MainWindow
+
+    book = _plan_book(tmp_path / "plan.xlsx")
+    window = MainWindow(demo=True)
+    try:
+        window._settle_s = 0
+        window._stable_needed = 2
+        window._demo_parts = 1
+        panel = window.cellular_panel
+        window.tabs.setCurrentIndex(1)
+        _load(panel, qapp, book)
+        panel.duration_spin.setValue(1.0)
+        panel.wait_spin.setValue(0)
+        real_start = window.start_capture
+        rejected = []
+
+        def reject_the_first(request):
+            if rejected:
+                return real_start(request)
+            rejected.append(request)
+            detail = "ERROR: Unable to schedule the command"
+            summary = CaptureSummary(
+                outcome=OUTCOME_SENSOR_ERROR, request=request, result=RESULT_FAILED, result_reason="rejected by the sensor",
+                sensor_error=detail, detail=detail, requested_s=request.seconds,
+                payload={"center_frequency": request.plan.center_hz, "bandwidth": request.plan.bandwidth_hz, "duration": request.seconds},
+            )
+            QTimer.singleShot(0, lambda: window.capture_finished.emit(summary))
+            return None
+
+        monkeypatch.setattr(window, "start_capture", reject_the_first)
+        panel.run_now.setChecked(True)
+        schedule, error = panel._schedule()
+        assert error is None
+        panel._start(schedule)
+        runner = window._cellular
+
+        def drive(rounds):
+            for _ in range(rounds):
+                assert _pump_until(qapp, lambda: window._http_in_flight is False)
+                _drive_capture(window, qapp)
+                runner._tick()
+            assert _pump_until(qapp, lambda: runner.state == S_DONE, timeout=8.0), runner.status()
+            assert _pump_until(qapp, lambda: runner.background_jobs() == 0, timeout=20.0)
+            qapp.processEvents()
+
+        drive(2)
+        assert len(rejected) == 1
+        assert not panel.pass_box.isHidden()
+        assert panel.pass_counts.text() == "Completed 1 · Partial 0 · Failed 1 · Uncertain 0"
+        assert not panel.retry_btn.isHidden() and panel.retry_btn.isEnabled()
+        panel.retry_btn.click()
+        qapp.processEvents()
+        assert window._external_owner == OWNER and panel.pass_box.isHidden(), "the pass runs again for the one row"
+        drive(1)
+        assert len(rejected) == 1, "the retry is a new request on the demo sensor"
+        assert panel.pass_counts.text() == "Completed 2 · Partial 0 · Failed 0 · Uncertain 0"
+        assert panel.retry_btn.isHidden()
+        assert panel.result_card.title.text() == "Row 1 of 2: 703-713 MHz (attempt 2)"
+        first = runner.session.tasks[runner.status()["last_round_id"]][0]
+        assert first.attempts == 2 and first.status == T_CONFIRMED and len(first.history) == 1
+        panel.pass_dismiss_btn.click()
+        assert panel.pass_box.isHidden()
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_wait_unit_keeps_the_same_wait_and_a_missing_workbook_says_what_to_do(qapp, tmp_path):
+    from crfs_iq_recorder.gui import MainWindow
+
+    save_panel_settings(tmp_path / "config", PanelSettings(workbook=str(tmp_path / "moved.xlsx"), wait_s=90.0, wait_unit="seconds"))
+    window = MainWindow(demo=True)
+    try:
+        panel = window.cellular_panel
+        assert panel.wait_seconds() == 90.0, "read from the settings before the form is built"
+        window.tabs.setCurrentIndex(1)
+        assert panel.import_label.text() == "Protocol workbook not found. Choose the file again."
+        assert not panel.start_btn.isEnabled()
+        panel.wait_unit.setCurrentText("Minutes")
+        assert panel.wait_spin.value() == pytest.approx(1.5) and panel.wait_seconds() == pytest.approx(90.0)
+        panel.wait_spin.setValue(2)
+        assert panel.wait_seconds() == pytest.approx(120.0)
+        panel._save_settings()
+        saved = json.loads((tmp_path / "config" / "cellular" / "settings.json").read_text(encoding="utf-8"))
+        assert saved["wait_unit"] == "minutes" and saved["wait_s"] == pytest.approx(120.0)
     finally:
         window.close()
         qapp.processEvents()

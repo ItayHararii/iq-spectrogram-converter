@@ -1,7 +1,7 @@
 # CRFS IQ Recorder - architecture
 
-**Version documented:** 1.12.0
-**Code:** `crfs_iq_recorder/` as of this file (3 November 2026). The Cellular Collection rows below describe the 1.10.0+ design; `docs/CELLULAR_COLLECTION.md` has the detail.
+**Version documented:** 1.13.0
+**Code:** `crfs_iq_recorder/` as of this file (3 November 2026). The Excel Collection rows below (called Cellular Collection before 1.13.0) describe the 1.13.0 design; `docs/CELLULAR_COLLECTION.md` has the detail.
 **Related app:** IQ Spectrogram Converter (`iq_gui.py`, `iq_data.py`) at the repository root
 
 This note describes how the software works today. Items we could not prove from source or from a published CRFS EMP schema are listed under [Unverified](#unverified). Ideas for later work are in [Proposed improvements](#proposed-improvements) and are not current behavior.
@@ -98,7 +98,10 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | Component | Responsibility | Source |
 | --- | --- | --- |
 | App entry | Runtime cache for the EXE; start Qt | `crfs_iq_recorder/__main__.py`, `run.py`, `paths.prepare_runtime` |
-| Main window / recording controller | Band and time, Start, series, status, log, Excel toggle, Sensor Files | `gui.py` (`MainWindow`) |
+| Main window / recording controller | Shared sensor header, **Manual Recording** and **Excel Collection** tabs with one controller of the sensor at a time and a reason line on the other tab's Start (1.13.0); band and time, Start, series with Pause/Resume/Stop, status, activity log, Excel toggle, Sensor Files; restores the last tab and form, never starts on its own | `gui.py` (`MainWindow`) |
+| Result card | "Last recording" card for both tabs: tag (Complete / Partial / Uncertain / Failed / Other range), Requested / Received / Recorded, separate recording / transfer / Excel states, Download / Open folder / View waterfall (1.13.0) | `result_view.py`, `result_card.py`, `desktop_open.py`, `waterfall_dialog.py`, `recording_download.py` |
+| Measured result | Duration, sample rate, centre and bandwidth read from the WAVE header and the CRFS `meta` trailer; result classes with a 2 % partial tolerance; nothing inferred from sizes or elapsed time (1.13.0) | `capture_measure.py` |
+| Diagnostics | Short operator sentences in the activity log; rotating diagnostic log (2 MB x 5) with payloads, replies and counted sensor messages; **Copy details** report with addresses, user folder, sensor position and stored secrets masked (1.13.0) | `diagnostic_log.py`, `diagnostic_report.py`, `operator_text.py` |
 | Recording phases | Idle, sending, recording, waiting for files, confirmed | `recording_status.py` |
 | Log sanitizer | Strip secrets from URLs, logs, and persisted objects | `sanitizer.py` |
 | Remote folders | Dated `/mnt/1/remdata/` paths | `sftp_paths.py` |
@@ -116,14 +119,14 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | Merge controller | Toggle state, queue, one worker thread, dedupe via `merge_history.json` and sidecars, cancel, `.partial` sweep on start (1.8.10) | `merge_controller.py` |
 | Programmatic capture | `MainWindow.start_capture(CaptureRequest)` drives the same Start path as the button; `capture_finished(CaptureSummary)` reports confirmed / unknown / not_sent / sensor_error / failed; an external owner blocks manual Start and the series (1.9.0) | `capture_api.py`, `gui.py` |
 | Cellular protocol import | Excel workbook/worksheet by headers (band, direction, duplex, start, stop, sensor, result columns), unit parsing, validation, result rows recognised by key and never reimported, versioned snapshot (1.9.0, simplified 1.10.0) | `cellular_protocol.py` |
-| Sensor capability | Per verified model: sample-rate tiers, per-capture byte budget measured on the sensor (R100-18: 100 MHz x 1 s or 50 MHz x 2 s within 625 MB), `window_for(duration)`; the R40-8 keeps its 20 MHz rule (1.10.0) | `cellular_capabilities.py` |
-| Cellular plan | Worksheet order, the app's duration for every row, sequential windows for rows wider than the capture window, per-task storage estimate (1.10.0) | `cellular_plan.py` |
+| Sensor capability | What the model number says (tuning range, instantaneous bandwidth, sample-rate tiers), for a warning before Start and the size estimate only; it never changes a request (1.13.0; 1.10.0-1.12.0 used it to split rows) | `cellular_capabilities.py` |
+| Cellular plan | Worksheet order, one request per row with the row's own start/stop and the app's duration, per-task storage estimate, `legacy` flag for plans saved by 1.10.0-1.12.0 (never continued) (1.13.0) | `cellular_plan.py` |
 | Cellular schedule | Run now with a repeat count (0 = until stopped) or times of day (dates or daily); local time; due / delayed / missed classification; round IDs (1.9.0, 1.10.0) | `cellular_scheduler.py` |
-| Cellular runner | QObject controller: idle check before every request, one capture at a time, wait after confirmed finalization, Pause/Resume/Stop, task states, persisted session, restart reconciliation (nothing resent blindly), a pass whose time went by while the app was closed is listed as missed and never started on its own - also after Continue (1.12.0), bounded download queue, checksums, quality checks, the workbook queue (1.9.0+) | `cellular_runner.py` |
+| Cellular runner | QObject controller: idle check before every request, one capture at a time, wait after confirmed finalization, Pause/Resume/Stop, task states, persisted session, restart reconciliation (nothing resent blindly), a pass whose time went by while the app was closed is listed as missed and never started on its own - also after Continue (1.12.0), bounded download queue, checksums, quality checks, the workbook queue (1.9.0+); pass counts and **Retry failed rows** (reconcile first, failed rows only, new attempt, nothing re-sent on its own); a new collection waits for the last one's downloads, and a restart offers unfinished downloads of a finished collection (Continue only downloads) (1.13.0) | `cellular_runner.py` |
 | Cellular manifests | Versioned JSON manifest beside each logical capture; session handover JSON + Markdown with counts kept apart (1.9.0) | `cellular_manifest.py` |
 | Cellular workbook | Cell-level writer for the protocol worksheet: block 0 filled in place, later passes appended as blocks, backup before the first change of a session, persistent `WorkbookQueue` with busy/error retries, openpyxl or Excel COM when the workbook is open (1.10.0) | `cellular_workbook.py`, `excel_com.py` |
 | Cellular quality | Pre-run checks, post-download WAV validation sampling begin/middle/end, sampled preview PNG, coverage summary (1.9.0) | `cellular_quality.py` |
-| Cellular panel | Borderless section of the recording card: header with state badge, lazily built two-column body, detachable action bar docked under the form and captioned "CELLULAR COLLECTION" (1.11.0/1.12.0), plan preview, recovery notice (interrupted session: Check with the sensor / Continue / Skip uncertain; missed pass: Run now / Skip) | `cellular_panel.py`, `cellular_pickers.py` |
+| Cellular panel | The Excel Collection tab (1.13.0): header with state badge, lazily built form, action bar pinned under the tab, plan preview, result card, pass summary with Retry failed rows, recovery notice (interrupted session: Check with the sensor / Continue / Skip uncertain; missed pass: Run now / Skip; unfinished downloads: Continue) | `cellular_panel.py`, `cellular_pickers.py` |
 | Sensor Files window | Listing, sort, groups, download, delete, waterfall | `sftp_window.py` |
 | SFTP backend | One listing thread and one SSH session for browse/delete | `sftp_window.py` (`SftpBackend`) |
 | SFTP client | Paramiko connect (8 s), read (20 s), download via `.part` | `sftp_client.py`, `download_util.py` |

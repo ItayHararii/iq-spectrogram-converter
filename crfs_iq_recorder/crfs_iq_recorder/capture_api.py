@@ -18,7 +18,7 @@ from .frequency import FrequencyPlan
 # How a capture ended. Task completion (the sensor's word) and file
 # availability (the files settled on its disk) are reported separately in
 # the summary; this is the overall verdict the caller acts on.
-OUTCOME_CONFIRMED = "confirmed"  # files settled on the sensor (may be short; see held_s)
+OUTCOME_CONFIRMED = "confirmed"  # files settled on the sensor; `result` says what they hold
 OUTCOME_UNKNOWN = "unknown"  # request reached the sensor; no settled file confirms it
 OUTCOME_NOT_SENT = "not_sent"  # nothing reached the sensor; safe to retry
 OUTCOME_SENSOR_ERROR = "sensor_error"  # the sensor reported an error for the task
@@ -54,6 +54,7 @@ class CaptureSummary:
     phase: str = ""
     detail: str = ""
     requested_s: float = 0.0
+    # Seconds of IQ read from the files' WAVE headers; None when unknown.
     held_s: float | None = None
     parts: int = 0
     total_bytes: int = 0
@@ -70,6 +71,16 @@ class CaptureSummary:
     stem: str = ""
     # EMP recording_format identifier actually sent (WAVE, XDAT, ...); "" when nothing was sent.
     recording_format: str = ""
+    # completed / partial / unconfirmed / failed (capture_measure.RESULT_*).
+    result: str = ""
+    result_reason: str = ""
+    # What the files' headers and metadata say (capture_measure.CaptureMeasurement.to_dict()).
+    measurement: dict[str, Any] = field(default_factory=dict)
+    # What the sensor's own reply said: centre, bandwidth, duration, file count, its error text.
+    sensor_reply: dict[str, Any] = field(default_factory=dict)
+    sensor_error: str = ""
+    # The exact recording_scans entry that was POSTed.
+    payload: dict[str, Any] = field(default_factory=dict)
 
     @property
     def confirmed(self) -> bool:
@@ -77,12 +88,8 @@ class CaptureSummary:
 
     @property
     def short(self) -> bool:
-        """The files hold clearly less IQ than requested."""
-        return (
-            self.held_s is not None
-            and self.requested_s > 0
-            and self.held_s < 0.95 * self.requested_s
-        )
+        """The recording is partial (measured from the files, never from the clock)."""
+        return self.result == "partial"
 
     @property
     def retry_is_safe(self) -> bool:
@@ -111,4 +118,10 @@ class CaptureSummary:
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "stem": self.stem,
             "recording_format": self.recording_format,
+            "result": self.result,
+            "result_reason": self.result_reason,
+            "measurement": dict(self.measurement),
+            "sensor_reply": dict(self.sensor_reply),
+            "sensor_error": self.sensor_error,
+            "payload": dict(self.payload),
         }

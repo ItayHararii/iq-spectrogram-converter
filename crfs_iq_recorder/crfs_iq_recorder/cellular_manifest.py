@@ -75,7 +75,6 @@ def build_capture_manifest(
     task_state: dict[str, Any],
     sensor: dict[str, Any],
     protocol_version: str,
-    plan_window_hz: int,
     timezone_label: str,
     app_version: str = __version__,
 ) -> dict[str, Any]:
@@ -84,12 +83,17 @@ def build_capture_manifest(
     files = task_state.get("files") or []
     held = summary.get("held_s")
     requested = summary.get("requested_s") or task.get("duration_s")
-    sample_rate = task.get("sample_rate_hz")
-    total_bytes = sum(int(f.get("size") or 0) for f in files) or summary.get("total_bytes") or 0
+    measurement = summary.get("measurement") or {}
+    parts = [p for p in measurement.get("parts") or [] if isinstance(p, dict)]
     sample_count: Any = UNKNOWN
-    if files and sample_rate and held is not None:
-        # 16-bit I and Q: 4 bytes per complex sample; headers removed by the size model.
-        sample_count = int(round(float(held) * float(sample_rate)))
+    if parts and all(p.get("duration_s") is not None and p.get("sample_rate_hz") for p in parts):
+        sample_count = int(round(sum(float(p["duration_s"]) * float(p["sample_rate_hz"]) for p in parts)))
+    total_bytes = sum(int(f.get("size") or 0) for f in files) or summary.get("total_bytes") or 0
+    centre = measurement.get("centre_hz")
+    bandwidth = measurement.get("bandwidth_hz")
+    recorded_range: Any = UNKNOWN
+    if centre is not None and bandwidth:
+        recorded_range = [float(centre) - float(bandwidth) / 2, float(centre) + float(bandwidth) / 2]
     started = _parse(summary.get("started_at"))
     finished = _parse(summary.get("finished_at"))
     return {
@@ -140,39 +144,53 @@ def build_capture_manifest(
         "allocation": {
             "requested_start_hz": task.get("requested_start_hz"),
             "requested_stop_hz": task.get("requested_stop_hz"),
-            "window_start_hz": task.get("window_start_hz"),
-            "window_stop_hz": task.get("window_stop_hz"),
-            "window_index": task.get("window_index"),
+            "request_rule": "one request per protocol row (start/stop as listed)",
             "window_count": task.get("window_count"),
-            "overlap_with_previous_window_hz": task.get("overlap_prev_hz"),
-            "coverage": (
-                "partial: one sequential window of a wider allocation"
-                if int(task.get("window_count") or 1) > 1
-                else "whole allocation"
-            ),
-            "capture_window_limit_hz": plan_window_hz,
+            "recorded_range_hz_from_metadata": recorded_range,
             "adjustments": list(task.get("adjustments") or []),
+        },
+        "request": {
+            "attempt": int(task_state.get("attempts") or 0),
+            "payload_sent": dict(summary.get("payload") or {}) or UNKNOWN,
+            "sensor_reply": dict(summary.get("sensor_reply") or {}) or UNKNOWN,
+            "sensor_error": _or_unknown(summary.get("sensor_error")),
+            "earlier_attempts": [
+                {
+                    "attempt": item.get("attempt"),
+                    "status": item.get("status"),
+                    "result": _or_unknown(item.get("result")),
+                    "reason": _or_unknown(item.get("result_reason")),
+                    "finished_utc": _or_unknown(item.get("finished_utc")),
+                    "files": [f.get("name") for f in item.get("files") or []],
+                    "manifest": _or_unknown(item.get("manifest_path")),
+                }
+                for item in task_state.get("history") or []
+            ],
         },
         "recording": {
             "center_hz": task.get("center_hz"),
             "bandwidth_hz": task.get("bandwidth_hz"),
-            "sample_rate_hz_model": _or_unknown(sample_rate),
+            "recorded_center_hz": _or_unknown(centre),
+            "recorded_bandwidth_hz": _or_unknown(bandwidth),
+            "sample_rate_hz": _or_unknown(measurement.get("sample_rate_hz")),
             "sample_rate_note": (
-                "Complex sample rate from the sensor's bandwidth model (125 MS/s / 2^k); the WAVE header of "
-                "each part carries the actual value. The EMP 'rate' field is the task repeat interval, not this."
+                "Read from each part's WAVE header and CRFS metadata; 'unknown' when they could not be read. "
+                "The EMP 'rate' field is the task repeat interval, not this."
             ),
             "recording_format": _or_unknown(summary.get("recording_format")),
             "encoding": _encoding_text(summary.get("recording_format")),
             "requested_duration_s": _or_unknown(requested),
-            "held_duration_s": _or_unknown(held),
-            "duration_source": _or_unknown(task.get("duration_source")),
-            "sample_count_estimate": sample_count,
+            "measured_duration_s": _or_unknown(held),
+            "result": _or_unknown(task_state.get("result") or summary.get("result")),
+            "result_reason": _or_unknown(task_state.get("result_reason") or summary.get("result_reason")),
+            "sample_count": sample_count,
             "total_bytes": total_bytes,
             "parts": int(summary.get("parts") or len(files) or 0),
+            "parts_measured": parts,
             "sensor_finished": summary.get("sensor_finished"),
             "stream_lost": summary.get("stream_lost"),
             "outcome": _or_unknown(summary.get("outcome")),
-            "short_capture": bool(task_state.get("short", False)),
+            "partial": bool(task_state.get("short", False)),
             "sensor_warnings": list(summary.get("sensor_warnings") or []),
         },
         "sensor": {
@@ -256,10 +274,12 @@ def build_handover(
 ) -> dict[str, Any]:
     """Session summary: completed / missing / failed items, counts, sizes, checksums."""
     completed: list[dict[str, Any]] = []
+    partial: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     uncertain: list[dict[str, Any]] = []
     logical_captures = 0
+    unmeasured = 0
     file_count = 0
     total_bytes = 0
     held_total = 0.0
@@ -276,8 +296,10 @@ def build_handover(
                 "round_id": rid,
                 "task_key": state.get("task_key"),
                 "label": task.get("band_label", "") + " " + task.get("direction", ""),
-                "window_hz": [task.get("window_start_hz"), task.get("window_stop_hz")],
+                "requested_hz": [task.get("window_start_hz"), task.get("window_stop_hz")],
                 "status": state.get("status"),
+                "result": state.get("result") or UNKNOWN,
+                "attempt": state.get("attempts"),
                 "record_id": state.get("record_id"),
                 "stem": (state.get("summary") or {}).get("stem") or UNKNOWN,
                 "manifest": state.get("manifest_path") or UNKNOWN,
@@ -298,8 +320,15 @@ def build_handover(
                 "requested_s": (state.get("summary") or {}).get("requested_s") or task.get("duration_s"),
             }
             status = state.get("status")
+            result = state.get("result") or ("partial" if state.get("short") else "completed")
+            if status == "confirmed" and result not in {"completed", "partial"}:
+                # Files were found but their duration could not be read.
+                uncertain.append(item)
             if status == "confirmed":
-                completed.append(item)
+                if result == "completed":
+                    completed.append(item)
+                elif result == "partial":
+                    partial.append(item)
                 logical_captures += 1
                 files = state.get("files") or []
                 file_count += len(files)
@@ -310,9 +339,13 @@ def build_handover(
                 if state.get("merged_output"):
                     merged_outputs += 1
                 held = (state.get("summary") or {}).get("held_s")
-                held_total += float(held) if held is not None else float(task.get("duration_s") or 0)
+                if held is not None:
+                    held_total += float(held)
+                else:
+                    unmeasured += 1
                 if state.get("short"):
-                    warnings.append(f"{item['label']} in {rid}: short capture ({held} s of {item['requested_s']} s).")
+                    shown = f"{float(held):.3f} s" if held is not None else "unknown duration"
+                    warnings.append(f"{item['label']} in {rid}: partial recording ({shown} of {item['requested_s']} s).")
                 quality = state.get("quality") or {}
                 for flag in quality.get("flags") or []:
                     if flag == "not_wave":
@@ -354,6 +387,9 @@ def build_handover(
             "rounds_finished": sum(1 for r in rounds if r.get("status") in {"done", "partial", "failed", "stopped"}),
             "rounds_missed": len(missed_rounds),
             "logical_captures_confirmed": logical_captures,
+            "completed": len(completed),
+            "partial": len(partial),
+            "captures_duration_unknown": unmeasured,
             "files": file_count,
             "files_verified_locally": verified_files,
             "derived_images": derived_images,
@@ -366,6 +402,7 @@ def build_handover(
             "content_not_inspected": len(not_inspected),
         },
         "completed": completed,
+        "partial": partial,
         "uncertain": uncertain,
         "failed": failed,
         "not_recorded": missing,
@@ -389,15 +426,24 @@ def handover_markdown(data: dict[str, Any]) -> str:
         "",
         f"- Rounds: {counts.get('rounds_finished', 0)} finished of {counts.get('rounds_total', 0)}, "
         f"{counts.get('rounds_missed', 0)} missed",
-        f"- Logical captures confirmed: {counts.get('logical_captures_confirmed', 0)} "
-        f"({counts.get('files', 0)} files, {counts.get('files_verified_locally', 0)} verified locally, "
-        f"{counts.get('total_bytes', 0):,} bytes, {counts.get('held_seconds_total', 0)} s of IQ held)",
+        f"- Recordings with files: {counts.get('logical_captures_confirmed', 0)} "
+        f"(completed {counts.get('completed', 0)}, partial {counts.get('partial', 0)}; "
+        f"{counts.get('files', 0)} files, {counts.get('files_verified_locally', 0)} verified locally, "
+        f"{counts.get('total_bytes', 0):,} bytes, {counts.get('held_seconds_total', 0)} s of IQ measured"
+        + (f", {counts.get('captures_duration_unknown')} with unknown duration" if counts.get("captures_duration_unknown") else "")
+        + ")",
         f"- Derived images (previews): {counts.get('derived_images', 0)}  ·  Merged outputs: {counts.get('merged_outputs', 0)} "
         "(counted separately from the original recordings)",
         f"- Uncertain: {counts.get('uncertain', 0)}  ·  Failed: {counts.get('failed', 0)}  ·  Not recorded: {counts.get('not_recorded', 0)}",
         "",
     ]
-    for title, key in (("Completed", "completed"), ("Uncertain", "uncertain"), ("Failed", "failed"), ("Not recorded", "not_recorded")):
+    for title, key in (
+        ("Completed", "completed"),
+        ("Partial", "partial"),
+        ("Uncertain", "uncertain"),
+        ("Failed", "failed"),
+        ("Not recorded", "not_recorded"),
+    ):
         items = data.get(key) or []
         lines.append(f"## {title} ({len(items)})")
         for item in items:
