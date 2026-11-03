@@ -30,7 +30,9 @@ if defined CRFS_SIGN_PFX set "SIGNING=1"
 
 echo Building one-file exe...
 set "CRFS_BUILD_ONEDIR="
-".venv\Scripts\pyinstaller.exe" --noconfirm --clean CRFS_IQ_Recorder.spec
+rem PyInstaller is started through python.exe: the pyinstaller.exe launcher is an
+rem unsigned stub that application control (Device Guard / Smart App Control) can refuse.
+".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean CRFS_IQ_Recorder.spec
 if errorlevel 1 goto :error
 
 if "%SIGNING%"=="1" (
@@ -53,7 +55,7 @@ goto :done
 echo.
 echo Building folder layout for the installer...
 set "CRFS_BUILD_ONEDIR=1"
-".venv\Scripts\pyinstaller.exe" --noconfirm --clean --distpath dist\onedir --workpath build\onedir CRFS_IQ_Recorder.spec
+".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --distpath dist\onedir --workpath build\onedir CRFS_IQ_Recorder.spec
 set "CRFS_BUILD_ONEDIR="
 if errorlevel 1 goto :error
 if "%SIGNING%"=="1" (

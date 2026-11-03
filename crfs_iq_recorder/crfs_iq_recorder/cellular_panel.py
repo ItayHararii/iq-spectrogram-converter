@@ -1,10 +1,12 @@
-"""Cellular Collection panel: a compact, collapsible section of the main window.
+"""Cellular Collection panel: a collapsible section of the main window.
 
-Excel file and worksheet → recording duration → wait → run now or schedule →
-Start / Pause / Resume / Stop after current, with a one-line progress text.
-Everything heavy (workbook import, identity check, downloads, Excel updates)
-runs off the UI thread through the host's job helper or the runner; this
-module only draws and forwards. Diagnostics go to the activity log.
+Workflow order, top to bottom: Excel file and worksheet → recording duration
+and wait → run now or schedule (date, start times, repeat daily) → the action
+bar (Preview, Start, Pause / Resume, Stop) with a one-line status. The action
+bar is a separate widget so the main window can keep it in view under the
+scrolling form. Everything heavy (workbook import, identity check, downloads,
+Excel updates) runs off the UI thread through the host's job helper or the
+runner; this module only draws and forwards. Diagnostics go to the activity log.
 """
 
 from __future__ import annotations
@@ -14,7 +16,8 @@ from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QSize, Qt
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -71,11 +74,16 @@ from .cellular_runner import (
 from .cellular_scheduler import MODE_NOW, MODE_TIMES, Schedule, ScheduleTimeZone, tight_schedule_warning
 from .cellular_workbook import layout_from_import, plan_rows_from_import
 from .json_store import read_json, write_json
+from .theme import CONTROL_H, LABEL_W, current_palette, glyph_icon, restyle
 
 SETTINGS_NAME = "settings.json"
 DEFAULT_WAIT_S = 10.0
 DEFAULT_DURATION_S = 5.0
 MAX_START_TIMES = 12
+SPIN_W = 124  # duration / wait / repeat spin boxes
+_THEME_EVENTS = (QEvent.Type.StyleChange, QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange)
+
+STOP_TOOLTIP = "Stops after the current recording: it finishes and is written to Excel, nothing else is recorded."
 
 
 # ----------------------------------------------------------------------------- settings
@@ -170,6 +178,57 @@ def _same_file(first: str | Path, second: str | Path) -> bool:
         return str(first).strip().lower() == str(second).strip().lower()
 
 
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("" if count == 1 else "s")
+
+
+# ----------------------------------------------------------------------------- small widgets
+class ElideLabel(QLabel):
+    """A one-line label that elides long text instead of widening its row; the
+    full text is the tooltip."""
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(text, parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(40)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        super().setText(text)
+        self.setToolTip(text if self.fontMetrics().horizontalAdvance(text) > 160 else "")
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        hint = super().minimumSizeHint()
+        return QSize(40, hint.height())
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        del event
+        painter = QPainter(self)
+        rect = self.contentsRect()
+        text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight, rect.width())
+        self.style().drawItemText(painter, rect, int(self.alignment()), self.palette(), self.isEnabled(), text, self.foregroundRole())
+
+
+class FieldLabel(QLabel):
+    """Right-aligned caption of a form row, sharing one column width with the main form."""
+
+    def __init__(self, text: str, parent=None) -> None:
+        super().__init__(text, parent)
+        self.setMinimumWidth(LABEL_W)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(CONTROL_H)
+
+
+def _ghost(text: str, *, tooltip: str = "") -> QPushButton:
+    button = QPushButton(text)
+    button.setObjectName("ghost")
+    button.setAutoDefault(False)
+    button.setFixedHeight(CONTROL_H)
+    if tooltip:
+        button.setToolTip(tooltip)
+    return button
+
+
 # ----------------------------------------------------------------------------- preview
 class PlanPreviewDialog(QDialog):
     """What will be recorded, row by row, before Start — including any sequential windows."""
@@ -177,15 +236,18 @@ class PlanPreviewDialog(QDialog):
     def __init__(self, plan: CellularPlan, *, wait_s: float, rows_total: int, notes: list[str] | None = None, start_label: str | None = None, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Cellular Collection")
-        self.resize(760, 480)
+        self.resize(760, 500)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
         windows = len(plan.tasks)
         summary = QLabel(
-            f"{rows_total} protocol row(s)"
-            + (f", recorded as {windows} captures per pass" if windows != rows_total else "")
+            _plural(rows_total, "protocol row")
+            + (f" · recorded as {windows} captures per pass" if windows != rows_total else "")
             + f" · {format_seconds(plan.capture_seconds)} of IQ per pass · about {format_bytes(plan.estimated_bytes)} per pass"
             + f" · ≈ {format_seconds(plan.estimated_round_seconds(wait_s))} per pass with {format_seconds(wait_s)} waits"
         )
+        summary.setObjectName("summary")
         summary.setWordWrap(True)
         layout.addWidget(summary)
         for text in [plan.window_note, *(notes or [])]:
@@ -199,6 +261,9 @@ class PlanPreviewDialog(QDialog):
         tree.setHeaderLabels(["Row", "Band", "Direction", "Recorded as", "Duration"])
         tree.setRootIsDecorated(False)
         tree.setAlternatingRowColors(True)
+        tree.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
+        tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        tree.setEditTriggers(QTreeWidget.EditTrigger.NoEditTriggers)
         for task in plan.tasks:
             recorded = f"{task.window_start_hz / 1e6:g}–{task.window_stop_hz / 1e6:g} MHz"
             if task.window_count > 1:
@@ -206,8 +271,10 @@ class PlanPreviewDialog(QDialog):
             item = QTreeWidgetItem([str(task.row), task.band_label, task.direction, recorded, f"{task.duration_s:g} s"])
             tree.addTopLevelItem(item)
         header = tree.header()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setStretchLastSection(True)
+        header.setStretchLastSection(False)
+        for column in (0, 1, 2, 4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(tree, 1)
         problems = [i for i in plan.issues if i.level in {"error", LEVEL_WARNING}]
         if problems:
@@ -219,6 +286,7 @@ class PlanPreviewDialog(QDialog):
         buttons = QDialogButtonBox()
         if start_label:
             ok = buttons.addButton(start_label, QDialogButtonBox.ButtonRole.AcceptRole)
+            ok.setObjectName("primary")
             ok.setEnabled(plan.ready)
         buttons.addButton(QDialogButtonBox.StandardButton.Close)
         buttons.accepted.connect(self.accept)
@@ -228,11 +296,29 @@ class PlanPreviewDialog(QDialog):
 
 # ----------------------------------------------------------------------------- panel
 class CellularPanel(QFrame):
-    """Collapsible "Cellular Collection" section for the main window."""
+    """Collapsible "Cellular Collection" section for the main window.
+
+    ``action_bar`` (Preview / Start / Pause / Resume / Stop with the status
+    line) is created with the header; the host may take it with
+    ``detach_action_bar()`` and keep it under the scrolling form. It is shown
+    while the section is expanded.
+    """
+
+    CHIPS = {
+        S_RUNNING: ("Recording", "badgeAccent"),
+        S_WAITING: ("Waiting", "badgeAccent"),
+        S_WAITING_SCHEDULE: ("Scheduled", "badgeAccent"),
+        S_PAUSE_REQUESTED: ("Pausing", "badgeWait"),
+        S_PAUSED: ("Paused", "badgeWait"),
+        S_PAUSED_BACKLOG: ("Paused", "badgeWait"),
+        S_STOP_REQUESTED: ("Stopping", "badgeWait"),
+        S_INTERRUPTED: ("Interrupted", "badgeBad"),
+        S_DONE: ("Finished", "badgeOk"),
+    }
 
     def __init__(self, runner: CellularRunner, *, host, config_dir: Path, parent=None) -> None:
         super().__init__(parent)
-        self.setObjectName("inputWrap")
+        self.setObjectName("section")
         self.runner = runner
         self.host = host
         self._config_dir = Path(config_dir)
@@ -244,7 +330,9 @@ class CellularPanel(QFrame):
         self._importing = False
         self._identity_pending = False
         self._built = False
+        self._details_open = False
         self._build_header()
+        self._build_action_bar()
         self.runner.status_changed.connect(self._on_status)
         self.runner.session_changed.connect(self._refresh_recovery)
         self.runner.log.connect(self._on_runner_log)
@@ -256,23 +344,74 @@ class CellularPanel(QFrame):
     # ------------------------------------------------------------------ construction
     def _build_header(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(12, 8, 12, 10)
-        outer.setSpacing(8)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
         head = QHBoxLayout()
-        self.toggle_btn = QPushButton("▸ Cellular Collection")
-        self.toggle_btn.setObjectName("ghost")
+        head.setSpacing(8)
+        self.toggle_btn = QPushButton("Cellular Collection")
+        self.toggle_btn.setObjectName("sectionToggle")
         self.toggle_btn.setAutoDefault(False)
         self.toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle_btn.setIconSize(QSize(14, 14))
+        self.toggle_btn.setToolTip("Show or hide the Cellular Collection form")
+        self.toggle_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.toggle_btn.clicked.connect(lambda: self._set_expanded(self.body.isHidden()))
-        head.addWidget(self.toggle_btn)
-        head.addStretch(1)
-        self.chip = QLabel("Off")
-        self.chip.setObjectName("muted")
-        head.addWidget(self.chip)
+        head.addWidget(self.toggle_btn, 1)
+        self.chip = QLabel("Idle")
+        self.chip.setObjectName("badgeIdle")
+        self.chip.setToolTip("State of the collection")
+        head.addWidget(self.chip, 0, Qt.AlignmentFlag.AlignVCenter)
         outer.addLayout(head)
         self.body = QWidget()
+        self.body.setObjectName("section")
         self.body.setVisible(False)
         outer.addWidget(self.body)
+        self._bar_slot = outer
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self._refresh_icons()
+
+    def _build_action_bar(self) -> None:
+        bar = QFrame()
+        bar.setObjectName("actionBar")
+        bar.setVisible(False)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(14, 8, 14, 8)
+        row.setSpacing(8)
+        texts = QVBoxLayout()
+        texts.setContentsMargins(0, 0, 0, 0)
+        texts.setSpacing(1)
+        self.status_label = ElideLabel("Idle")
+        self.status_label.setObjectName("summary")
+        self.detail_label = ElideLabel("")
+        self.detail_label.setObjectName("muted")
+        self.detail_label.setVisible(False)
+        texts.addWidget(self.status_label)
+        texts.addWidget(self.detail_label)
+        row.addLayout(texts, 1)
+        self.preview_btn = _ghost("Preview", tooltip="The rows that will be recorded, in order, with the exact range of every capture")
+        self.preview_btn.clicked.connect(lambda: self._show_preview(start=False))
+        self.start_btn = QPushButton("Start")
+        self.start_btn.setObjectName("primary")
+        self.start_btn.setAutoDefault(False)
+        self.start_btn.setMinimumWidth(96)
+        self.start_btn.setToolTip("Check the connected sensor, show the preview, then record the list")
+        self.start_btn.clicked.connect(self._start_clicked)
+        self.pause_btn = _ghost("Pause", tooltip="Finish the current recording, then wait")
+        self.pause_btn.clicked.connect(self.runner.pause)
+        self.resume_btn = _ghost("Resume", tooltip="Continue with the next recording")
+        self.resume_btn.clicked.connect(self.runner.resume)
+        self.stop_btn = _ghost("Stop", tooltip=STOP_TOOLTIP)
+        self.stop_btn.clicked.connect(self._stop)
+        for button in (self.preview_btn, self.start_btn, self.pause_btn, self.resume_btn, self.stop_btn):
+            row.addWidget(button, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.action_bar = bar
+        self._bar_slot.addWidget(bar)
+
+    def detach_action_bar(self) -> QWidget:
+        """Hand the action bar to the host (it is removed from the panel's own layout)."""
+        self._bar_slot.removeWidget(self.action_bar)
+        self.action_bar.setParent(None)
+        return self.action_bar
 
     def _ensure_built(self) -> None:
         if self._built:
@@ -285,120 +424,165 @@ class CellularPanel(QFrame):
 
     def _build_body(self) -> None:
         body = QVBoxLayout(self.body)
-        body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(8)
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(6)
-        grid.setColumnStretch(1, 1)
+        body.setContentsMargins(0, 2, 0, 4)
+        body.setSpacing(10)
 
-        # Excel file and worksheet
-        grid.addWidget(QLabel("Excel file"), 0, 0)
+        # Recovery notice (interrupted session, missed pass) — at the top, where it is seen first.
+        self.recovery = QFrame()
+        self.recovery.setObjectName("notice")
+        rec = QVBoxLayout(self.recovery)
+        rec.setContentsMargins(12, 10, 12, 10)
+        rec.setSpacing(8)
+        self.recovery_label = QLabel("")
+        self.recovery_label.setWordWrap(True)
+        rec.addWidget(self.recovery_label)
+        rec_buttons = QHBoxLayout()
+        rec_buttons.setSpacing(8)
+        self.reconcile_btn = _ghost("Check with the sensor")
+        self.reconcile_btn.clicked.connect(self._reconcile)
+        self.resume_session_btn = _ghost("Continue")
+        self.resume_session_btn.clicked.connect(self._resume_after_restart)
+        self.skip_uncertain_btn = _ghost("Skip uncertain")
+        self.skip_uncertain_btn.clicked.connect(self._skip_uncertain)
+        self.run_missed_btn = _ghost("Run the missed pass now")
+        self.run_missed_btn.clicked.connect(self._run_missed)
+        self.skip_missed_btn = _ghost("Skip it")
+        self.skip_missed_btn.clicked.connect(self._skip_missed)
+        self.discard_btn = _ghost("Dismiss")
+        self.discard_btn.clicked.connect(self._discard)
+        for button in (self.reconcile_btn, self.resume_session_btn, self.skip_uncertain_btn, self.run_missed_btn, self.skip_missed_btn, self.discard_btn):
+            rec_buttons.addWidget(button)
+        rec_buttons.addStretch(1)
+        rec.addLayout(rec_buttons)
+        self.recovery.setVisible(False)
+        body.addWidget(self.recovery)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+        grid.setColumnMinimumWidth(0, LABEL_W)
+        grid.setColumnStretch(1, 1)
+        row = 0
+
+        # 1. Excel file and worksheet
+        grid.addWidget(FieldLabel("Excel file"), row, 0)
         file_row = QHBoxLayout()
-        file_row.setSpacing(6)
+        file_row.setSpacing(8)
         self.workbook_edit = QLineEdit()
         self.workbook_edit.setPlaceholderText("Protocol workbook (.xlsx / .xlsm)")
         self.workbook_edit.setReadOnly(True)
-        self.browse_btn = QPushButton("Browse…")
-        self.browse_btn.setObjectName("ghost")
-        self.browse_btn.setAutoDefault(False)
+        self.workbook_edit.setFixedHeight(CONTROL_H)
+        self.workbook_edit.setToolTip("The protocol workbook; each row of the worksheet is one recording")
+        self.browse_btn = _ghost("Browse…", tooltip="Choose the protocol workbook")
         self.browse_btn.clicked.connect(self._browse_workbook)
-        self.reload_btn = QPushButton("Reload")
-        self.reload_btn.setObjectName("ghost")
-        self.reload_btn.setAutoDefault(False)
-        self.reload_btn.setToolTip("Read the worksheet again (after editing the protocol)")
+        self.reload_btn = _ghost("Reload", tooltip="Read the worksheet again (after editing the protocol)")
         self.reload_btn.clicked.connect(lambda: self._import(force=True))
         file_row.addWidget(self.workbook_edit, 1)
         file_row.addWidget(self.browse_btn)
         file_row.addWidget(self.reload_btn)
-        grid.addLayout(file_row, 0, 1)
-        grid.addWidget(QLabel("Worksheet"), 1, 0)
+        grid.addLayout(file_row, row, 1)
+        row += 1
+
+        grid.addWidget(FieldLabel("Worksheet"), row, 0)
+        sheet_row = QHBoxLayout()
+        sheet_row.setSpacing(8)
         self.sheet_combo = QComboBox()
+        self.sheet_combo.setFixedHeight(CONTROL_H)
+        self.sheet_combo.setMinimumWidth(220)
         self.sheet_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.sheet_combo.setToolTip("The worksheet whose rows are recorded, in their order")
         self.sheet_combo.currentIndexChanged.connect(self._on_sheet_changed)
-        grid.addWidget(self.sheet_combo, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        sheet_row.addWidget(self.sheet_combo)
+        sheet_row.addStretch(1)
+        grid.addLayout(sheet_row, row, 1)
+        row += 1
+
+        summary_row = QHBoxLayout()
+        summary_row.setSpacing(8)
         self.import_label = QLabel("Load the protocol workbook.")
         self.import_label.setObjectName("muted")
         self.import_label.setWordWrap(True)
-        grid.addWidget(self.import_label, 2, 1)
+        self.import_label.setMinimumHeight(24)
+        self.details_btn = QPushButton("Details")
+        self.details_btn.setObjectName("linkBtn")
+        self.details_btn.setAutoDefault(False)
+        self.details_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.details_btn.setToolTip("Capture window of the sensor, sequential windows and other notes about this plan")
+        self.details_btn.setVisible(False)
+        self.details_btn.clicked.connect(lambda: self._show_details(not self._details_open))
+        summary_row.addWidget(self.import_label, 1)
+        summary_row.addWidget(self.details_btn, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addLayout(summary_row, row, 1)
+        row += 1
+        self.details_label = QLabel("")
+        self.details_label.setObjectName("muted")
+        self.details_label.setWordWrap(True)
+        self.details_label.setVisible(False)
+        grid.addWidget(self.details_label, row, 1)
+        row += 1
 
-        # Duration and wait
-        grid.addWidget(QLabel("Recording duration"), 3, 0)
+        # 2. Duration and wait
+        grid.addWidget(FieldLabel("Recording duration"), row, 0)
         duration_row = QHBoxLayout()
-        duration_row.setSpacing(6)
+        duration_row.setSpacing(8)
         self.duration_spin = QDoubleSpinBox()
         self.duration_spin.setDecimals(1)
         self.duration_spin.setRange(0.5, 3600.0)
         self.duration_spin.setSingleStep(1.0)
         self.duration_spin.setSuffix(" s")
+        self.duration_spin.setFixedSize(SPIN_W, CONTROL_H)
+        self.duration_spin.setToolTip("Seconds recorded for every row")
         self.duration_spin.setValue(self.settings.duration_s if self.settings.duration_s >= 0.5 else DEFAULT_DURATION_S)
         self.duration_spin.valueChanged.connect(self._rebuild_plan)
         duration_row.addWidget(self.duration_spin)
-        self.window_label = QLabel("")
-        self.window_label.setObjectName("muted")
-        self.window_label.setWordWrap(True)
-        duration_row.addWidget(self.window_label, 1)
-        grid.addLayout(duration_row, 3, 1)
-        grid.addWidget(QLabel("Wait between recordings"), 4, 0)
+        duration_hint = QLabel("per row")
+        duration_hint.setObjectName("muted")
+        duration_row.addWidget(duration_hint)
+        duration_row.addStretch(1)
+        grid.addLayout(duration_row, row, 1)
+        row += 1
+
+        grid.addWidget(FieldLabel("Wait between recordings"), row, 0)
         wait_row = QHBoxLayout()
-        wait_row.setSpacing(6)
+        wait_row.setSpacing(8)
         self.wait_spin = QSpinBox()
         self.wait_spin.setRange(0, 24 * 3600)
         self.wait_spin.setSuffix(" s")
+        self.wait_spin.setFixedSize(SPIN_W, CONTROL_H)
+        self.wait_spin.setToolTip("Pause after each confirmed recording before the next row")
         self.wait_spin.setValue(int(round(self.settings.wait_s)))
         wait_row.addWidget(self.wait_spin)
         wait_row.addStretch(1)
-        grid.addLayout(wait_row, 4, 1)
+        grid.addLayout(wait_row, row, 1)
+        row += 1
 
-        # Run now / schedule
-        grid.addWidget(QLabel("When"), 5, 0, alignment=Qt.AlignmentFlag.AlignTop)
-        when = QVBoxLayout()
-        when.setSpacing(6)
+        # 3. Run now / schedule
+        grid.addWidget(FieldLabel("Start"), row, 0)
         mode_row = QHBoxLayout()
-        mode_row.setSpacing(12)
+        mode_row.setSpacing(20)
         self.run_now = QRadioButton("Run now")
+        self.run_now.setToolTip("Record the list as soon as you press Start")
         self.run_times = QRadioButton("Schedule")
+        self.run_times.setToolTip("Record the list at chosen times of day (this computer's local time)")
         (self.run_times if self.settings.schedule_mode == MODE_TIMES else self.run_now).setChecked(True)
         self.run_now.toggled.connect(lambda on: self._on_schedule_mode(not on))
         mode_row.addWidget(self.run_now)
         mode_row.addWidget(self.run_times)
         mode_row.addStretch(1)
-        when.addLayout(mode_row)
-        self.schedule_box = QWidget()
-        schedule = QGridLayout(self.schedule_box)
-        schedule.setContentsMargins(0, 0, 0, 0)
-        schedule.setHorizontalSpacing(8)
-        schedule.setVerticalSpacing(6)
-        schedule.addWidget(QLabel("Start times"), 0, 0, alignment=Qt.AlignmentFlag.AlignTop)
-        saved_times = [t for t in (_parse_time(x) for x in self.settings.times) if t is not None]
-        self.times_field = TimesField(saved_times, maximum=MAX_START_TIMES)
-        schedule.addWidget(self.times_field, 0, 1)
-        schedule.addWidget(QLabel("Date"), 1, 0)
-        try:
-            saved_date = date.fromisoformat(self.settings.schedule_date) if self.settings.schedule_date else None
-        except ValueError:
-            saved_date = None
-        if saved_date is not None and saved_date < date.today():
-            saved_date = None
-        date_row = QHBoxLayout()
-        date_row.setSpacing(10)
-        self.date_field = DateField(saved_date or date.today(), minimum=date.today())
-        self.date_field.setMaximumWidth(220)
-        date_row.addWidget(self.date_field)
-        self.daily_check = QCheckBox("Repeat daily")
-        self.daily_check.setChecked(self.settings.daily)
-        self.daily_check.toggled.connect(self._on_daily)
-        date_row.addWidget(self.daily_check)
-        date_row.addStretch(1)
-        schedule.addLayout(date_row, 1, 1)
-        when.addWidget(self.schedule_box)
+        grid.addLayout(mode_row, row, 1)
+        row += 1
+
+        # Run now: how many passes.
+        self.repeat_label = FieldLabel("Repeat")
+        grid.addWidget(self.repeat_label, row, 0)
         repeat_row = QHBoxLayout()
-        repeat_row.setSpacing(8)
-        self.repeat_label = QLabel("Repeat")
-        repeat_row.addWidget(self.repeat_label)
+        repeat_row.setSpacing(12)
         self.repeat_spin = QSpinBox()
         self.repeat_spin.setRange(1, 999)
         self.repeat_spin.setSuffix(" pass(es)")
+        self.repeat_spin.setFixedSize(SPIN_W + 16, CONTROL_H)
+        self.repeat_spin.setToolTip("How many times the whole list is recorded, back to back")
         self.repeat_spin.setValue(self.settings.repeat)
         repeat_row.addWidget(self.repeat_spin)
         self.until_stopped = QCheckBox("Until stopped")
@@ -407,91 +591,91 @@ class CellularPanel(QFrame):
         self.repeat_spin.setEnabled(not self.settings.until_stopped)
         repeat_row.addWidget(self.until_stopped)
         repeat_row.addStretch(1)
-        when.addLayout(repeat_row)
-        grid.addLayout(when, 5, 1)
+        self.repeat_box = QWidget()
+        self.repeat_box.setObjectName("section")
+        repeat_host = QHBoxLayout(self.repeat_box)
+        repeat_host.setContentsMargins(0, 0, 0, 0)
+        repeat_host.addLayout(repeat_row)
+        grid.addWidget(self.repeat_box, row, 1)
+        row += 1
+
+        # Schedule: date, start times, repeat daily (only when Schedule is selected).
+        self.schedule_box = QWidget()
+        self.schedule_box.setObjectName("section")
+        schedule = QGridLayout(self.schedule_box)
+        schedule.setContentsMargins(0, 0, 0, 0)
+        schedule.setHorizontalSpacing(12)
+        schedule.setVerticalSpacing(10)
+        schedule.setColumnMinimumWidth(0, LABEL_W)
+        schedule.setColumnStretch(1, 1)
+        schedule.addWidget(FieldLabel("Date"), 0, 0)
+        try:
+            saved_date = date.fromisoformat(self.settings.schedule_date) if self.settings.schedule_date else None
+        except ValueError:
+            saved_date = None
+        if saved_date is not None and saved_date < date.today():
+            saved_date = None
+        date_row = QHBoxLayout()
+        date_row.setSpacing(16)
+        self.date_field = DateField(saved_date or date.today(), minimum=date.today())
+        self.date_field.setFixedWidth(200)
+        self.date_field.setToolTip("The day of the scheduled pass (click to open the calendar)")
+        date_row.addWidget(self.date_field)
+        self.daily_check = QCheckBox("Repeat daily")
+        self.daily_check.setToolTip("Record at the start times every day until stopped")
+        self.daily_check.setChecked(self.settings.daily)
+        self.daily_check.toggled.connect(self._on_daily)
+        date_row.addWidget(self.daily_check)
+        date_row.addStretch(1)
+        schedule.addLayout(date_row, 0, 1)
+        times_label = FieldLabel("Start times")
+        times_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        schedule.addWidget(times_label, 1, 0, alignment=Qt.AlignmentFlag.AlignTop)
+        saved_times = [t for t in (_parse_time(x) for x in self.settings.times) if t is not None]
+        self.times_field = TimesField(saved_times, maximum=MAX_START_TIMES)
+        self.times_field.setToolTip("One pass starts at each time; times are this computer's local time")
+        schedule.addWidget(self.times_field, 1, 1)
+        grid.addWidget(self.schedule_box, row, 0, 1, 2)
+        row += 1
+
         body.addLayout(grid)
-
-        # Buttons
-        buttons = QHBoxLayout()
-        buttons.setSpacing(8)
-        self.preview_btn = QPushButton("Preview")
-        self.preview_btn.setObjectName("ghost")
-        self.preview_btn.setAutoDefault(False)
-        self.preview_btn.clicked.connect(lambda: self._show_preview(start=False))
-        self.start_btn = QPushButton("Start")
-        self.start_btn.setObjectName("primary")
-        self.start_btn.setAutoDefault(False)
-        self.start_btn.clicked.connect(self._start_clicked)
-        self.pause_btn = QPushButton("Pause")
-        self.pause_btn.setObjectName("ghost")
-        self.pause_btn.setAutoDefault(False)
-        self.pause_btn.clicked.connect(self.runner.pause)
-        self.resume_btn = QPushButton("Resume")
-        self.resume_btn.setObjectName("ghost")
-        self.resume_btn.setAutoDefault(False)
-        self.resume_btn.clicked.connect(self.runner.resume)
-        self.stop_btn = QPushButton("Stop after current recording")
-        self.stop_btn.setObjectName("ghost")
-        self.stop_btn.setAutoDefault(False)
-        self.stop_btn.clicked.connect(self._stop)
-        for button in (self.preview_btn, self.start_btn, self.pause_btn, self.resume_btn, self.stop_btn):
-            buttons.addWidget(button)
-        buttons.addStretch(1)
-        body.addLayout(buttons)
-
-        # Progress line and pending indicator
-        self.status_label = QLabel("Idle")
-        self.status_label.setWordWrap(True)
-        body.addWidget(self.status_label)
-        self.detail_label = QLabel("")
-        self.detail_label.setObjectName("muted")
-        self.detail_label.setWordWrap(True)
-        self.detail_label.setVisible(False)
-        body.addWidget(self.detail_label)
-
-        # Recovery (interrupted session, missed pass)
-        self.recovery = QFrame()
-        self.recovery.setObjectName("inputWrap")
-        rec = QVBoxLayout(self.recovery)
-        rec.setContentsMargins(10, 8, 10, 8)
-        rec.setSpacing(6)
-        self.recovery_label = QLabel("")
-        self.recovery_label.setWordWrap(True)
-        rec.addWidget(self.recovery_label)
-        rec_buttons = QHBoxLayout()
-        rec_buttons.setSpacing(8)
-        self.reconcile_btn = QPushButton("Check with the sensor")
-        self.reconcile_btn.clicked.connect(self._reconcile)
-        self.resume_session_btn = QPushButton("Continue")
-        self.resume_session_btn.clicked.connect(self._resume_after_restart)
-        self.skip_uncertain_btn = QPushButton("Skip uncertain")
-        self.skip_uncertain_btn.clicked.connect(self._skip_uncertain)
-        self.run_missed_btn = QPushButton("Run the missed pass now")
-        self.run_missed_btn.clicked.connect(self._run_missed)
-        self.skip_missed_btn = QPushButton("Skip it")
-        self.skip_missed_btn.clicked.connect(self._skip_missed)
-        self.discard_btn = QPushButton("Dismiss")
-        self.discard_btn.clicked.connect(self._discard)
-        for button in (self.reconcile_btn, self.resume_session_btn, self.skip_uncertain_btn, self.run_missed_btn, self.skip_missed_btn, self.discard_btn):
-            button.setObjectName("ghost")
-            button.setAutoDefault(False)
-            rec_buttons.addWidget(button)
-        rec_buttons.addStretch(1)
-        rec.addLayout(rec_buttons)
-        self.recovery.setVisible(False)
-        body.addWidget(self.recovery)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         self._on_schedule_mode(self.run_times.isChecked())
         self._on_daily(self.daily_check.isChecked())
 
     # ------------------------------------------------------------------ small helpers
+    def _refresh_icons(self) -> None:
+        text = QColor(current_palette().text)
+        expanded = not self.body.isHidden()
+        self.toggle_btn.setIcon(glyph_icon("chevron-down" if expanded else "chevron-right", text))
+
+    def changeEvent(self, event: QEvent) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if event.type() in _THEME_EVENTS:
+            self._refresh_icons()
+
     def _set_expanded(self, on: bool) -> None:
         if on:
             self._ensure_built()
         self.body.setVisible(on)
-        self.toggle_btn.setText(("▾ " if on else "▸ ") + "Cellular Collection")
+        self.action_bar.setVisible(on)
+        self.toggle_btn.setToolTip("Hide the Cellular Collection form" if on else "Show the Cellular Collection form")
+        self._refresh_icons()
         self.settings.expanded = on
         self._save_settings()
+
+    def is_expanded(self) -> bool:
+        return not self.body.isHidden()
+
+    def _set_chip(self, text: str, style: str) -> None:
+        self.chip.setText(text)
+        if self.chip.objectName() != style:
+            self.chip.setObjectName(style)
+            restyle(self.chip)
+
+    def _show_details(self, on: bool) -> None:
+        self._details_open = bool(on)
+        self.details_label.setVisible(self._details_open and bool(self.details_label.text()))
+        self.details_btn.setText("Hide details" if self._details_open else "Details")
 
     def _save_settings(self) -> None:
         if self._built:
@@ -552,12 +736,11 @@ class CellularPanel(QFrame):
         self.schedule_box.setVisible(times_on)
         # Run now: passes back to back. Schedule: every listed time (daily until stopped).
         self.repeat_label.setVisible(not times_on)
-        self.repeat_spin.setVisible(not times_on)
-        self.until_stopped.setVisible(not times_on)
+        self.repeat_box.setVisible(not times_on)
 
     def _on_daily(self, daily: bool) -> None:
         self.date_field.setEnabled(not daily)
-        self.date_field.setToolTip("Every day from today" if daily else "")
+        self.date_field.setToolTip("Every day from today" if daily else "The day of the scheduled pass (click to open the calendar)")
 
     # ------------------------------------------------------------------ protocol
     def _load_saved_workbook(self) -> None:
@@ -587,9 +770,9 @@ class CellularPanel(QFrame):
                 # The worksheet stays selected so results are queued for it.
                 self.sheet_combo.addItem(kept.worksheet, kept.worksheet)
                 self.sheet_combo.setCurrentIndex(0)
-                self.import_label.setText(self._kept_text(kept, exc))
+                self._set_import_text(self._kept_text(kept, exc))
             else:
-                self.import_label.setText(str(exc))
+                self._set_import_text(str(exc))
             self.sheet_combo.blockSignals(False)
             return
         for name, visible in sheets:
@@ -623,6 +806,17 @@ class CellularPanel(QFrame):
             "results are queued until the workbook can be written."
         )
 
+    def _set_import_text(self, text: str, *, warn: bool = False, details: str = "") -> None:
+        """The compact summary under the worksheet; long explanations go to Details."""
+        self.import_label.setText(text)
+        name = "warn" if warn else ("summary" if self.plan is not None else "muted")
+        if self.import_label.objectName() != name:
+            self.import_label.setObjectName(name)
+            restyle(self.import_label)
+        self.details_label.setText(details)
+        self.details_btn.setVisible(bool(details))
+        self.details_label.setVisible(self._details_open and bool(details))
+
     def _import(self, *, force: bool, quiet: bool = False) -> None:
         """Read the worksheet (off the UI thread when the host offers a job helper)."""
         path = self.workbook_edit.text().strip()
@@ -632,7 +826,7 @@ class CellularPanel(QFrame):
         self._import_token += 1
         token = self._import_token
         self._importing = True
-        self.import_label.setText("Reading the worksheet…")
+        self._set_import_text("Reading the worksheet…")
         self._sync_buttons(self.runner.status())
 
         def work():
@@ -658,17 +852,18 @@ class CellularPanel(QFrame):
                 kept = self._kept_import(path, error) if error is not None else None
                 if kept is not None and kept.worksheet == sheet:
                     # Locked or unplugged right now: the plan imported earlier stands.
-                    self.import_label.setText(self._kept_text(kept, error))
+                    self._set_import_text(self._kept_text(kept, error), warn=True, details=self._details_text())
                     if not quiet:
                         self._host_log(self.import_label.text(), "error")
                     self._sync_buttons(self.runner.status())
                     return
                 self.imported = None
                 self.plan = None
-                self.import_label.setText(str(result.get("error") if isinstance(result, dict) else "The worksheet could not be read."))
+                self._set_import_text(str(result.get("error") if isinstance(result, dict) else "The worksheet could not be read."), warn=True)
                 if not quiet:
                     self._host_log(self.import_label.text(), "error")
                 self._sync_buttons(self.runner.status())
+                self._on_status(self.runner.status())
                 return
             self.imported = result["imported"]
             try:
@@ -678,7 +873,8 @@ class CellularPanel(QFrame):
             self._rebuild_plan()
             self._save_settings()
             if not quiet:
-                self._host_log(self.import_label.text())
+                self._host_log(self.import_label.text() + (f" {self.details_label.text()}" if self.details_label.text() else ""))
+            self._on_status(self.runner.status())
 
         runner = getattr(self.host, "_start_job", None)
         if runner is None:
@@ -693,40 +889,43 @@ class CellularPanel(QFrame):
         self.plan = build_plan(self.imported, capability, fallback_duration_s=self.duration_seconds())
         rows = len(self.imported.valid_entries())
         windows = len(self.plan.tasks)
-        parts = [f"{rows} row(s) from '{self.imported.worksheet}'"]
+        parts = [_plural(rows, "row")]
         if windows != rows:
-            parts.append(f"recorded as {windows} captures per pass")
-        parts.append(f"≈ {format_bytes(self.plan.estimated_bytes)} per pass")
-        results = len(self.imported.result_rows())
-        if results:
-            parts.append(f"{results} earlier result row(s) kept, not recorded again")
+            parts.append(_plural(windows, "capture"))
+        parts.append(f"Estimated {format_bytes(self.plan.estimated_bytes)}")
         errors = len(self.imported.errors) + len(self.plan.errors)
         if errors:
-            parts.append(f"{errors} problem(s) — see Preview")
-        layout = layout_from_import(self.imported)
-        if not (layout.result or layout.time or layout.duration):
-            parts.append("no result column in this sheet: results stay in the log and the manifests")
-        self.import_label.setText(" · ".join(parts))
-        self.window_label.setText(self._window_text(capability))
+            parts.append(_plural(errors, "problem") + " (see Preview)")
+        self._set_import_text(" · ".join(parts), warn=bool(errors), details=self._details_text(capability))
         self._sync_buttons(self.runner.status())
 
-    def _window_text(self, capability) -> str:
-        if self.plan is None:
+    def _details_text(self, capability=None) -> str:
+        """Sensor capture window, sequential windows, kept result rows: the long version."""
+        if self.plan is None or self.imported is None:
             return ""
+        capability = capability or self._capability()
         window_mhz = self.plan.window_hz / 1e6
         split = [t for t in self.plan.tasks if t.window_count > 1]
         rows_split = len({t.row for t in split})
+        lines: list[str] = []
+        lines.append(f"Worksheet '{self.imported.worksheet}', rows recorded in worksheet order; the estimate is per pass.")
         if self._sensor_model():
             name = readable_sensor_name(capability.model) or capability.model or "this sensor"
-            text = f"{name}: up to {window_mhz:g} MHz per capture at {self.duration_seconds():g} s."
+            lines.append(f"{name}: up to {window_mhz:g} MHz per capture at {self.duration_seconds():g} s.")
         else:
-            text = (
+            lines.append(
                 f"Sensor not verified yet: up to {window_mhz:g} MHz per capture at {self.duration_seconds():g} s "
                 "(conservative figure; the plan is rebuilt for the connected sensor when you press Start)."
             )
         if rows_split:
-            text += f" {rows_split} row(s) wider than that are recorded as sequential windows, each for the full duration."
-        return text
+            lines.append(f"{_plural(rows_split, 'row')} wider than that are recorded as sequential frequency windows, each for the full duration; the windows are recorded one after another, never at the same time.")
+        results = len(self.imported.result_rows())
+        if results:
+            lines.append(f"{_plural(results, 'earlier result row')} kept, not recorded again.")
+        layout = layout_from_import(self.imported)
+        if not (layout.result or layout.time or layout.duration):
+            lines.append("No result column in this worksheet: results stay in the log and the manifests.")
+        return " ".join(lines)
 
     # ------------------------------------------------------------------ schedule / settings
     def _schedule(self) -> tuple[Schedule | None, str | None]:
@@ -803,9 +1002,13 @@ class CellularPanel(QFrame):
             rows_total=len(self.imported.valid_entries()) if self.imported is not None else len({t.row for t in self.plan.tasks}),
             notes=self._notes_before_start(schedule),
             start_label="Start" if start else None,
-            parent=self,
+            parent=self.window(),
         )
-        if dialog.exec() != QDialog.DialogCode.Accepted or not start:
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            dialog.deleteLater()
+        if not accepted or not start:
             return
         self._start(schedule)
 
@@ -881,12 +1084,12 @@ class CellularPanel(QFrame):
     def _on_status(self, status: dict) -> None:
         state = status.get("state", S_IDLE)
         text = status.get("text", "")
-        chip = {
-            S_RUNNING: "Recording", S_WAITING: "Waiting", S_WAITING_SCHEDULE: "Scheduled", S_PAUSE_REQUESTED: "Pausing",
-            S_PAUSED: "Paused", S_PAUSED_BACKLOG: "Paused", S_STOP_REQUESTED: "Stopping", S_INTERRUPTED: "Interrupted",
-            S_DONE: "Finished", S_IDLE: "Off",
-        }.get(state, state)
-        self.chip.setText(chip)
+        if state in self.CHIPS:
+            self._set_chip(*self.CHIPS[state])
+        elif self.plan is not None and self.plan.ready and not self._importing:
+            self._set_chip("Ready", "badgeOk")
+        else:
+            self._set_chip("Idle", "badgeIdle")
         if not self._built:
             if status.get("active") or state in {S_INTERRUPTED, S_DONE} or status.get("missed_rounds"):
                 self._set_expanded(True)
@@ -919,7 +1122,12 @@ class CellularPanel(QFrame):
             self.detail_label.setVisible(bool(details))
         else:
             if not self._identity_pending and not self._importing:
-                self.status_label.setText("Idle" if self.plan is None else "Ready")
+                if self.plan is None:
+                    self.status_label.setText("Idle · load a protocol workbook")
+                elif self.plan.ready:
+                    self.status_label.setText("Ready to start")
+                else:
+                    self.status_label.setText("Fix the problems listed in Preview before starting")
             pending = int(status.get("workbook_pending") or 0)
             if pending:
                 # Results left over from an earlier run are still waiting for the workbook.
@@ -1039,3 +1247,6 @@ class CellularPanel(QFrame):
     def persist(self) -> None:
         """Called by the main window on close."""
         self._save_settings()
+
+
+__all__ = ["CellularPanel", "PanelSettings", "PlanPreviewDialog", "ElideLabel", "FieldLabel", "load_panel_settings", "save_panel_settings", "settings_path"]

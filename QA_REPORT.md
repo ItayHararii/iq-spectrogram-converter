@@ -1,10 +1,61 @@
-# QA report - CRFS IQ Recorder 1.10.0 / 1.9.1 / 1.9.0 / 1.8.10 / 1.8.9 and IQ Spectrogram Converter 1.5.1
+# QA report - CRFS IQ Recorder 1.11.0 / 1.10.0 / 1.9.1 / 1.9.0 / 1.8.10 / 1.8.9 and IQ Spectrogram Converter 1.5.1
 
-Five passes plus a follow-up. Part D (2 November 2026, night) simplified the Cellular Collection to the operator's workflow (the protocol rows are the plan and the result rows, nine columns, compact panel, local-time pickers), fixed the four reliability faults found in the review of the 18:44 run and three more found on the sensor during this pass, and ran the complete path from capture to Excel on the Node 100-18; it produced Recorder 1.10.0. Part C.1 (2 November 2026, evening) ran the Cellular Collection against the operator's own protocol workbook, fixed the import defects that surfaced and added the results sheets in the protocol workbook; it produced Recorder 1.9.1. Part C (2 November 2026) added the Cellular Collection feature and produced Recorder 1.9.0. Part 0 (1 November 2026) fixed the "Time elapsed - file not confirmed" status, investigated why the Node splits recordings, and added the optional merge of recording parts; it produced Recorder 1.8.10 (the Converter did not need a change). Part 1 (31 October 2026) ran against the same RFeye Node and produced Recorder 1.8.9 and Converter 1.5.1. Part 2 (30 October 2026) is the earlier simulation-only pass that produced 1.8.8 / 1.5.0; all are kept unchanged below except where a later result supersedes a statement.
+Six passes plus a follow-up. Part E (3 November 2026, morning) polished the GUI - the Cellular Collection panel above all - and removed the measured window-construction and theme-switch slowness; it produced Recorder 1.11.0 with no change to recording, Excel or scheduling behaviour. Part D (2 November 2026, night) simplified the Cellular Collection to the operator's workflow (the protocol rows are the plan and the result rows, nine columns, compact panel, local-time pickers), fixed the four reliability faults found in the review of the 18:44 run and three more found on the sensor during this pass, and ran the complete path from capture to Excel on the Node 100-18; it produced Recorder 1.10.0. Part C.1 (2 November 2026, evening) ran the Cellular Collection against the operator's own protocol workbook, fixed the import defects that surfaced and added the results sheets in the protocol workbook; it produced Recorder 1.9.1. Part C (2 November 2026) added the Cellular Collection feature and produced Recorder 1.9.0. Part 0 (1 November 2026) fixed the "Time elapsed - file not confirmed" status, investigated why the Node splits recordings, and added the optional merge of recording parts; it produced Recorder 1.8.10 (the Converter did not need a change). Part 1 (31 October 2026) ran against the same RFeye Node and produced Recorder 1.8.9 and Converter 1.5.1. Part 2 (30 October 2026) is the earlier simulation-only pass that produced 1.8.8 / 1.5.0; all are kept unchanged below except where a later result supersedes a statement.
 
-Releases: Recorder 1.10.0 (tag `v1.10.0`), Converter 1.5.1 (tag `converter-v1.5.1`). Previous: 1.9.1 (`v1.9.1`), 1.9.0 (`v1.9.0`), 1.8.10 (`v1.8.10`), 1.8.9 (`v1.8.9`), 1.8.8 (`v1.8.8`), 1.5.0 (`converter-v1.5.0`), 1.8.7 (`v1.8.7`), 1.4.0 (`converter-v1.4.0`). All earlier releases stay on GitHub.
+Releases: Recorder 1.11.0 (tag `v1.11.0`), Converter 1.5.1 (tag `converter-v1.5.1`). Previous: 1.10.0 (`v1.10.0`), 1.9.1 (`v1.9.1`), 1.9.0 (`v1.9.0`), 1.8.10 (`v1.8.10`), 1.8.9 (`v1.8.9`), 1.8.8 (`v1.8.8`), 1.5.0 (`converter-v1.5.0`), 1.8.7 (`v1.8.7`), 1.4.0 (`converter-v1.4.0`). All earlier releases stay on GitHub.
 
 Legend used throughout: **Hardware** = executed against the real sensor in this pass; **Simulated** = executed against the demo transport, a local proxy or synthetic files; **Untested** = not executed.
+
+---
+
+# Part E - GUI polish and the construction / theme-switch slowness (3 November 2026, Recorder 1.11.0)
+
+## Scope
+
+A presentation pass on the Recorder: the collapsible Cellular Collection panel, the main form, the SFTP browser and Settings were brought to one grid (36 px controls, 40 px primary button, 150 px label column, one spacing scale, one typography scale) in both themes, and the window-construction and theme-switch times measured in Part D were investigated and fixed. Recording, Excel and scheduling code was not changed (`cellular_runner`, `cellular_workbook`, `cellular_protocol`, `emp_client`, `emp_stream`, `sftp_*`, `recorder` untouched); only `theme.py`, `cellular_pickers.py`, `cellular_panel.py`, `gui.py`, two test files, the version, the installer version line and the docs changed. **Simulated** throughout: the sensor was not contacted and nothing was recorded. The desktop session was locked for the whole pass, so every GUI check ran offscreen (`QT_QPA_PLATFORM=offscreen`) with renders saved as PNG; the before pictures come from the unchanged 1.10.0 source, the after pictures from the same scenes with 1.11.0.
+
+## What changed
+
+| Area | Before (1.10.0) | After (1.11.0) |
+| --- | --- | --- |
+| Panel header | Badge read **Off** while the form was visible; enabled/disabled and expanded/collapsed were one state. | Badge is the collection state only (*Idle, Ready, Scheduled, Waiting, Recording, Pausing, Paused, Stopping, Interrupted, Finished*); the header toggle only shows or hides the form. |
+| Workflow order and grid | A small recording-duration box beside 48 px controls; labels of different widths; wrapped rows. | Workbook + Browse, Worksheet → Recording duration + Wait → *Run now / Schedule* (date, start times and Repeat daily appear only for Schedule) → actions. All fields 36 px on a 150 px label column. |
+| Start times | Times in one line; removal through a popup. | **Add time** beside the chip list; each chip has its own × (accessible name *Remove HH:MM*); flow layout wraps without clipping. |
+| Pickers | Calendar cells rendered 19 px tall (stylesheet overrode the fixed size), empty space in the popup; faint arrows. | 36 px day cells, 30 px navigation buttons, visible arrows and glyphs; the Windows regional date and 12/24 h format kept. |
+| Indicators and icons | Radio and check indicators invisible in the dark theme; faint combo arrows. | Generated PNG glyphs (check, radio dot, arrows, cross, plus, grip) coloured from the theme palette, cached, drawn in both themes. |
+| Action bar | Preview / Start / Pause / Resume / Stop of mixed heights inside the scrolling form; Stop label long. | One aligned bar (`Preview`, primary **Start**, `Pause`/`Resume`, short **Stop** with tooltip *Stops after the current recording*) docked under the form so it stays reachable while the form scrolls. |
+| Status text | A technical paragraph under the form. | `15 rows · 65 captures · Estimated 40.9 GB` (+ `N problems (see Preview)`); the full text behind **Details**; warnings stay visible and short. |
+| Layout and log | Nested borders, empty frames, two controls that hid the log. | One card per area, no nested borders; the activity log is resizable (dotted splitter grip) and collapsible with **one** control; the splitter remembers the last size. |
+| Theme button, Settings, SFTP browser | Mixed control heights. | Same 36 px grid, same checkbox and arrow glyphs, both themes. |
+
+## Checks
+
+| Case | How | Result |
+| --- | --- | --- |
+| Main window, light and dark, 1100×700 and larger; panel collapsed and expanded; schedule mode; running state | Offscreen renders of the real `MainWindow` (demo transport, isolated settings, a copy of the protocol workbook) | **Pass.** No clipped control, no needless scrollbar, no awkward wrap at 1100×700 with the log hidden; dark theme indicators visible. |
+| Calendar, time picker, Preview dialog | Offscreen renders of the popups and the dialog | **Pass.** 320×367 calendar with 36 px cells; Preview without the focus frame and horizontal scrollbar it had. |
+| 125 % and 150 % scaling | `QT_SCALE_FACTOR=1.25 / 1.5` with `QT_ENABLE_HIGHDPI_SCALING=1`, offscreen | **Pass** for layout (geometry stays on the logical grid; glyphs are 4× images that only scale down). Pixel rendering at real DPI not seen on the desktop (locked). |
+| Settings dialog and SFTP browser | Offscreen renders, both themes | **Pass.** Consistent with the main form. |
+| Recording / Excel / scheduling behaviour | Full suite | **Pass.** Unchanged modules, unchanged tests. |
+| Desktop (visible) check of the EXE | - | **Not done:** the Windows session stayed locked; the renders above are the evidence. Worth a short look by the operator at 100 % and at the display's own scaling. |
+
+## Timings (same machine, offscreen, same probe scripts against the 1.10.0 sources exported from Git and the 1.11.0 tree)
+
+| Measure | 1.10.0 | 1.11.0 | Cause of the difference |
+| --- | --- | --- | --- |
+| `MainWindow` construction (panel expanded, workbook loaded) | 0.65-0.94 s | 0.65-0.72 s | Twelve per-widget stylesheets on combo popups (0.14 s) removed; palette only. |
+| Theme switch (light → dark) | 0.23-0.45 s | 0.20-0.31 s | `setStyle("Fusion")` was re-run on every toggle; identical sheet now returns early; glyph icons cached. The remaining floor is Qt re-polishing every widget. |
+| Start to first frame (`python -m crfs_iq_recorder`, saved workbook, panel expanded) | 2.69-2.75 s | 2.61-2.69 s | Dominated by interpreter and PySide6 import; unchanged. |
+| GUI test modules (65 tests) | 1.10.0 code: `test_gui_smoke` 48 tests in 74 s, `test_theme_toggle_persists` 5.4 s; the new panel on the old harness: 142 s and 28 s | 42 s for the 65 GUI tests; the theme test is no longer among the ten slowest of the suite (every test outside that list took under 1.1 s) | **The slowness measured in Part D was in the test harness, not the app:** closed `MainWindow`s stayed alive (lambda reference cycles), so every theme change re-polished hundreds of dead widgets. `conftest.py` now releases closed windows after each test. |
+
+## Test and release status
+
+| Item | Result |
+| --- | --- |
+| Recorder unit + GUI suite (offscreen Qt) | 398 collected: **396 pass, 2 skip** (live-sensor tests), 0 fail, in 81 s, run once, not overlapping the build. `test_cellular_panel.py` asserts the new summary text, the *Details* control, the *Ready* / *Idle* badge texts and the hidden action bar when collapsed. `compileall` clean; no unused import or undefined name in the edited modules. |
+| Build | `build_exe.bat` with `CRFS_BUILD_INSTALLER=1`: `dist\CRFS_IQ_Recorder.exe` 57,196,487 B (SHA-256 `AD7F03FB…BCD4D`), `dist\CRFS_IQ_Recorder_Setup.exe` 43,367,747 B (SHA-256 `B3AD00F8…D0EB4`), version resources 1.11.0. Not Authenticode-signed (unchanged). The script now starts PyInstaller through `python.exe -m PyInstaller`: the `pyinstaller.exe` launcher stub was refused by this PC's application-control policy (*blocked by your organization's Device Guard policy*); the build itself is the same. |
+| EXE smoke test | The **portable EXE** started headlessly (`QT_QPA_PLATFORM=offscreen`, isolated `%LOCALAPPDATA%`, `--demo`): parent and child alive after 25 s, the app's settings, cache and `cellular` folders created (the panel was built), then stopped. The **Setup installer and the installer's program** (`dist\onedir\…\CRFS_IQ_Recorder.exe`) **could not be started on this PC**: Smart App Control refused both (*An Application Control policy has blocked this file*, Code Integrity events 3033/3077/3118) - the mirror image of Part D, where the onedir program ran and the portable EXE was refused. This is the reputation verdict for new unsigned binaries, not a fault in the program; the installer compiled normally and its version resource reads 1.11.0. Smart App Control was not changed. If a file is blocked on the operator's PC, try the other artifact or sign the release. |
+| Git | Branch `cursor/polish-gui-easy-launch`, tag `v1.11.0`, pushed to `personal`; GitHub Release `v1.11.0` with both files. 1.10.0 and older releases kept. |
 
 ---
 

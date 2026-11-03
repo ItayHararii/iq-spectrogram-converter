@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 
-from PySide6.QtCore import QDate, QEvent, QLocale, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTime, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QDate, QEvent, QLocale, QPoint, QRect, QSize, Qt, QTime, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -31,9 +31,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .theme import Palette, available_screen_rect, current_palette
+from .theme import CELL, CONTROL_H, Palette, available_screen_rect, current_palette, glyph_icon
+from .theme import picker_rules as _picker_rules
 
-CELL = 36  # day cell edge, px
 WHEEL_ROW = 36  # one wheel row, px
 WHEEL_ROWS = 5  # rows visible in a wheel
 _PAD = WHEEL_ROWS // 2  # blank rows so the first/last value can sit in the middle
@@ -112,79 +112,21 @@ def _now_time() -> time:
 # ----------------------------------------------------------------------------- styling
 
 
-def _mix(a: str, b: str, t: float) -> str:
-    ca, cb = QColor(a), QColor(b)
-    return QColor(
-        round(ca.red() + (cb.red() - ca.red()) * t),
-        round(ca.green() + (cb.green() - ca.green()) * t),
-        round(ca.blue() + (cb.blue() - ca.blue()) * t),
-    ).name()
-
-
 def picker_stylesheet(p: Palette) -> str:
-    """Rules for the custom parts (day cells, wheels, chips); everything else uses the app sheet."""
-    faint = _mix(p.muted, p.surface, 0.55)
-    return f"""
-QLabel#calTitle {{ color: {p.text}; font-size: 15px; font-weight: 700; background: transparent; }}
-QLabel#weekday {{ color: {p.muted}; font-size: 11px; font-weight: 700; background: transparent; }}
-QPushButton#navBtn {{
-    background: transparent; border: 1px solid transparent; border-radius: 16px;
-    padding: 0; color: {p.text}; font-size: 20px; font-weight: 600;
-}}
-QPushButton#navBtn:hover {{ background: {p.button_hover}; }}
-QPushButton#navBtn:pressed {{ background: {p.border}; }}
-QPushButton#navBtn:disabled {{ color: {faint}; background: transparent; }}
-QPushButton#dayCell {{
-    background: transparent; border: 1px solid transparent; border-radius: {CELL // 2}px;
-    padding: 0; color: {p.text}; font-size: 13px; font-weight: 500;
-}}
-QPushButton#dayCell:hover {{ background: {p.button_hover}; }}
-QPushButton#dayCell[outside="true"] {{ color: {p.muted}; }}
-QPushButton#dayCell:disabled {{ color: {faint}; background: transparent; }}
-QPushButton#dayCell[today="true"] {{ border: 1px solid {p.accent}; color: {p.accent}; font-weight: 700; }}
-QPushButton#dayCell[selected="true"] {{ background: {p.accent}; border-color: {p.accent}; color: #FFFFFF; font-weight: 700; }}
-QPushButton#dayCell[selected="true"]:hover {{ background: {p.accent_hover}; border-color: {p.accent_hover}; }}
-QLabel#timeDisplay {{ color: {p.text}; font-size: 32px; font-weight: 700; background: transparent; padding: 4px 0; }}
-QLabel#wheelColon {{ color: {p.muted}; font-size: 24px; font-weight: 700; background: transparent; padding-bottom: 4px; }}
-QListWidget#wheel {{ background: transparent; border: none; outline: 0; color: {p.muted}; }}
-QListWidget#wheel::item {{ color: {p.muted}; border-radius: 8px; margin: 0 2px; background: transparent; }}
-QListWidget#wheel::item:hover {{ background: {p.button_hover}; color: {p.text}; }}
-QListWidget#wheel::item:selected {{ background: {p.accent}; color: #FFFFFF; }}
-QListWidget#wheel::item:selected:hover {{ background: {p.accent_hover}; color: #FFFFFF; }}
-QPushButton#chip {{
-    background: transparent; border: 1px solid {p.border}; border-radius: 14px;
-    padding: 0 12px; min-height: 26px; max-height: 26px; color: {p.text}; font-weight: 600;
-}}
-QPushButton#chip:hover {{ border-color: {p.accent}; color: {p.accent}; background: transparent; }}
-QPushButton#chip:pressed {{ background: {p.button_hover}; }}
-QFrame#timeChip {{ background: {p.surface}; border: 1px solid {p.border}; border-radius: 15px; }}
-QFrame#timeChip:hover {{ border-color: {p.accent}; }}
-QPushButton#chipText {{
-    background: transparent; border: none; padding: 0 2px 0 10px; min-height: 26px; max-height: 26px;
-    color: {p.text}; font-weight: 600;
-}}
-QPushButton#chipText:hover {{ color: {p.accent}; background: transparent; }}
-QPushButton#chipText:disabled {{ color: {p.muted}; }}
-QPushButton#chipRemove {{
-    background: transparent; border: none; border-radius: 11px; padding: 0;
-    color: {p.muted}; font-size: 15px; font-weight: 700;
-}}
-QPushButton#chipRemove:hover {{ background: {p.button_hover}; color: {p.danger}; }}
-QPushButton#fieldBtn {{ background: transparent; border: none; border-radius: 6px; padding: 0; }}
-QPushButton#fieldBtn:hover {{ background: {p.button_hover}; }}
-QPushButton#fieldBtn:pressed {{ background: {p.border}; }}
-QLineEdit#bareField:disabled {{ color: {p.muted}; background: transparent; }}
-QFrame#inputWrap:disabled {{ background: {p.bg}; }}
-"""
+    """The picker rules (day cells, wheels, chips, fields). They are part of the
+    application stylesheet (`theme.stylesheet_for`); kept here for callers that
+    style a picker on its own."""
+    return _picker_rules(p)
 
 
 class _Themed:
-    """Mixin: keep the palette-derived stylesheet in step with light/dark toggles."""
+    """Mixin: redraw palette-coloured icons when the light/dark theme changes.
+
+    The style rules themselves live in the application stylesheet, so a theme
+    switch costs one re-polish of the window and no per-widget stylesheets."""
 
     def _refresh_style(self) -> None:
-        sheet = picker_stylesheet(current_palette())
-        if self.styleSheet() != sheet:  # type: ignore[attr-defined]
-            self.setStyleSheet(sheet)  # type: ignore[attr-defined]
+        return None
 
     def changeEvent(self, event: QEvent) -> None:  # noqa: N802
         super().changeEvent(event)  # type: ignore[misc]
@@ -193,31 +135,8 @@ class _Themed:
 
 
 def _glyph_icon(kind: str, color: QColor, size: int = 18) -> QIcon:
-    """Calendar or clock outline drawn in the given colour (no emoji font needed)."""
-    px = size * 4
-    image = QImage(px, px, QImage.Format.Format_ARGB32_Premultiplied)
-    image.fill(0)
-    painter = QPainter(image)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    pen = QPen(color)
-    pen.setWidthF(px * 0.075)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    painter.setPen(pen)
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    if kind == "calendar":
-        painter.drawRoundedRect(QRectF(px * 0.14, px * 0.2, px * 0.72, px * 0.66), px * 0.1, px * 0.1)
-        painter.drawLine(QPointF(px * 0.14, px * 0.4), QPointF(px * 0.86, px * 0.4))
-        for x in (0.34, 0.66):
-            painter.drawLine(QPointF(px * x, px * 0.1), QPointF(px * x, px * 0.28))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(color)
-        painter.drawEllipse(QPointF(px * 0.5, px * 0.63), px * 0.075, px * 0.075)
-    else:
-        painter.drawEllipse(QPointF(px / 2, px / 2), px * 0.37, px * 0.37)
-        painter.drawLine(QPointF(px / 2, px / 2), QPointF(px / 2, px * 0.26))
-        painter.drawLine(QPointF(px / 2, px / 2), QPointF(px * 0.68, px * 0.6))
-    painter.end()
-    return QIcon(QPixmap.fromImage(image))
+    """Calendar, clock, plus or cross outline drawn in the given colour (no emoji font needed)."""
+    return glyph_icon(kind, color, size)
 
 
 def _flat(button: QPushButton, name: str, size: int | None = None) -> QPushButton:
@@ -831,27 +750,34 @@ class TimeField(_PopupField):
         self.set_time(dialog.time())
 
 
-class _Chip(QFrame):
-    """A time chip: the text edits the time, the × removes it."""
+class _Chip(_Themed, QFrame):
+    """A time chip: the text edits the time, the cross removes it."""
 
     def __init__(self, t: time, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("timeChip")
         self.value = t
-        self.setFixedHeight(30)
+        self.setFixedHeight(CONTROL_H)
         row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 3, 0)
+        row.setContentsMargins(0, 0, 4, 0)
         row.setSpacing(0)
         self.text_btn = _flat(QPushButton(format_time(t)), "chipText")
         self.text_btn.setToolTip("Change this time")
-        self.remove_btn = _flat(QPushButton("×"), "chipRemove", 22)
+        self.remove_btn = _flat(QPushButton(), "chipRemove", 22)
+        self.remove_btn.setIconSize(QSize(12, 12))
         self.remove_btn.setToolTip("Remove this time")
+        self.remove_btn.setAccessibleName(f"Remove {format_time(t)}")
         row.addWidget(self.text_btn)
         row.addWidget(self.remove_btn)
+        self._refresh_style()
+
+    def _refresh_style(self) -> None:
+        self.remove_btn.setIcon(_glyph_icon("cross", QColor(current_palette().muted)))
 
 
 class TimesField(_Themed, QWidget):
-    """A wrapping row of time chips plus '+ Add time'; values stay unique and sorted."""
+    """Time chips (each with its own remove button) and an **Add time** button
+    pinned beside them; values stay unique and sorted."""
 
     changed = Signal(object)
 
@@ -861,20 +787,30 @@ class TimesField(_Themed, QWidget):
         self._maximum = max(1, int(maximum))
         self._chips: list[_Chip] = []
         self._dialog: QDialog | None = None
-        self.flow = FlowLayout(self)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+        self.chips_host = QWidget()
+        self.chips_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.flow = FlowLayout(self.chips_host, h_spacing=6, v_spacing=6)
         self.empty_label = QLabel("No start time yet")
         self.empty_label.setObjectName("muted")
-        self.empty_label.setFixedHeight(30)
-        self.add_btn = QPushButton("+ Add time")
+        self.empty_label.setFixedHeight(CONTROL_H)
+        self.add_btn = QPushButton("Add time")
         self.add_btn.setObjectName("ghost")
         self.add_btn.setAutoDefault(False)
-        self.add_btn.setFixedHeight(30)
+        self.add_btn.setFixedHeight(CONTROL_H)
+        self.add_btn.setIconSize(QSize(14, 14))
         self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.add_btn.clicked.connect(lambda: self._open_popup(None))
         self.flow.addWidget(self.empty_label)
-        self.flow.addWidget(self.add_btn)
+        outer.addWidget(self.chips_host, 1)
+        outer.addWidget(self.add_btn, 0, Qt.AlignmentFlag.AlignTop)
         self._refresh_style()
         self.set_times(initial or [])
+
+    def _refresh_style(self) -> None:
+        self.add_btn.setIcon(_glyph_icon("plus", QColor(current_palette().text)))
 
     # ------------------------------------------------------------------ api
     def times(self) -> list[time]:
@@ -907,25 +843,25 @@ class TimesField(_Themed, QWidget):
 
     # ------------------------------------------------------------------ internals
     def _rebuild(self) -> None:
-        for widget in (*self._chips, self.empty_label, self.add_btn):
+        for widget in (*self._chips, self.empty_label):
             self.flow.removeWidget(widget)
         for chip in self._chips:
             chip.hide()
             chip.deleteLater()
         self._chips = []
         for t in self._times:
-            chip = _Chip(t)
+            chip = _Chip(t, self.chips_host)
             chip.text_btn.clicked.connect(lambda _checked=False, value=t: self._open_popup(value))
             chip.remove_btn.clicked.connect(lambda _checked=False, value=t: self._remove(value))
             self.flow.addWidget(chip)
             self._chips.append(chip)
         self.flow.addWidget(self.empty_label)
-        self.flow.addWidget(self.add_btn)
         self.empty_label.setVisible(not self._times)
         full = len(self._times) >= self._maximum
         self.add_btn.setEnabled(not full)
         self.add_btn.setToolTip(f"Up to {self._maximum} start times" if full else "Add a start time")
         self.flow.invalidate()
+        self.chips_host.updateGeometry()
         self.updateGeometry()
 
     def _open_popup(self, replacing: time | None) -> QDialog:

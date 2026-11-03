@@ -1,8 +1,8 @@
 # Cellular Collection - how it works (developer report)
 
-**Version:** CRFS IQ Recorder 1.10.0 (November 2026)
+**Version:** CRFS IQ Recorder 1.11.0 (November 2026)
 **Operator guide:** the "Cellular Collection" section of the [Quick Start](confluence/CRFS_IQ_Recorder_Quick_Start.md).
-**QA:** `QA_REPORT.md` at the repository root, Part D.
+**QA:** `QA_REPORT.md` at the repository root, Parts D and E.
 
 Cellular Collection records the frequency ranges listed in a protocol workbook, row by row and in worksheet order, waits between recordings, and repeats the whole list (back to back or at scheduled local times) so activity can be compared at different hours. It fills the protocol's own result cells and nothing else. It lives inside the existing Recorder and reuses its recording path, SFTP download, merge engine and worker-thread registry. Nothing in the manual recording flow changed for operators who do not open the panel.
 
@@ -21,8 +21,9 @@ Do not put sensor addresses, logins or passwords in this file.
 | `cellular_scheduler.py` | Run-now with a repeat count (0 = until stopped) or times of day (dates or daily); local time; due / delayed / missed classification. |
 | `cellular_runner.py` | The controller (QObject): task state machine, idle check before every request, waits, Pause/Resume/Stop, persistence and recovery, downloads, checksums, quality checks, manifests, handover, the workbook queue. |
 | `cellular_workbook.py` | Cell-level writer for the protocol worksheet (block 0 in place, later passes appended), persistent `WorkbookQueue`, backup-before-first-change, openpyxl and Excel-COM back ends. |
-| `cellular_pickers.py` | Calendar popup, time-picker popup (hour/minute wheels, AM/PM when the locale uses it, presets), `DateField`, `TimeField`, `TimesField`; formats from `QLocale.system()`. |
-| `cellular_panel.py` | The compact collapsible panel and the plan preview. |
+| `cellular_pickers.py` | Calendar popup, time-picker popup (hour/minute wheels, AM/PM when the locale uses it, presets), `DateField`, `TimeField`, `TimesField` (chips with a remove button each, **Add time** pinned beside them); formats from `QLocale.system()`. Their style rules are part of the application sheet (`theme.picker_rules`). |
+| `cellular_panel.py` | The collapsible section of the recording form (header with state badge, lazily built body, detachable action bar) and the plan preview. |
+| `theme.py` | Palettes, the one application style sheet (uniform 36 px controls, generated PNG glyphs for check boxes, radio buttons, arrows and the splitter grip under `%TEMP%\CRFS IQ Recorder\ui`), `apply_theme` (idempotent; re-polishes only when the sheet changes). |
 | `cellular_manifest.py`, `cellular_quality.py`, `cellular_excel.py`, `cellular_reference.py` | Manifests and handover; WAV validation and sampled previews; row helpers; reference allocations for tests. |
 
 ## Capture path
@@ -85,7 +86,14 @@ A fifth case appeared during the 1.10.0 hardware checks: `ERROR: Collection was 
 
 ## Background work
 
-All waiting, listing, downloading, hashing, checking, workbook writing and identity/idle checks run off the UI thread (`QThread` workers tracked by `worker_threads`, queued signals, `MAX_DOWNLOADS` parallel downloads, backlog and local-disk gates). The panel is cheap while collapsed: only the header row exists until it is opened or a saved session is found.
+All waiting, listing, downloading, hashing, checking, workbook writing and identity/idle checks run off the UI thread (`QThread` workers tracked by `worker_threads`, queued signals, `MAX_DOWNLOADS` parallel downloads, backlog and local-disk gates). The panel is cheap while collapsed: only the header row and the (hidden) action bar exist until it is opened or a saved session is found.
+
+## Panel layout (1.11.0)
+
+- `CellularPanel` is a borderless **section** of the recording card (a 1 px divider above it, no nested frame). The header is one button - chevron + "Cellular Collection" - and a state badge that is never "Off": *Idle* until a plan is loaded, *Ready* when the plan can start, then the runner states (*Recording*, *Waiting*, *Scheduled*, *Pausing*, *Paused*, *Stopping*, *Finished*, *Interrupted*). Enabled/disabled and expanded/collapsed are separate: the badge reflects the runner, the chevron the body.
+- The body is a two-column grid that shares the caption column (`theme.LABEL_W`) and the control height (`theme.CONTROL_H`, 36 px) with the recording form. Rows, in workflow order: Excel file (+ Browse…, Reload) → Worksheet → one-line summary (`15 rows · 54 captures · Estimated 34.0 GB`, problems counted there) with a **Details** link that unfolds the long text (capture window of the sensor, sequential windows, kept result rows) → Recording duration → Wait between recordings → Start (*Run now* / *Schedule* radios) → either the Repeat row (Run now) or the schedule block (Date + Repeat daily, Start times with the chips and **Add time**). The recovery notice (interrupted session, missed pass) sits above the grid as a tinted `notice` frame.
+- The **action bar** (`Preview`, `Start` as the primary button, `Pause` / `Resume`, a short `Stop` whose tooltip says it stops after the current recording, plus the status line and a detail line) is created with the header and handed to the main window (`detach_action_bar()`), which mounts it under the scroll area of the recording card so it stays in view while the form scrolls. It is shown only while the section is expanded.
+- The main window has one show/hide control for the activity log (header button; dragging the splitter shut is the same state), a splitter handle with a dotted grip, and the Excel logging block as a section with the same grid. Theme switches re-polish the window once (`apply_theme` returns early when the sheet is unchanged; combo popups take their colours from the application sheet instead of per-widget sheets).
 
 ## Tests
 

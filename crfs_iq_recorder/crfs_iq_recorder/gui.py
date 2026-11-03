@@ -151,12 +151,17 @@ from .size_estimate import (
 )
 from .merge_controller import MergeController
 from .sftp_window import SftpWindow, _open_browser
+from .cellular_panel import FieldLabel
 from .theme import (
+    CONTROL_H,
     DARK_MODE,
+    LABEL_W,
     LIGHT_MODE,
+    PRIMARY_H,
     apply_combo_popup_palette,
     apply_theme,
     current_mode,
+    divider,
     fit_window_to_screen,
     polish_combo,
     restyle,
@@ -357,6 +362,8 @@ class MainWindow(QMainWindow):
         root.addWidget(self._sensor_strip())
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setHandleWidth(10)
+        self.splitter.setChildrenCollapsible(False)
         self.splitter.addWidget(self._recording_panel())
         self.splitter.addWidget(self._log_panel())
         self.splitter.setStretchFactor(0, 3)
@@ -364,6 +371,7 @@ class MainWindow(QMainWindow):
         self.splitter.setCollapsible(0, False)
         self.splitter.setCollapsible(1, True)
         self.splitter.setSizes(self._log_sizes)
+        self.splitter.splitterMoved.connect(self._on_splitter_moved)
         body = QWidget()
         body_l = QVBoxLayout(body)
         body_l.setContentsMargins(16, 8, 16, 12)
@@ -517,14 +525,13 @@ class MainWindow(QMainWindow):
     def _unit_field(self, suffix: str) -> tuple[QFrame, QLineEdit, QLabel]:
         wrap = QFrame()
         wrap.setObjectName("inputWrap")
-        wrap.setMinimumHeight(36)
-        wrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        wrap.setFixedHeight(CONTROL_H)
+        wrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         row = QHBoxLayout(wrap)
         row.setContentsMargins(0, 0, 4, 0)
         row.setSpacing(0)
         field = QLineEdit()
         field.setObjectName("bareField")
-        field.setMinimumHeight(32)
         field.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         unit = QLabel(suffix)
         unit.setObjectName("unitSuffix")
@@ -532,24 +539,44 @@ class MainWindow(QMainWindow):
         row.addWidget(unit)
         return wrap, field, unit
 
+    @staticmethod
+    def _ghost_button(text: str, tooltip: str = "") -> QPushButton:
+        button = QPushButton(text)
+        button.setObjectName("ghost")
+        button.setAutoDefault(False)
+        button.setFixedHeight(CONTROL_H)
+        if tooltip:
+            button.setToolTip(tooltip)
+        return button
+
     def _recording_panel(self) -> QWidget:
+        """The recording card: a scrolling form and, under it, the Cellular
+        action bar that stays in view while the form scrolls."""
         holder = QWidget()
         outer = QVBoxLayout(holder)
-        outer.setContentsMargins(0, 0, 8, 0)
+        outer.setContentsMargins(0, 0, 0, 0)
         card = QFrame()
         card.setObjectName("card")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(8)
+        card_l = QVBoxLayout(card)
+        card_l.setContentsMargins(0, 0, 0, 0)
+        card_l.setSpacing(0)
+
+        form = QWidget()
+        form.setObjectName("section")
+        layout = QVBoxLayout(form)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(10)
         layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
+        head = QHBoxLayout()
+        head.setSpacing(12)
         heading = QLabel("Recording")
         heading.setObjectName("sectionTitle")
-        layout.addWidget(heading)
+        head.addWidget(heading)
         intro = QLabel("Set the band and time, then start.")
         intro.setObjectName("muted")
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
+        head.addWidget(intro, 1)
+        layout.addLayout(head)
 
         self.mode_start = QRadioButton("Start / End")
         self.mode_center = QRadioButton("Center / Bandwidth")
@@ -563,8 +590,8 @@ class MainWindow(QMainWindow):
         unit_caption.setObjectName("muted")
         modes.addWidget(unit_caption)
         self.unit_combo = QComboBox()
-        self.unit_combo.setMinimumWidth(88)
-        self.unit_combo.setMinimumHeight(36)
+        self.unit_combo.setMinimumWidth(92)
+        self.unit_combo.setFixedHeight(CONTROL_H)
         for unit in FREQ_UNITS:
             self.unit_combo.addItem(unit)
         self.unit_combo.setCurrentText(self._conn.freq_unit or DEFAULT_FREQ_UNIT)
@@ -581,20 +608,20 @@ class MainWindow(QMainWindow):
         fields.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         grid = QGridLayout(fields)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(8)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
         grid.setColumnStretch(1, 1)
-        grid.setColumnMinimumWidth(0, 140)
+        grid.setColumnMinimumWidth(0, LABEL_W)
         unit = self._freq_unit()
-        self.label_a = QLabel("Center frequency")
-        self.label_b = QLabel("Bandwidth")
+        self.label_a = FieldLabel("Center frequency")
+        self.label_b = FieldLabel("Bandwidth")
         wrap_a, self.field_a, self.unit_a = self._unit_field(unit)
         wrap_b, self.field_b, self.unit_b = self._unit_field(unit)
         time_wrap, self.time_edit, _time_suffix = self._unit_field("s")
         self.time_edit.setText(f"{self._conn.recorded_time_s:g}")
         self.time_edit.setPlaceholderText("0.1")
         self.format_combo = QComboBox()
-        self.format_combo.setMinimumHeight(36)
+        self.format_combo.setFixedHeight(CONTROL_H)
         self.format_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         for item in VERIFIED_RECORDING_FORMATS:
             self.format_combo.addItem(item.short_label, item.identifier)
@@ -605,15 +632,13 @@ class MainWindow(QMainWindow):
         self.format_combo.currentIndexChanged.connect(self._refresh_size)
         for widget in (self.field_a, self.field_b, self.time_edit):
             widget.textChanged.connect(self._refresh_size)
-        format_label = QLabel("Recording format")
-        time_label = QLabel("Recording time")
-        for lab in (self.label_a, self.label_b, format_label, time_label):
-            lab.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        format_label = FieldLabel("Recording format")
+        time_label = FieldLabel("Recording time")
         time_box = QWidget()
         time_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         time_row = QHBoxLayout(time_box)
         time_row.setContentsMargins(0, 0, 0, 0)
-        time_row.setSpacing(16)
+        time_row.setSpacing(12)
         time_row.addWidget(time_wrap, 1)
         self.size_label = QLabel("")
         self.size_label.setObjectName("sizeHint")
@@ -628,36 +653,39 @@ class MainWindow(QMainWindow):
         grid.addWidget(time_label, 3, 0)
         grid.addWidget(time_box, 3, 1)
         for row in range(4):
-            grid.setRowMinimumHeight(row, 38)
+            grid.setRowMinimumHeight(row, CONTROL_H)
         layout.addWidget(fields)
 
         self.msg = QLabel("")
         self.msg.setWordWrap(True)
         layout.addWidget(self.msg)
 
+        layout.addWidget(divider(form))
         layout.addWidget(self._collection_section())
 
         self.start_btn = QPushButton("Start Recording")
         self.start_btn.setObjectName("primary")
         self.start_btn.setDefault(True)
+        self.start_btn.setFixedHeight(PRIMARY_H)
         self.start_btn.clicked.connect(self._on_start)
         layout.addWidget(self.start_btn)
 
-        self.stop_btn = QPushButton("Stop after current recording")
-        self.stop_btn.setObjectName("ghost")
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.stop_btn = self._ghost_button("Stop after current recording", "Finish the recording in progress, then stop the series")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._on_stop_after_current)
-        layout.addWidget(self.stop_btn)
+        actions.addWidget(self.stop_btn)
+        actions.addStretch(1)
+        self.sftp_btn = self._ghost_button("Sensor Files", "Browse, download and merge the recordings stored on the sensor")
+        self.sftp_btn.clicked.connect(self._open_sftp)
+        actions.addWidget(self.sftp_btn)
+        layout.addLayout(actions)
 
         self.phase_label = QLabel(PHASE_LABELS[IDLE])
         self.phase_label.setObjectName("muted")
         self.phase_label.setWordWrap(True)
         layout.addWidget(self.phase_label)
-
-        self.sftp_btn = QPushButton("Sensor Files")
-        self.sftp_btn.setObjectName("ghost")
-        self.sftp_btn.clicked.connect(self._open_sftp)
-        layout.addWidget(self.sftp_btn)
 
         merge_row = QHBoxLayout()
         merge_row.setSpacing(8)
@@ -670,8 +698,7 @@ class MainWindow(QMainWindow):
         )
         self.merge_check.setChecked(bool(self._conn.merge_parts))
         self.merge_check.toggled.connect(self._on_merge_toggled)
-        self.merge_cancel_btn = QPushButton("Cancel merge")
-        self.merge_cancel_btn.setObjectName("ghost")
+        self.merge_cancel_btn = self._ghost_button("Cancel merge")
         self.merge_cancel_btn.setVisible(False)
         self.merge_cancel_btn.clicked.connect(self._cancel_merge)
         merge_row.addWidget(self.merge_check)
@@ -690,29 +717,37 @@ class MainWindow(QMainWindow):
         self.merge_progress.setVisible(False)
         layout.addWidget(self.merge_progress)
 
+        layout.addWidget(divider(form))
         self.cellular_panel = CellularPanel(self._cellular, host=self, config_dir=user_config_dir())
         layout.addWidget(self.cellular_panel)
         layout.addStretch(1)
 
         scroll = QScrollArea()
+        scroll.setObjectName("formScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setWidget(card)
-        outer.addWidget(scroll)
+        scroll.setWidget(form)
+        self.form_scroll = scroll
+        card_l.addWidget(scroll, 1)
+        # The Cellular action bar is pinned under the form; it shows with the section.
+        self.cellular_bar = self.cellular_panel.detach_action_bar()
+        card_l.addWidget(self.cellular_bar, 0)
+        outer.addWidget(card)
         return holder
 
     def _collection_section(self) -> QWidget:
-        box = QFrame()
-        box.setObjectName("inputWrap")
+        box = QWidget()
+        box.setObjectName("section")
         box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.excel_section = box
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(10)
 
         self.excel_check = QCheckBox("Log recordings to Excel")
+        self.excel_check.setToolTip("Append every recording to a worksheet of the collection workbook")
         self.excel_check.setChecked(bool(self._conn.excel_enabled))
         self.excel_check.toggled.connect(self._on_excel_toggled)
         layout.addWidget(self.excel_check)
@@ -721,32 +756,28 @@ class MainWindow(QMainWindow):
         details.setObjectName("excelDetails")
         details.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.excel_details = details
-        detail_layout = QVBoxLayout(details)
-        detail_layout.setContentsMargins(0, 0, 0, 0)
-        detail_layout.setSpacing(8)
+        grid = QGridLayout(details)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnMinimumWidth(0, LABEL_W)
 
         book_row = QHBoxLayout()
         book_row.setSpacing(8)
-        book_label = QLabel("Workbook")
-        book_label.setObjectName("muted")
         self.workbook_edit = QLineEdit()
         self.workbook_edit.setReadOnly(True)
+        self.workbook_edit.setFixedHeight(CONTROL_H)
         self.workbook_edit.setPlaceholderText("Choose a .xlsm collection workbook")
         if self._conn.excel_workbook:
             self.workbook_edit.setText(self._conn.excel_workbook)
-        browse = QPushButton("Browse")
-        browse.setObjectName("ghost")
+        browse = self._ghost_button("Browse…", "Choose the collection workbook")
         browse.clicked.connect(self._browse_workbook)
-        book_row.addWidget(book_label)
         book_row.addWidget(self.workbook_edit, 1)
         book_row.addWidget(browse)
-        detail_layout.addLayout(book_row)
+        grid.addWidget(FieldLabel("Workbook"), 0, 0)
+        grid.addLayout(book_row, 0, 1)
 
-        grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(6)
-        grid.setColumnStretch(1, 1)
         self.event_combo = QComboBox()
         self.event_combo.setEditable(True)
         self.event_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -760,18 +791,17 @@ class MainWindow(QMainWindow):
         self.sheet_combo.setEditable(True)
         self.sheet_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         apply_combo_popup_palette(self.sheet_combo, dark=False)
-        grid.addWidget(QLabel("Collection event"), 0, 0)
-        grid.addWidget(self.event_combo, 0, 1)
-        grid.addWidget(QLabel("Target class"), 1, 0)
-        grid.addWidget(self.class_combo, 1, 1)
-        grid.addWidget(QLabel("Worksheet"), 2, 0)
-        grid.addWidget(self.sheet_combo, 2, 1)
-        detail_layout.addLayout(grid)
+        for combo in (self.event_combo, self.class_combo, self.sheet_combo):
+            combo.setFixedHeight(CONTROL_H)
+        grid.addWidget(FieldLabel("Collection event"), 1, 0)
+        grid.addWidget(self.event_combo, 1, 1)
+        grid.addWidget(FieldLabel("Target class"), 2, 0)
+        grid.addWidget(self.class_combo, 2, 1)
+        grid.addWidget(FieldLabel("Worksheet"), 3, 0)
+        grid.addWidget(self.sheet_combo, 3, 1)
 
         repeat_row = QHBoxLayout()
         repeat_row.setSpacing(12)
-        repeat_caption = QLabel("Repeat recording")
-        repeat_caption.setObjectName("muted")
         self.repeat_off = QRadioButton("Off")
         self.repeat_n = QRadioButton("Count")
         self.repeat_until = QRadioButton("Until stopped")
@@ -784,42 +814,44 @@ class MainWindow(QMainWindow):
         group.addButton(self.repeat_until)
         self.repeat_spin = QSpinBox()
         self.repeat_spin.setRange(1, 999)
+        self.repeat_spin.setFixedSize(96, CONTROL_H)
         self.repeat_spin.setValue(int(self._conn.repeat_count or 2))
         self.repeat_spin.setEnabled(self.repeat_n.isChecked())
         self.repeat_n.toggled.connect(lambda on: self.repeat_spin.setEnabled(on))
-        repeat_row.addWidget(repeat_caption)
         repeat_row.addWidget(self.repeat_off)
         repeat_row.addWidget(self.repeat_n)
         repeat_row.addWidget(self.repeat_spin)
         repeat_row.addWidget(self.repeat_until)
         repeat_row.addStretch(1)
-        detail_layout.addLayout(repeat_row)
+        grid.addWidget(FieldLabel("Repeat recording"), 4, 0)
+        grid.addLayout(repeat_row, 4, 1)
 
         wait_row = QHBoxLayout()
         wait_row.setSpacing(8)
-        wait_caption = QLabel("Wait between recordings")
-        wait_caption.setObjectName("muted")
         self.wait_spin = QDoubleSpinBox()
         self.wait_spin.setRange(0, 10_000)
         self.wait_spin.setDecimals(2)
         self.wait_spin.setSingleStep(1)
+        self.wait_spin.setFixedSize(124, CONTROL_H)
         self.wait_unit = QComboBox()
         self.wait_unit.addItems(["Seconds", "Minutes"])
+        self.wait_unit.setFixedHeight(CONTROL_H)
+        self.wait_unit.setMinimumWidth(112)
         apply_combo_popup_palette(self.wait_unit, dark=False)
         unit = "Minutes" if self._conn.repeat_wait_unit == "minutes" else "Seconds"
         self.wait_unit.setCurrentText(unit)
         wait_s = max(float(self._conn.repeat_wait_s), 0.0)
         self.wait_spin.setValue(wait_s / 60.0 if unit == "Minutes" else wait_s)
-        wait_row.addWidget(wait_caption)
         wait_row.addWidget(self.wait_spin)
         wait_row.addWidget(self.wait_unit)
         wait_row.addStretch(1)
-        detail_layout.addLayout(wait_row)
+        grid.addWidget(FieldLabel("Wait between recordings"), 5, 0)
+        grid.addLayout(wait_row, 5, 1)
 
         self.collection_status = QLabel("Recordings completed: 0  ·  Files found: 0  ·  Excel: Idle")
         self.collection_status.setObjectName("muted")
         self.collection_status.setWordWrap(True)
-        detail_layout.addWidget(self.collection_status)
+        grid.addWidget(self.collection_status, 6, 1)
         layout.addWidget(details)
         self._sync_excel_details()
         return box
@@ -831,18 +863,13 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
         head = QHBoxLayout()
+        head.setSpacing(8)
         title = QLabel("Activity")
         title.setObjectName("sectionTitle")
-        self.log_toggle = QPushButton("Hide")
-        self.log_toggle.setObjectName("ghost")
-        self.log_toggle.setFixedWidth(72)
-        self.log_toggle.clicked.connect(self._toggle_log)
-        self.clear_btn = QPushButton("Clear")
-        self.clear_btn.setObjectName("ghost")
+        self.clear_btn = self._ghost_button("Clear", "Empty the activity log")
         self.clear_btn.clicked.connect(self._clear_log)
         head.addWidget(title)
         head.addStretch()
-        head.addWidget(self.log_toggle)
         head.addWidget(self.clear_btn)
         layout.addLayout(head)
         self.log_edit = QPlainTextEdit()
@@ -850,28 +877,40 @@ class MainWindow(QMainWindow):
         self.log_edit.setReadOnly(True)
         self.log_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.log_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.log_edit.setMinimumWidth(180)
+        self.log_edit.setMinimumWidth(160)
         layout.addWidget(self.log_edit, 1)
         return self.log_panel
 
     def _toggle_log(self) -> None:
         if self._log_collapsed:
             self.log_panel.setVisible(True)
-            sizes = self._log_sizes if self._log_sizes[1] > 80 else [680, 300]
+            sizes = self._log_sizes if len(self._log_sizes) > 1 and self._log_sizes[1] > 80 else [680, 300]
             self.splitter.setSizes(sizes)
             self._log_collapsed = False
         else:
-            self._log_sizes = self.splitter.sizes()
+            sizes = self.splitter.sizes()
+            if len(sizes) > 1 and sizes[1] > 80:
+                self._log_sizes = sizes
             self.log_panel.setVisible(False)
             self._log_collapsed = True
         self._sync_log_toggle()
 
+    def _on_splitter_moved(self, _pos: int, _index: int) -> None:
+        """Dragging the log shut is the same as hiding it: one state, one button."""
+        sizes = self.splitter.sizes()
+        if len(sizes) < 2:
+            return
+        if sizes[1] <= 0 and not self._log_collapsed:
+            self.log_panel.setVisible(False)
+            self._log_collapsed = True
+            self._sync_log_toggle()
+        elif sizes[1] > 80:
+            self._log_sizes = sizes
+
     def _sync_log_toggle(self) -> None:
-        header = "Show log" if self._log_collapsed else "Hide log"
         if hasattr(self, "activity_btn"):
-            self.activity_btn.setText(header)
-        if hasattr(self, "log_toggle"):
-            self.log_toggle.setText("Show" if self._log_collapsed else "Hide")
+            self.activity_btn.setText("Show log" if self._log_collapsed else "Hide log")
+            self.activity_btn.setToolTip("Show the activity log beside the form" if self._log_collapsed else "Hide the activity log; the form takes the whole window")
 
     def _sync_theme_button(self) -> None:
         if not hasattr(self, "theme_btn"):

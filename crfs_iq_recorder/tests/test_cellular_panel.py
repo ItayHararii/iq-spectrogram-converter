@@ -147,7 +147,8 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         assert panel.duration_spin.value() == 5.0 and panel.wait_spin.value() == 10, "defaults: 5 s recordings, 10 s wait"
         _load(panel, qapp, book)
         assert panel.imported is not None and panel.plan is not None
-        assert "2 row(s) from 'Plan'" in panel.import_label.text()
+        assert panel.import_label.text().startswith("2 rows · Estimated "), panel.import_label.text()
+        assert "'Plan'" in panel.details_label.text() and panel.details_btn.isVisibleTo(panel.body)
         assert panel.plan.ready and panel.start_btn.isEnabled()
         assert [t.direction for t in panel.plan.tasks] == ["UL", "DL"], "worksheet order"
         panel.duration_spin.setValue(1.0)
@@ -189,7 +190,7 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         assert window._external_owner == ""
         panel._discard()
         qapp.processEvents()
-        assert window._cellular.state == S_IDLE and panel.chip.text() == "Off"
+        assert window._cellular.state == S_IDLE and panel.chip.text() == "Ready", "a loaded plan is 'Ready', never 'Off'"
     finally:
         window._watch_timer.stop()
         window._record_timer.stop()
@@ -437,7 +438,8 @@ def test_collapsed_panel_builds_nothing_until_opened_and_opens_for_a_saved_sessi
         panel = window.cellular_panel
         assert not panel._built and panel.body.isHidden()
         assert len(panel.findChildren(QWidget)) < 10, "only the header exists while collapsed"
-        assert panel.chip.text() == "Off"
+        assert panel.chip.text() == "Idle"
+        assert panel.action_bar.isHidden(), "the action bar follows the form"
         window.close()
         qapp.processEvents()
         saved = json.loads((tmp_path / "config" / "cellular" / "settings.json").read_text(encoding="utf-8"))

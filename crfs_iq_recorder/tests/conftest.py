@@ -34,6 +34,41 @@ def stop_worker_threads_at_exit():
 
 
 @pytest.fixture(autouse=True)
+def release_closed_windows():
+    """Delete the windows a test closed.
+
+    Closed windows used to stay alive until the end of the session (signal
+    lambdas keep the Python wrappers, Qt keeps the C++ widgets), so every later
+    ``configure_appearance()`` and theme toggle re-polished hundreds of dead
+    widgets and the suite slowed down test by test. Worker threads are finished
+    first: deleting a window while one of its jobs runs is the 0xC0000409 crash.
+    """
+    yield
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError:  # pragma: no cover - Qt-free test runs
+        return
+    app = QApplication.instance()
+    if app is None:
+        return
+    from PySide6.QtCore import QEvent
+
+    from crfs_iq_recorder.worker_threads import stop_worker_threads
+
+    stop_worker_threads(timeout_s=5.0)
+    app.processEvents()
+    for top in list(app.topLevelWidgets()):
+        try:
+            if top.isVisible() or top.parent() is not None:
+                continue
+            top.deleteLater()
+        except RuntimeError:
+            pass  # already gone
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+
+
+@pytest.fixture(autouse=True)
 def reset_demo_sftp():
     from crfs_iq_recorder.demo_sftp import reset_shared_demo_browser
 
