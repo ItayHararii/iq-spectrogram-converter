@@ -94,7 +94,12 @@ Technical details per capture (exact window frequencies, requested and measured 
 
 ## Preview the captured signal
 
-Click a WAVE file. A short waterfall of the first portion appears under the list (frequency on X, time on Y, color in dBFS/bin). Use it as a quick visual check.
+Click a WAVE or XDAT file. A short waterfall of the first portion appears under the list (frequency on X, time on Y, colour in dBFS/bin). Use it as a quick visual check; it reads only the beginning of the file, so a quiet start does not mean a quiet file.
+
+- **Zoom the time axis** with the mouse wheel over the picture; the time under the pointer stays where it is. **Drag** up or down to pan. **Reset view** (or the Home key) shows the whole sample again; the button is enabled only while you are zoomed in. A small badge in the corner reads the zoom factor and the visible span.
+- **Point** anywhere on the picture to read the exact time (local clock from the file's own start time, plus the offset into the sample), the frequency in MHz and the level in dBFS/bin on the line under the picture.
+- The frequency axis is absolute RF only when the file carries its centre frequency (CRFS metadata in a WAVE, or the `.xhdr` beside an `.xdat`). The range requested for that recording is drawn as dashed markers; a part of the requested range the file does **not** cover is drawn **hatched grey**, and the line under the picture says what is covered (`File covers 700.19-715.81 MHz of the requested 691-721 MHz; hatched … not recorded`). Without a centre in the file the axis is relative to the centre and the requested range cannot be placed.
+- `.xhdr` and `.xmrk` files hold no samples; select the `.xdat` beside them. An `.xdat` whose header the sensor has not written yet says so - select it again a moment later.
 
 ![Waterfall preview of the selected IQ file.](03-waterfall-preview.png)
 

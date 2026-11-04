@@ -345,3 +345,169 @@ def test_list_failure_does_not_open_a_popup(qapp, monkeypatch):
     finally:
         window.close()
         qapp.processEvents()
+
+
+def _waterfall_data(requested=(703.0, 713.0)):
+    from datetime import datetime, timezone
+
+    import numpy as np
+
+    from crfs_iq_recorder.spectrogram_preview import WaterfallData
+
+    n_freq, n_time = 32, 64
+    return WaterfallData(
+        power_db=np.full((n_freq, n_time), -60.0, dtype=np.float32),
+        rgb=np.zeros((n_time, n_freq, 3), dtype=np.uint8),
+        colorbar_rgb=np.zeros((256, 3), dtype=np.uint8),
+        vmin=-100.0,
+        vmax=-20.0,
+        duration_s=0.5,
+        sample_rate_hz=16e6,
+        absolute=True,
+        freq_lo=700.0,
+        freq_hi=716.0,
+        freq_unit="MHz",
+        x_label="Frequency (MHz)",
+        capture_start=datetime(2026, 11, 4, 22, 48, 50, tzinfo=timezone.utc),
+        covered_mhz=(700.0, 716.0),
+        requested_mhz=requested,
+        markers=(),
+        legend_lines=(),
+        peak_dbfs=-20.0,
+        whole_file_read=False,
+    )
+
+
+def test_interactive_preview_shows_view_note_readout_and_reset(qapp):
+    from crfs_iq_recorder.connection_state import ConnectionState
+    from crfs_iq_recorder.sftp_window import SftpWindow
+    from crfs_iq_recorder.spectrogram_preview import PreviewResult
+    from crfs_iq_recorder.waterfall_view import IDLE_READOUT
+
+    window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
+    try:
+        _wait_listing(window, qapp, count=1)
+        window.resize(1100, 700)
+        data = _waterfall_data(requested=(691.0, 721.0))
+        result = PreviewResult(
+            png_bytes=b"",
+            caption="First 0.500 s · centre 708 MHz",
+            sampled_seconds=0.5,
+            sample_rate=16e6,
+            peak_dbfs=-20.0,
+            layout="xdat",
+            whole_file_read=False,
+            cache_key=("k", 1, 0, 691_000_000, 721_000_000),
+            data=data,
+        )
+        window._preview_token = 3
+        window._on_preview_ready(3, result)
+        qapp.processEvents()
+        assert window.preview_stack.currentIndex() == 1
+        assert window.preview_view.data is data
+        assert window.preview_note.isVisibleTo(window)
+        assert "hatched 691-700 MHz and 716-721 MHz not recorded" in window.preview_note.text()
+        assert "start 05 Nov 2026" in window.preview_caption.text() or "start 04 Nov 2026" in window.preview_caption.text()
+        assert window.preview_readout.text() == IDLE_READOUT
+        assert not window.preview_reset.isEnabled()
+        # Zooming enables Reset; the readout follows the view's signal; Reset restores the full view.
+        window.preview_view.zoom_by(2.0, 0.5)
+        qapp.processEvents()
+        assert window.preview_reset.isEnabled()
+        window.preview_view.readout_changed.emit("00:48:50.100000 local (+100.000 ms)  ·  708.000 MHz  ·  -60.0 dBFS/bin")
+        assert window.preview_readout.text().endswith("-60.0 dBFS/bin")
+        window.preview_view.readout_changed.emit("")
+        assert window.preview_readout.text() == IDLE_READOUT
+        window.preview_reset.click()
+        qapp.processEvents()
+        assert not window.preview_view.zoomed
+        assert not window.preview_reset.isEnabled()
+        # A cancelled preview keeps the picture; a real failure returns to the plain label and hides the extra lines.
+        window._on_preview_failed(3, "Preview cancelled.")
+        assert window.preview_stack.currentIndex() == 1
+        window._on_preview_failed(3, "Could not read the file: connection lost.")
+        assert window.preview_caption.text() == "Could not read the file: connection lost."
+        assert window.preview_stack.currentIndex() == 0
+        assert window.preview_view.data is None
+        assert not window.preview_note.isVisibleTo(window)
+        assert not window.preview_readout.isVisibleTo(window)
+        assert not window.preview_reset.isEnabled()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_sidecar_selection_explains_without_starting_a_preview(qapp):
+    from datetime import datetime
+
+    from crfs_iq_recorder.connection_state import ConnectionState
+    from crfs_iq_recorder.sftp_client import RemoteEntry
+    from crfs_iq_recorder.sftp_window import SftpWindow
+
+    window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
+    try:
+        _wait_listing(window, qapp, count=1)
+        before = window._preview_token
+        entry = RemoteEntry(name="file_221054_0001.xhdr", path="/x/file_221054_0001.xhdr", is_dir=False, size=1200, modified=datetime(2026, 11, 4, 22, 10, 54))
+        window._request_preview(entry)
+        qapp.processEvents()
+        assert window._preview_token == before + 1
+        assert not window._preview_active
+        assert window._preview_pending is None
+        assert window.preview_caption.text() == "Header and marker files have no samples."
+        assert "Select the .xdat file beside it" in window.preview_image.text()
+        assert window.preview_stack.currentIndex() == 0
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_preview_cache_key_includes_the_requested_range(qapp):
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    from crfs_iq_recorder.connection_state import ConnectionState
+    from crfs_iq_recorder.sftp_client import RemoteEntry
+    from crfs_iq_recorder.sftp_window import SftpWindow
+
+    window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
+    try:
+        _wait_listing(window, qapp, count=1)
+        entry = RemoteEntry(name="a.xdat", path="/x/a.xdat", is_dir=False, size=10, modified=datetime(2026, 11, 4, 22, 10, 54))
+        assert window._requested_range(entry) == (None, None)
+        window._matched[entry.path] = SimpleNamespace(start_hz=703_000_000, end_hz=713_000_000, center_hz=708_000_000, bandwidth_hz=10_000_000)
+        assert window._requested_range(entry) == (703_000_000, 713_000_000)
+        window._matched[entry.path] = SimpleNamespace(start_hz=None, end_hz=713_000_000)
+        assert window._requested_range(entry) == (None, None)
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_demo_selection_produces_an_interactive_waterfall(qapp):
+    """End to end on the demo transport: select a file -> worker -> array -> interactive view."""
+    from crfs_iq_recorder.connection_state import ConnectionState
+    from crfs_iq_recorder.sftp_window import SftpWindow
+    from crfs_iq_recorder.waterfall_view import IDLE_READOUT
+
+    window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
+    try:
+        _wait_listing(window, qapp, count=1)
+        window.resize(1100, 700)
+        window.table.setCurrentItem(window.table.topLevelItem(0))
+        window.table.topLevelItem(0).setSelected(True)
+        deadline = time.time() + 20
+        while time.time() < deadline and window.preview_stack.currentIndex() != 1:
+            qapp.processEvents()
+            time.sleep(0.02)
+        assert window.preview_stack.currentIndex() == 1, window.preview_caption.text()
+        data = window.preview_view.data
+        assert data is not None and data.n_time > 0 and data.n_freq > 0
+        assert window.preview_caption.text().startswith("First")
+        assert window.preview_readout.text() == IDLE_READOUT
+        assert window.preview_view.window is not None and not window.preview_view.zoomed
+        # The result is cached under the file key plus the requested range.
+        assert any(len(k) == 5 for k in window._preview_cache)
+    finally:
+        window.close()
+        qapp.processEvents()

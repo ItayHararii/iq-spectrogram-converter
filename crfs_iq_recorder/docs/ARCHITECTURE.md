@@ -135,7 +135,8 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | SFTP backend | One listing thread and one SSH session for browse/delete | `sftp_window.py` (`SftpBackend`) |
 | SFTP client | Paramiko connect (8 s), read (20 s), download via `.part` | `sftp_client.py`, `download_util.py` |
 | Listing groups | `_0001` / `_0002` as one capture; NEW badge | `listing_sort.py` |
-| Waterfall preview | First ~0.8 MB of a WAVE; STFT PNG | `spectrogram_preview.py`, `iq_wav.py` |
+| Waterfall preview | First ~0.8 MB of a WAVE or XDAT (headerless prefix decoded at the `.xhdr` rate); STFT computed once off the UI thread into a `WaterfallData` array (dB values, colour rows, colour bar, absolute axis and capture start when the metadata gives them, requested range) | `spectrogram_preview.py`, `iq_wav.py` |
+| Waterfall view | `WaterfallView` widget (1.16.0): wheel zooms the time axis at the pointer (`TimeWindow`, bounded to 64x / 4 columns), drag pans (clamped), Reset / Home restores; cursor readout of local time (file start + offset), RF frequency and dBFS/bin from the array; requested range markers and hatched *not recorded* ranges (`coverage_of`); the scene is rendered once per view change into a cached pixmap at the device pixel ratio, mouse moves only redraw the crosshair; handler timings kept in `timings` / `max_timings` | `waterfall_view.py` |
 | Excel log | Queue, backup, merge split names, COM or openpyxl; flushed on a worker thread (1.8.8) | `excel_log.py`, `excel_writer.py`, `excel_com.py` |
 | JSON state files | Atomic temp-file + replace writes, `.bak` fallback on a corrupt file (1.8.8) | `json_store.py` |
 | Collection catalog | Workbook classes, worksheets, frequency styles | `collection_catalog.py`, `class_match.py` |
@@ -204,7 +205,7 @@ Repeat (count or until stopped) waits after the current capture (default 5 s). *
 | --- | --- | --- |
 | Sensor Files | Button | Own window and SFTP session |
 | Download | Selection + Download | Up to four files at once; a file already saved with the sensor's size is skipped; never overwrites another file (a clash moves the recording to a sensor subfolder, then to `name (2).wav`); saved into `<root>/<YYYYMMDD>/` like the sensor (1.16.0) |
-| Waterfall | Click a WAVE | Prefix only; quiet start does not mean a quiet file |
+| Waterfall | Click a WAVE or XDAT; wheel / drag / Reset on the picture | Prefix only; quiet start does not mean a quiet file; zoom and pan never re-read the file |
 | Delete remote | Delete key on the list | Sensor files only; local copies and Excel stay |
 | IQ Storage | Connect, timer 30 s, after record/delete | Separate SFTP from Sensor Files |
 | Link badge | Every 10 s | HTTP only |
@@ -274,7 +275,7 @@ erDiagram
 | File part | Remote path, e.g. `.../file_122236_0001.wav` | Size, mtime from SFTP; `_0001` is a size split, not a frequency tile |
 | Group | `iq_group_key(name)` (stem without `_NNNN`) | All parts of one capture; parent row in Sensor Files; one Excel row |
 | Excel row | `sensor_id` + remote path (and group merge) | Typed Freq Start/Stop, class, filenames, Playback Start as `N seconds` |
-| Preview | `(path, size, mtime)` | Last 8 PNGs in that Sensor Files window |
+| Preview | `(path, size, mtime, requested_start_hz, requested_stop_hz)` | Last 8 waterfall arrays in that Sensor Files window |
 
 **Requested vs recorded**
 

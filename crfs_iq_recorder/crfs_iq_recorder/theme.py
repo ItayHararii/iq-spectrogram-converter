@@ -561,6 +561,15 @@ QLabel#previewImage {{
     border: 1px solid {p.border};
     border-radius: 8px;
 }}
+QLabel#previewReadout {{
+    color: {p.text};
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 12px;
+    padding: 2px 4px;
+    background: {p.bg};
+    border: 1px solid {p.border};
+    border-radius: 6px;
+}}
 QLabel#emptyState {{
     color: {p.muted};
     font-size: 14px;

@@ -89,6 +89,7 @@ from .spectrogram_preview import (
 )
 from .theme import current_palette, fit_window_to_screen, format_bytes
 from .validation import ValidationError, parse_optional_port
+from .waterfall_view import IDLE_READOUT, WaterfallView, format_capture_start
 from .worker_threads import track as track_worker_thread
 
 MAX_PARALLEL_DOWNLOADS = 4
@@ -570,6 +571,9 @@ class PreviewWorker(QObject):
         *,
         center_hz: int | None = None,
         bandwidth_hz: int | None = None,
+        requested_start_hz: int | None = None,
+        requested_stop_hz: int | None = None,
+        cache_id: tuple | None = None,
     ) -> None:
         super().__init__()
         self._state = state
@@ -577,6 +581,8 @@ class PreviewWorker(QObject):
         self._entry = entry
         self._center_hz = center_hz
         self._bandwidth_hz = bandwidth_hz
+        self._requested = (requested_start_hz, requested_stop_hz)
+        self._cache_id = cache_id
         self._cancel = threading.Event()
         self._browser: SftpBrowser | None = None
 
@@ -607,23 +613,35 @@ class PreviewWorker(QObject):
             self._browser.read_prefix(self._entry.path, tmp, PREVIEW_MAX_BYTES)
             if self._cancel.is_set():
                 raise PreviewError("Preview cancelled.")
-            if self._entry.name.lower().endswith(".wav"):
-                # Same session: two small reads (header and CRFS trailer), no extra connection.
+            name = self._entry.name.lower()
+            is_xdat = name.endswith(".xdat")
+            part = None
+            if name.endswith(".wav") or is_xdat:
+                # Same session: two small reads (WAVE header and CRFS trailer, or the .xhdr), no
+                # extra connection. They give the centre, the start time and, for XDAT, the rate
+                # the headerless prefix is decoded with.
                 try:
                     part = measure_part(self._browser, self._entry.path, int(self._entry.size or 0))
                     if part.readable:
                         self.measured.emit(part.to_dict())
                 except Exception:  # noqa: BLE001 - the Recorded columns then stay "unknown"
-                    pass
+                    part = None
+            if is_xdat and (part is None or not part.sample_rate_hz):
+                raise PreviewError("The sensor is still writing this file's header (.xhdr). Select it again in a moment.")
             mtime_ts = self._entry.modified.timestamp() if self._entry.modified else 0
             with _PREVIEW_COMPUTE:
                 if self._cancel.is_set():
                     raise PreviewError("Preview cancelled.")
                 result = build_preview_from_path(
                     tmp,
-                    cache_id=cache_key(self._entry.path, self._entry.size, mtime_ts),
+                    cache_id=self._cache_id or cache_key(self._entry.path, self._entry.size, mtime_ts),
                     center_hz=self._center_hz,
                     bandwidth_hz=self._bandwidth_hz,
+                    requested_start_hz=self._requested[0],
+                    requested_stop_hz=self._requested[1],
+                    metadata=part,
+                    xdat_sample_rate_hz=float(part.sample_rate_hz) if (is_xdat and part is not None and part.sample_rate_hz) else None,
+                    render_png=False,
                 )
             if self._cancel.is_set():
                 raise PreviewError("Preview cancelled.")
@@ -857,6 +875,11 @@ class SftpWindow(QWidget):
         preview_head.addWidget(preview_title)
         preview_head.addStretch(1)
         preview_head.addWidget(self.preview_file, 2)
+        self.preview_reset = QPushButton("Reset view")
+        self.preview_reset.setToolTip("Show the whole sample again after zooming or panning (Home).")
+        self.preview_reset.setEnabled(False)
+        self.preview_reset.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        preview_head.addWidget(self.preview_reset)
         preview_l.addLayout(preview_head)
         self.preview_busy = QProgressBar()
         self.preview_busy.setObjectName("thin")
@@ -873,7 +896,26 @@ class SftpWindow(QWidget):
         self.preview_image.setMinimumHeight(160)
         self.preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_image.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        preview_l.addWidget(self.preview_image, 1)
+        self.preview_view = WaterfallView()
+        self.preview_view.setToolTip("Mouse wheel: zoom the time axis at the cursor. Drag: pan. Home: whole sample.")
+        self.preview_stack = QStackedWidget()
+        self.preview_stack.addWidget(self.preview_image)
+        self.preview_stack.addWidget(self.preview_view)
+        self.preview_stack.setCurrentIndex(0)
+        preview_l.addWidget(self.preview_stack, 1)
+        self.preview_note = QLabel("")
+        self.preview_note.setObjectName("muted")
+        self.preview_note.setWordWrap(True)
+        self.preview_note.setVisible(False)
+        preview_l.addWidget(self.preview_note)
+        self.preview_readout = QLabel("")
+        self.preview_readout.setObjectName("previewReadout")
+        self.preview_readout.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.preview_readout.setVisible(False)
+        preview_l.addWidget(self.preview_readout)
+        self.preview_reset.clicked.connect(self.preview_view.reset_view)
+        self.preview_view.view_changed.connect(self._on_preview_view_changed)
+        self.preview_view.readout_changed.connect(self._on_preview_readout)
 
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.addWidget(self.table_stack)
@@ -1440,9 +1482,45 @@ class SftpWindow(QWidget):
         self.preview_file.setText("Select a WAVE file")
         self.preview_file.setProperty("remote_path", "")
         self.preview_caption.setText("Select a WAVE file.")
-        self.preview_image.setPixmap(QPixmap())
-        self.preview_image.setText("The waterfall appears here.")
+        self._show_preview_message("The waterfall appears here.")
         self._set_preview_busy(False)
+
+    def _show_preview_message(self, text: str) -> None:
+        """Plain text instead of a picture; the interactive view and its lines are hidden."""
+        self.preview_view.clear()
+        self.preview_stack.setCurrentIndex(0)
+        self.preview_image.setPixmap(QPixmap())
+        self.preview_image.setText(text)
+        self.preview_note.setVisible(False)
+        self.preview_note.setText("")
+        self.preview_readout.setVisible(False)
+        self.preview_readout.setText("")
+        self.preview_reset.setEnabled(False)
+
+    def _requested_range(self, entry: RemoteEntry) -> tuple[int | None, int | None]:
+        """Start/stop the operator asked for, from the recording this file belongs to."""
+        rec = self._matched.get(entry.path)
+        start = getattr(rec, "start_hz", None)
+        stop = getattr(rec, "end_hz", None)
+        if rec is None or start is None or stop is None:
+            return None, None
+        try:
+            return int(start), int(stop)
+        except (TypeError, ValueError):
+            return None, None
+
+    @Slot()
+    def _on_preview_view_changed(self) -> None:
+        view = self.preview_view
+        self.preview_reset.setEnabled(view.zoomed)
+        if view.data is not None and view.readout_text() == "":
+            self.preview_readout.setText(IDLE_READOUT)
+
+    @Slot(str)
+    def _on_preview_readout(self, text: str) -> None:
+        if self.preview_view.data is None:
+            return
+        self.preview_readout.setText(text or IDLE_READOUT)
 
     def _on_selection_changed(self) -> None:
         files = self._selected_files()
@@ -2123,9 +2201,17 @@ class SftpWindow(QWidget):
         self._preview_token += 1
         token = self._preview_token
         mtime_ts = entry.modified.timestamp() if entry.modified else 0
-        key = cache_key(entry.path, entry.size, mtime_ts)
+        key = cache_key(entry.path, entry.size, mtime_ts) + self._requested_range(entry)
         self.preview_file.setText(entry.name)
         self.preview_file.setProperty("remote_path", entry.path)
+        lower = entry.name.lower()
+        if lower.endswith((".xhdr", ".xmrk")):
+            # Sidecars hold no samples; the waterfall belongs to the .xdat beside them.
+            self._preview_pending = None
+            self._set_preview_busy(False)
+            self.preview_caption.setText("Header and marker files have no samples.")
+            self._show_preview_message("Select the .xdat file beside it to see its waterfall.")
+            return
         cached = self._preview_cache.get(key)
         if cached is not None:
             self._set_preview_busy(False)
@@ -2135,8 +2221,7 @@ class SftpWindow(QWidget):
         self.preview_caption.setText("Preparing waterfall…")
         self._preview_source = None
         self._preview_scaled_key = None
-        self.preview_image.setPixmap(QPixmap())
-        self.preview_image.setText("Preparing waterfall…")
+        self._show_preview_message("Preparing waterfall…")
         if self._preview_jobs:
             for thread, worker in list(self._preview_jobs):
                 try:
@@ -2180,9 +2265,21 @@ class SftpWindow(QWidget):
         rec = self._matched.get(entry.path)
         center = int(rec.center_hz) if rec is not None else None
         bandwidth = int(rec.bandwidth_hz) if rec is not None else None
+        start_hz, stop_hz = self._requested_range(entry)
+        mtime_ts = entry.modified.timestamp() if entry.modified else 0
+        key = cache_key(entry.path, entry.size, mtime_ts) + (start_hz, stop_hz)
         self._preview_active = True
         thread = QThread()
-        worker = PreviewWorker(self._state, token, entry, center_hz=center, bandwidth_hz=bandwidth)
+        worker = PreviewWorker(
+            self._state,
+            token,
+            entry,
+            center_hz=center,
+            bandwidth_hz=bandwidth,
+            requested_start_hz=start_hz,
+            requested_stop_hz=stop_hz,
+            cache_id=key,
+        )
         worker.moveToThread(thread)
         queued = Qt.ConnectionType.QueuedConnection
         worker.finished.connect(self._on_preview_ready, queued)
@@ -2222,19 +2319,40 @@ class SftpWindow(QWidget):
             return
         self._set_preview_busy(False)
         self._preview_source = None
-        self.preview_image.setPixmap(QPixmap())
-        self.preview_image.setText("")
+        self._show_preview_message("")
         self.preview_caption.setText(detail)
 
     def _show_preview(self, result: PreviewResult, token: int) -> None:
         if token != self._preview_token:
             return
         self._set_preview_busy(False)
+        data = result.data
+        if data is not None:
+            # Interactive view: the whole sample first; wheel and drag work on the computed array.
+            self._preview_source = None
+            self._preview_scaled_key = None
+            self.preview_image.setPixmap(QPixmap())
+            self.preview_image.setText("")
+            self.preview_view.set_data(data)
+            self.preview_stack.setCurrentIndex(1)
+            coverage = self.preview_view.coverage
+            self.preview_note.setText(coverage.note if coverage is not None else "")
+            self.preview_note.setVisible(bool(self.preview_note.text()))
+            self.preview_readout.setText(IDLE_READOUT)
+            self.preview_readout.setVisible(True)
+            self.preview_reset.setEnabled(False)
+            self.preview_caption.setText(f"{result.caption}  ·  {format_capture_start(data.capture_start)}")
+            return
         pixmap = QPixmap()
         pixmap.loadFromData(result.png_bytes, "PNG")
         if pixmap.isNull():
             self.preview_caption.setText(result.caption)
             return
+        self.preview_view.clear()
+        self.preview_stack.setCurrentIndex(0)
+        self.preview_note.setVisible(False)
+        self.preview_readout.setVisible(False)
+        self.preview_reset.setEnabled(False)
         self._preview_source = pixmap
         self._preview_scaled_key = None
         self.preview_image.setText("")
