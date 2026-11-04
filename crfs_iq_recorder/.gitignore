@@ -13,6 +13,7 @@ __pycache__/
 # Local settings, history, secrets (plus the .bak / .tmp files of the crash-safe writer)
 .crfs_iq_recorder_settings.json
 .crfs_iq_recorder_recordings.json
+.crfs_iq_recorder_file_measurements.json
 .crfs_iq_recorder_*.json.bak
 .crfs_iq_recorder_*.json.*.tmp
 merge_history.json

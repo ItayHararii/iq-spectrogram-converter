@@ -192,7 +192,7 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         assert panel.retry_btn.isHidden(), "nothing failed, nothing to retry"
         card = panel.result_card
         assert not card.isHidden() and card.title.text().startswith("Row 2 of 2: ")
-        assert card.requested.text() == "Requested: 10 MHz for 1 s" and card.received.text().startswith("Received: 1 file, ")
+        assert card.requested.text() == "Requested: 10 MHz for 1 s" and card.received.text().startswith("Received (read from the files): 1 file, ")
         assert card.tag.text() == "Complete" and "Saved locally" in card.states.text()
         assert card.open_btn.isEnabled() and card.waterfall_btn.isEnabled()
         assert window._external_owner == ""
@@ -703,6 +703,20 @@ def test_retry_failed_rows_from_the_pass_summary_sends_the_rejected_row_as_attem
         assert panel.result_card.title.text() == "Row 1 of 2: 703-713 MHz (attempt 2)"
         first = runner.session.tasks[runner.status()["last_round_id"]][0]
         assert first.attempts == 2 and first.status == T_CONFIRMED and len(first.history) == 1
+        # A file given up while the sensor accepted no connection: the pass box says so and
+        # "Retry downloads" fetches it without recording anything again.
+        assert panel.retry_dl_btn.isHidden()
+        item = first.files[0]
+        item["download_status"] = "failed"
+        panel._on_status(runner.status())
+        assert panel.pass_counts.text().endswith("\nNot downloaded: 1 file, still on the sensor.")
+        assert not panel.retry_dl_btn.isHidden() and panel.retry_dl_btn.isEnabled()
+        panel.retry_dl_btn.click()
+        assert _pump_until(qapp, lambda: item["download_status"] == "verified", timeout=10.0), item
+        assert _pump_until(qapp, lambda: runner.background_jobs() == 0, timeout=10.0)
+        panel._on_status(runner.status())
+        assert panel.retry_dl_btn.isHidden() and "Not downloaded" not in panel.pass_counts.text()
+        assert first.attempts == 2 and runner.state == S_DONE, "nothing was recorded again"
         panel.pass_dismiss_btn.click()
         assert panel.pass_box.isHidden()
     finally:

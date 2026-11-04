@@ -1223,20 +1223,10 @@ def polish_combo_popups(root: QWidget) -> None:
 
 
 def format_bytes(size: int) -> str:
-    value = float(max(int(size or 0), 0))
-    if value < 1024:
-        return f"{int(value)} B"
-    if value < 1024 * 1024:
-        text = f"{value / 1024:.1f}"
-        return f"{text.rstrip('0').rstrip('.')} KB"
-    if value < 1024 * 1024 * 1024:
-        text = f"{value / (1024 * 1024):.1f}"
-        return f"{text.rstrip('0').rstrip('.')} MB"
-    if value < 1024 * 1024 * 1024 * 1024:
-        text = f"{value / (1024 * 1024 * 1024):.2f}"
-        return f"{text.rstrip('0').rstrip('.')} GB"
-    text = f"{value / (1024 * 1024 * 1024 * 1024):.2f}"
-    return f"{text.rstrip('0').rstrip('.')} TB"
+    """Decimal MB/GB, the same units as the size estimate (the tooltips add bytes and MiB)."""
+    from .operator_text import size_text
+
+    return size_text(size)
 
 
 def format_display_date(value: datetime) -> str:

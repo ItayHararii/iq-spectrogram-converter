@@ -44,6 +44,14 @@ class ResultCard(QFrame):
         self.recorded = QLabel("")
         self.states = QLabel("")
         self.states.setObjectName("muted")
+        self.requested.setToolTip("What the application asked CRFS for: bandwidth and duration as sent.")
+        self.received.setToolTip(
+            "Read from each file's WAVE header: samples divided by the sample rate, and the file sizes. "
+            "\"unknown\" when the header could not be read."
+        )
+        self.recorded.setToolTip(
+            "The centre frequency and bandwidth CRFS stored in the file. \"unknown\" when the file holds none."
+        )
         for label in (self.requested, self.received, self.recorded, self.states):
             label.setWordWrap(True)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)

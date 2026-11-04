@@ -80,8 +80,9 @@ from .cellular_workbook import (
     queue_path,
 )
 from .diagnostic_log import diag
+from .download_util import already_saved
 from .excel_writer import ExcelBusyError
-from .operator_text import clip, seconds_text
+from .operator_text import clip, files_text, seconds_text
 from .result_view import EXCEL_FAILED, EXCEL_PENDING, EXCEL_UPDATED, ResultView, view_from_task
 from .sensor_label import workbook_sensor_name
 from .worker_threads import track as track_worker_thread
@@ -121,7 +122,12 @@ DL_VERIFIED = "verified"
 DL_FAILED = "failed"
 
 MAX_DOWNLOADS = 2
+# A transfer that failed after the connection was made (cut, short, local
+# check) is tried again twice, DOWNLOAD_RETRY_DELAY_S apart. Waiting for the
+# sensor to accept a connection is not a failed attempt: the download worker
+# waits on its own (sftp_window.CONNECT_PATIENCE_S) and then gives up.
 DOWNLOAD_RETRIES = 2
+DOWNLOAD_RETRY_DELAY_S = 10.0
 NOT_SENT_RETRIES = 1
 DEFAULT_BACKLOG_LIMIT = 8
 DEFAULT_LOCAL_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
@@ -585,6 +591,10 @@ class CellularRunner(QObject):
         self._quality_jobs: list[tuple[QThread, QObject]] = []
         self._quality_pending: list[QObject] = []
         self._refreshes = 0  # listings scheduled before a capture's downloads start
+        self._retry_at: dict[int, float] = {}  # id(file item) -> monotonic time its next attempt may start
+        self._downloads_waiting = False  # a download waits for the sensor to accept a connection
+        self._downloads_stopped_logged = False
+        self._backlog_failed_base = 0
         # A finished session reopened with downloads that never completed: Continue only downloads them.
         self._downloads_only = False
         self._excel_retry: set[tuple[str, str]] = set()
@@ -628,11 +638,33 @@ class CellularRunner(QObject):
             elif self.state == S_INTERRUPTED and not self._downloads_only and self._mark_missed_while_closed(self._clock()):
                 # Logged once the panel listens; the window is still being built here.
                 QTimer.singleShot(0, self, self._note_missed_rounds)
+        if self.session is not None:
+            # Collections recorded before Sensor Files kept per-file readings still show them there.
+            QTimer.singleShot(0, self, self._backfill_file_measurements)
         # Results that could not be written before the last exit (Excel had the
         # workbook, the application was closed) are written now, whether or not
         # the collection itself is finished; a busy workbook is retried.
         if queue_path(self._config_dir).is_file() and self.workbook_pending() > 0:
             QTimer.singleShot(1500, self, self._flush_workbook)
+
+    def _backfill_file_measurements(self) -> None:
+        if self.session is None or self.session.plan.legacy:
+            return
+        from .file_measurements import record_parts
+
+        conn = getattr(self.host, "_conn", None)
+        if conn is not None and getattr(conn, "demo", False):
+            return
+        parts = [
+            part
+            for tasks in self.session.tasks.values()
+            for state in tasks
+            if state.status == T_CONFIRMED
+            for part in ((state.summary or {}).get("measurement") or {}).get("parts") or []
+        ]
+        added = record_parts(str(getattr(conn, "host", "") or ""), parts) if parts else 0
+        if added:
+            diag("file_measurements_backfilled", files=added)
 
     # ------------------------------------------------------------------ helpers
     def _log(self, message: str, level: str = "info") -> None:
@@ -940,7 +972,12 @@ class CellularRunner(QObject):
             reason = self._backlog_reason()
             if reason is None:
                 self.session.pause_reason = ""
-                self._log("Downloads caught up. The collection continues.")
+                given_up = self.failed_downloads() - self._backlog_failed_base
+                if given_up > 0:
+                    # The queue shrank because files were given up, not because they arrived.
+                    self._log(f"Not downloaded: {files_text(given_up)}, still on the sensor. The collection continues.", "error")
+                else:
+                    self._log("Downloads caught up. The collection continues.")
                 self.state = S_RUNNING if self.current_round() is not None else S_WAITING_SCHEDULE
             else:
                 self.session.pause_reason = reason
@@ -1029,6 +1066,7 @@ class CellularRunner(QObject):
         if reason is not None:
             self.state = S_PAUSED_BACKLOG
             self.session.pause_reason = reason
+            self._backlog_failed_base = self.failed_downloads()
             self._log(reason, "error")
             self._save()
             return
@@ -1110,6 +1148,7 @@ class CellularRunner(QObject):
             if "storage" in lowered:
                 self.state = S_PAUSED_BACKLOG
                 self.session.pause_reason = error
+                self._backlog_failed_base = self.failed_downloads()
                 self._log(f"Paused: {error}", "error")
                 self._save()
                 return
@@ -1530,8 +1569,16 @@ class CellularRunner(QObject):
     def _drain_downloads(self) -> None:
         if self.session is None:
             return
-        while self._downloads_pending and len(self._downloads_active) < MAX_DOWNLOADS:
-            task_key, round_id, item = self._downloads_pending.pop(0)
+        now = time.monotonic()
+        while len(self._downloads_active) < MAX_DOWNLOADS:
+            index = next(
+                (i for i, entry in enumerate(self._downloads_pending) if self._retry_at.get(id(entry[2]), 0.0) <= now),
+                None,
+            )
+            if index is None:
+                return
+            task_key, round_id, item = self._downloads_pending.pop(index)
+            self._retry_at.pop(id(item), None)
             self._start_download(task_key, round_id, item)
 
     def _start_download(self, task_key: str, round_id: str, item: dict[str, Any]) -> None:
@@ -1545,14 +1592,19 @@ class CellularRunner(QObject):
         folder = Path(self._download_dir())
         folder.mkdir(parents=True, exist_ok=True)
         local = folder / str(item["name"])
-        if local.is_file() and local.stat().st_size == int(item.get("size") or 0) and int(item.get("size") or 0) > 0:
-            item["download_status"] = DL_VERIFIED if not self.session.settings.verify_checksums else "present"
-            item["local_path"] = str(local)
-            diag("download_present", str(item["name"]), size=int(item.get("size") or 0))
-            if self.session.settings.verify_checksums:
-                self._start_checksum(task_key, str(item["name"]), str(local))
-            self._save()
-            return
+        state = self.session.task_by_key(round_id, task_key)
+        if already_saved(local, int(item.get("size") or 0)):
+            problem = self._local_copy_problem(state, item, local)
+            if not problem:
+                item["download_status"] = DL_VERIFIED if not self.session.settings.verify_checksums else "present"
+                item["local_path"] = str(local)
+                diag("download_present", str(item["name"]), size=int(item.get("size") or 0))
+                if self.session.settings.verify_checksums:
+                    self._start_checksum(task_key, str(item["name"]), str(local))
+                self._save()
+                return
+            # A same-size copy that does not check out is downloaded again (it is replaced, never doubled).
+            diag("download_present_unverified", str(item["name"]), problem=problem)
         item["download_status"] = DL_ACTIVE
         item["attempts"] = int(item.get("attempts") or 0) + 1
         thread = QThread()
@@ -1561,12 +1613,49 @@ class CellularRunner(QObject):
         queued = Qt.ConnectionType.QueuedConnection
         worker.finished.connect(self._on_download_finished, queued)
         worker.failed.connect(self._on_download_failed, queued)
+        worker.waiting.connect(self._on_download_waiting, queued)
+        worker.connected.connect(self._on_download_connected, queued)
+        worker.unreachable.connect(self._on_download_unreachable, queued)
         thread.started.connect(worker.run)
         thread.finished.connect(self._on_download_thread_finished, queued)
         self._downloads_active.append((thread, worker, task_key, round_id))
         track_worker_thread(thread, worker)
         thread.start()
         self._save()
+
+    def _local_copy_problem(self, state: TaskState | None, item: dict[str, Any], path: Path) -> str:
+        """Why a local file is not a verified copy of the sensor's file ('' when it is).
+
+        The size must be the sensor's; a WAVE file must also parse and hold the
+        samples that were read from the same file on the sensor.
+        """
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            return f"not readable ({exc.strerror or exc})"
+        expected = int(item.get("size") or 0)
+        if expected and size != expected:
+            return f"{size:,} bytes locally, {expected:,} on the sensor"
+        if not str(item.get("name") or path.name).lower().endswith(".wav"):
+            return ""
+        from .iq_merge import MergeError, inspect_part
+
+        try:
+            info = inspect_part(path)
+        except MergeError as exc:
+            return str(exc)
+        except Exception as exc:  # noqa: BLE001 - an unreadable copy is not verified
+            return f"header not readable ({type(exc).__name__})"
+        if any("truncated" in problem for problem in info.problems):
+            return "the local copy is cut short"
+        rate = float(info.fmt.sample_rate or 0)
+        measured = _measured_part(state, item)
+        if rate > 0 and measured is not None and measured.get("duration_s") is not None:
+            local_s = info.frames / rate
+            sensor_s = float(measured["duration_s"])
+            if abs(local_s - sensor_s) > 1.5 / rate:
+                return f"{local_s:.6f} s of samples locally, {sensor_s:.6f} s read on the sensor"
+        return ""
 
     def _find_file(self, name: str) -> tuple[TaskState, dict[str, Any]] | None:
         if self.session is None:
@@ -1597,6 +1686,10 @@ class CellularRunner(QObject):
         if actual and actual != listed:
             item["listed_size"] = listed
             item["size"] = actual
+        problem = self._local_copy_problem(state, item, Path(path))
+        if problem:
+            self._transfer_failed(state, item, f"Local copy check failed: {problem}")
+            return
         if self.session.settings.verify_checksums:
             item["download_status"] = "present"
             self._start_checksum(state.task_key, name, path)
@@ -1613,19 +1706,126 @@ class CellularRunner(QObject):
         if found is None:
             return
         state, item = found
-        diag("download_failed", name, attempt=int(item.get("attempts") or 0), detail=str(detail))
+        self._transfer_failed(state, item, str(detail))
+
+    def _transfer_failed(self, state: TaskState, item: dict[str, Any], detail: str) -> None:
+        """The connection was made but the copy failed: try again later, at most DOWNLOAD_RETRIES times."""
+        name = str(item.get("name") or "")
+        diag("download_failed", name, attempt=int(item.get("attempts") or 0), detail=detail)
         if int(item.get("attempts") or 0) <= DOWNLOAD_RETRIES:
             item["download_status"] = DL_PENDING
-            self._log("Download failed. Trying again. See details.", "error")
+            self._retry_at[id(item)] = time.monotonic() + DOWNLOAD_RETRY_DELAY_S
             self._downloads_pending.append((state.task_key, state.round_id, item))
+            # The session timer is stopped once the last capture is done.
+            QTimer.singleShot(int(DOWNLOAD_RETRY_DELAY_S * 1000) + 50, self, self._drain_downloads)
         else:
             item["download_status"] = DL_FAILED
             item["note"] = detail
             state.notes.append(f"Download failed for {name}: {detail}")
-            self._log(f"Download failed {item['attempts']} times. The file stays on the sensor. See details.", "error")
+            self._log(f"Download of {name} failed {item['attempts']} times. It stays on the sensor. See details.", "error")
             self._rewrite_manifest(state)
         self._save()
         self._emit_status()
+
+    @Slot(str, float, str)
+    def _on_download_waiting(self, name: str, delay_s: float, detail: str) -> None:
+        """The sensor does not accept a new connection yet; the worker tries again on its own."""
+        diag("download_waiting", name, delay_s=round(float(delay_s), 1), detail=detail)
+        if not self._downloads_waiting:
+            self._downloads_waiting = True
+            if not self._downloads_stopped_logged:
+                self._log("Downloads are waiting: the sensor is not accepting new connections. They try again on their own.", "error")
+            self._emit_status()
+
+    @Slot(str)
+    def _on_download_connected(self, name: str) -> None:
+        self._downloads_stopped_logged = False
+        if self._downloads_waiting:
+            self._downloads_waiting = False
+            diag("download_connected", name)
+            self._log("The sensor accepts connections again. Downloads continue.")
+            self._emit_status()
+
+    @Slot(str, str)
+    def _on_download_unreachable(self, name: str, detail: str) -> None:
+        """No connection for CONNECT_PATIENCE_S: this file and the queued ones stay on the sensor."""
+        from .sftp_window import CONNECT_PATIENCE_S
+
+        found = self._find_file(name)
+        if found is None:
+            return
+        state, item = found
+        diag("download_unreachable", name, detail=detail)
+        minutes = int(CONNECT_PATIENCE_S // 60)
+        note = f"Not downloaded: the sensor accepted no new connection for {minutes} min. The file stays on the sensor."
+        # Waiting for a connection was not an attempt at the transfer.
+        item["attempts"] = max(int(item.get("attempts") or 0) - 1, 0)
+        given_up = [(state, item)]
+        for task_key, round_id, queued in list(self._downloads_pending):
+            owner = self.session.task_by_key(round_id, task_key) if self.session is not None else None
+            if owner is not None:
+                given_up.append((owner, queued))
+        self._downloads_pending.clear()
+        self._retry_at.clear()
+        for owner, entry in given_up:
+            entry["download_status"] = DL_FAILED
+            entry["note"] = note
+            owner.notes.append(f"{entry.get('name')}: {note}")
+        for owner in {id(o): o for o, _e in given_up}.values():
+            self._rewrite_manifest(owner)
+        self._downloads_waiting = False
+        if not self._downloads_stopped_logged:
+            self._downloads_stopped_logged = True
+            self._log(
+                f"Downloads stopped: the sensor accepted no new connection for {minutes} min. "
+                "The files stay on the sensor; use Retry downloads.",
+                "error",
+            )
+        self._save()
+        self._emit_status()
+
+    def failed_downloads(self) -> int:
+        """Files of confirmed recordings that were given up (they are still on the sensor)."""
+        if self.session is None:
+            return 0
+        return sum(
+            1
+            for tasks in self.session.tasks.values()
+            for state in tasks
+            if state.status == T_CONFIRMED
+            for item in state.files
+            if item.get("download_status") == DL_FAILED
+        )
+
+    def retry_failed_downloads(self) -> str:
+        """'Retry downloads': queue every given-up file of the session again (explicit operator action)."""
+        if self.session is None:
+            return "No collection to download."
+        mismatch = self.identity_mismatch()
+        if mismatch:
+            return mismatch
+        count = 0
+        for tasks in self.session.tasks.values():
+            for state in tasks:
+                if state.status != T_CONFIRMED:
+                    continue
+                for item in state.files:
+                    if item.get("download_status") != DL_FAILED or any(entry[2] is item for entry in self._downloads_pending):
+                        continue
+                    item["download_status"] = DL_PENDING
+                    item["attempts"] = 0
+                    item["note"] = ""
+                    self._downloads_pending.append((state.task_key, state.round_id, item))
+                    count += 1
+        if not count:
+            return "No file is waiting to be downloaded again."
+        self._downloads_stopped_logged = False
+        diag("download_retry_requested", files=count)
+        self._save()
+        self._timer.start()
+        self._drain_downloads()
+        self._emit_status()
+        return f"Downloading {files_text(count)} again."
 
     @Slot()
     def _on_download_thread_finished(self) -> None:
@@ -2764,6 +2964,8 @@ class CellularRunner(QObject):
             "delayed_rounds": [r.round_id for r in delayed],
             "missed_rounds": [r.round_id for r in missed],
             "pending_downloads": pending_dl,
+            "downloads_waiting": self._downloads_waiting and pending_dl > 0,
+            "failed_downloads": self.failed_downloads(),
             "pending_excel": pending_excel,
             "remaining_s": remaining_s,
             "remaining_bytes": remaining_bytes,
@@ -2814,6 +3016,19 @@ class CellularRunner(QObject):
             + len(self._quality_pending)
             + (1 if self._workbook_flushing else 0)
         )
+
+
+def _measured_part(state: Any, item: dict[str, Any]) -> dict[str, Any] | None:
+    """What was read from this file's header on the sensor when the capture was confirmed."""
+    summary = getattr(state, "summary", None) or {}
+    parts = (summary.get("measurement") or {}).get("parts") or []
+    remote = str(item.get("remote_path") or "")
+    name = str(item.get("name") or "")
+    for part in parts:
+        path = str(part.get("path") or "")
+        if path == remote or (name and path.rsplit("/", 1)[-1] == name):
+            return part
+    return None
 
 
 def _identity_text(value: Any) -> str:

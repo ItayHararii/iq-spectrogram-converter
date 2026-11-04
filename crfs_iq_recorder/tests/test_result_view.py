@@ -36,8 +36,8 @@ def _summary(result: str, parts: list[dict], *, requested=2.0, bandwidth=100 * M
 def test_complete_recording_shows_requested_received_and_the_recorded_range():
     view = view_from_summary(_summary("completed", [_part(PATHS[0], 1.2), _part(PATHS[1], 0.8)]), title="3500-3600 MHz")
     assert view.requested == "Requested: 100 MHz for 2 s"
-    assert view.received == "Received: 2 files, 2.00 s"
-    assert view.recorded == "Recorded: 3500-3600 MHz (100 MHz)"
+    assert view.received == "Received (read from the files): 2 files, 2.000 s, 2 kB"
+    assert view.recorded == "Recorded (file metadata): 3500-3600 MHz (100 MHz)"
     assert (view.tag, view.tag_style) == ("Complete", "badgeOk")
     assert view.states_text == "Files ready · On the sensor"
     assert not view.local_ready
@@ -46,7 +46,7 @@ def test_complete_recording_shows_requested_received_and_the_recorded_range():
 def test_short_recording_is_tagged_partial_and_the_tolerance_is_two_percent():
     assert PARTIAL_TOLERANCE == 0.02
     view = view_from_summary(_summary("partial", [_part(PATHS[0], 1.4)]))
-    assert view.received == "Received: 1 file, 1.40 s"
+    assert view.received == "Received (read from the files): 1 file, 1.400 s, 1 kB"
     assert (view.tag, view.tag_style) == ("Partial", "badgeWait")
     assert view.recording_state == "Files ready"
 
@@ -54,8 +54,8 @@ def test_short_recording_is_tagged_partial_and_the_tolerance_is_two_percent():
 def test_unread_metadata_reads_unknown_never_the_requested_values():
     parts = [{"path": PATHS[0], "size": 1000, "duration_s": None}]
     view = view_from_summary(_summary("unconfirmed", parts))
-    assert view.received == "Received: 1 file, duration unknown"
-    assert view.recorded == "Recorded range: unknown"
+    assert view.received == "Received (read from the files): 1 file, duration unknown"
+    assert view.recorded == "Recorded (file metadata): unknown"
     assert (view.tag, view.recording_state) == ("Uncertain", "Not confirmed")
 
 
@@ -64,15 +64,28 @@ def test_a_wider_request_recorded_narrower_says_so():
     parts = [_part(PATHS[0], 2.0, centre=3550 * MHZ, bandwidth=100 * MHZ)]
     view = view_from_summary(_summary("completed", parts, bandwidth=500 * MHZ))
     assert view.requested == "Requested: 500 MHz for 2 s"
-    assert view.recorded == "Recorded: 3500-3600 MHz (100 MHz), not the requested range"
+    assert view.recorded == "Recorded (file metadata): 3500-3600 MHz (100 MHz), not the requested range"
     # Counted as completed (time and data), but the badge does not claim the requested range.
     assert view.result == "completed"
     assert (view.tag, view.tag_style) == ("Other range", "badgeWait")
 
 
+def test_node_100_18_file_shows_its_measured_seconds_rate_and_decimal_size():
+    """Hardware values (R100-18, 2026-11-04): 0.5 s requested at 500 MHz; the file holds
+    62,853,088 samples at 125 MS/s (0.502824704 s) in 251,413,056 bytes, metadata 100 MHz at 3550 MHz."""
+    part = {
+        "path": PATHS[0], "size": 251_413_056, "duration_s": 0.502824704, "sample_rate_hz": 125e6,
+        "centre_hz": 3550 * MHZ, "bandwidth_hz": 100 * MHZ,
+    }
+    view = view_from_summary(_summary("completed", [part], requested=0.5, bandwidth=500 * MHZ))
+    assert view.requested == "Requested: 500 MHz for 0.5 s"
+    assert view.received == "Received (read from the files): 1 file, 0.503 s at 125 MS/s, 251.4 MB"
+    assert view.recorded == "Recorded (file metadata): 3500-3600 MHz (100 MHz), not the requested range"
+
+
 def test_no_files_is_failed_with_no_transfer_state():
     view = view_from_summary(_summary("failed", []))
-    assert view.received == "Received: no files" and view.recorded == "Recorded range: unknown"
+    assert view.received == "Received: no files" and view.recorded == "Recorded (file metadata): unknown"
     assert (view.tag, view.tag_style) == ("Failed", "badgeBad")
     assert view.transfer_state == "" and view.states_text == "Not recorded"
 

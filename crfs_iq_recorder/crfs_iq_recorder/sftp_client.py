@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import socket
 import stat
 import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +34,17 @@ class SftpError(Exception):
 
 class SftpNotFoundError(SftpError):
     """The remote path does not exist (as opposed to the session failing)."""
+
+
+class SftpConnectError(SftpError):
+    """No SSH session could be opened, so nothing was transferred.
+
+    `retry_after_s` is set while new connections are held back after a timeout.
+    """
+
+    def __init__(self, message: str, *, retry_after_s: float = 0.0) -> None:
+        super().__init__(message)
+        self.retry_after_s = max(float(retry_after_s or 0.0), 0.0)
 
 
 def _mtime(value: float | int | None) -> datetime | None:
@@ -129,6 +143,109 @@ SFTP_READ_TIMEOUT_S = 20.0
 # are gated process-wide; open sessions are not limited.
 SSH_HANDSHAKE_SLOTS = 2
 _handshake_gate = threading.BoundedSemaphore(SSH_HANDSHAKE_SLOTS)
+# Measured on an RFeye Node 100-18 over OpenVPN: after about six new SSH
+# connections within ten seconds, further ones were dropped (the TCP connect
+# timed out while HTTP on the same sensor answered at once) until nothing had
+# been tried for ~15 s. A timed-out connect sends several SYNs, so retrying at
+# once kept the block in place: in one collection 11 of 15 downloads gave up.
+# New connections are paced process-wide; after a connect timeout none is
+# tried for a cool-down, then one at a time until one gets through.
+SSH_CONNECT_WINDOW_S = 10.0
+SSH_CONNECTS_PER_WINDOW = 3
+SSH_COOLDOWN_S = 20.0
+SSH_COOLDOWN_MAX_S = 60.0
+
+
+class ConnectPacer:
+    """When a new SSH connection may be opened (shared by every SFTP user in the process)."""
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._cond = threading.Condition()
+        self._clock = clock
+        self._starts: deque[float] = deque()
+        self._blocked_until = 0.0
+        self._timeouts = 0
+        self._probing = False
+
+    def cooling_down_s(self) -> float:
+        """Seconds until new connections are tried again (0 when they may be opened)."""
+        with self._cond:
+            return max(self._blocked_until - self._clock(), 0.0)
+
+    def acquire(self, cancel: threading.Event | None = None) -> None:
+        """Wait for a turn; raises SftpConnectError while connections are held back."""
+        with self._cond:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise SftpError("SFTP cancelled.")
+                now = self._clock()
+                if now < self._blocked_until:
+                    wait = self._blocked_until - now
+                    raise SftpConnectError(
+                        f"The sensor is not accepting new SFTP connections; trying again in {int(wait + 0.999)} s.",
+                        retry_after_s=wait,
+                    )
+                if self._timeouts and self._probing:
+                    # Another connection is finding out whether the sensor accepts them again.
+                    self._cond.wait(0.2)
+                    continue
+                while self._starts and now - self._starts[0] >= SSH_CONNECT_WINDOW_S:
+                    self._starts.popleft()
+                if len(self._starts) >= SSH_CONNECTS_PER_WINDOW:
+                    self._cond.wait(min(0.2, max(self._starts[0] + SSH_CONNECT_WINDOW_S - now, 0.01)))
+                    continue
+                self._starts.append(now)
+                if self._timeouts:
+                    self._probing = True
+                return
+
+    def reached(self) -> None:
+        """The sensor answered (logged in, or refused the login): connections are accepted."""
+        with self._cond:
+            self._timeouts = 0
+            self._probing = False
+            self._blocked_until = 0.0
+            self._cond.notify_all()
+
+    def timed_out(self) -> float:
+        """A connect timed out: hold new connections back. Returns the cool-down in seconds."""
+        with self._cond:
+            self._timeouts += 1
+            self._probing = False
+            cool = min(SSH_COOLDOWN_S * (2 ** (self._timeouts - 1)), SSH_COOLDOWN_MAX_S)
+            self._blocked_until = self._clock() + cool
+            self._cond.notify_all()
+            return cool
+
+    def failed(self) -> None:
+        """Another connection failure (refused, unreachable): nothing learnt about the block."""
+        with self._cond:
+            self._probing = False
+            self._cond.notify_all()
+
+
+connect_pacer = ConnectPacer()
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """A TCP connect or SSH banner that timed out (paramiko wraps the latter in SSHException)."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, socket.timeout)) or "timed out" in str(current).lower():
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _failure_text(exc: BaseException) -> str:
+    text = str(exc).strip()
+    if text:
+        return text
+    return "timed out" if _is_timeout(exc) else type(exc).__name__
+
+
 # paramiko's transport thread logs a full traceback when a socket is closed
 # under it (our cancel path). Without a handler Python prints that to the
 # console; the app reports the outcome itself. A configured logger still gets it.
@@ -265,7 +382,13 @@ class ParamikoSftpBrowser(SftpBrowser):
         try:
             self._sftp.get(remote_path, str(tmp), callback=_cb)
             _raise_if_cancelled(cancel)
-            finalize_download(tmp, local_path, expected_size=expected_size)
+            # The sensor's size now, not the one listed earlier: a file it was
+            # still writing must not count as downloaded.
+            final = int(self._sftp.stat(remote_path).st_size or 0)
+            got = tmp.stat().st_size
+            if final and got != final:
+                raise SftpError(f"Download incomplete: {got:,} of {final:,} bytes arrived.")
+            finalize_download(tmp, local_path, expected_size=max(int(expected_size or 0), final))
         except SftpError:
             cleanup_part(tmp)
             raise
@@ -367,6 +490,7 @@ def connect_sftp(
 
     def _connect(client, extra: dict | None = None) -> None:
         _raise_if_cancelled()
+        connect_pacer.acquire(cancel)
         kwargs = {
             "hostname": host,
             "port": int(port),
@@ -380,7 +504,18 @@ def connect_sftp(
         }
         if extra:
             kwargs.update(extra)
-        client.connect(**kwargs)
+        try:
+            client.connect(**kwargs)
+        except paramiko.AuthenticationException:
+            connect_pacer.reached()
+            raise
+        except Exception as exc:
+            if _is_timeout(exc):
+                connect_pacer.timed_out()
+            else:
+                connect_pacer.failed()
+            raise
+        connect_pacer.reached()
         _raise_if_cancelled()
         try:
             transport = client.get_transport()
@@ -414,14 +549,21 @@ def connect_sftp(
             _close_ssh_client(client)
             client = _new_client()
             _connect(client, {"disabled_algorithms": {"pubkeys": ["rsa-sha2-256", "rsa-sha2-512"]}})
+        holder["connected"] = True
         _raise_if_cancelled()
         return ParamikoSftpBrowser(client)
     except SftpError:
+        _close_ssh_client(holder.get("client"))
         raise
     except Exception as exc:
         _close_ssh_client(holder.get("client"))
         if _cancelled():
             raise SftpError("SFTP cancelled.") from exc
+        if not holder.get("connected"):
+            raise SftpConnectError(
+                f"SFTP connection failed: {_failure_text(exc)}",
+                retry_after_s=connect_pacer.cooling_down_s(),
+            ) from exc
         raise SftpError(f"SFTP connection failed: {exc}") from exc
     finally:
         if gate_held:

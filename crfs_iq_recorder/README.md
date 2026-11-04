@@ -36,7 +36,7 @@ The main window shows IQ Storage for the sensor disk that holds `/mnt/1/remdata/
 2. Choose Start / End or Center / Bandwidth, and the frequency units (kHz, MHz, or GHz).
 3. Pick a recording format (WAVE, XDAT, NCP, or HDF5) and enter recording time in seconds, for example `0.1`, `1`, or `10`.
 4. Click Start Recording.
-5. Click Sensor Files to browse the sensor. Split recordings appear as a collapsible group, for example `iq_20260915_142718` with `_0001.wav` and `_0002.wav` underneath. Select the parent and Download this recording to fetch every listed part, or select individual children to copy only those files. Open recordings folder shows the local copies. Existing local files are not overwritten (`iq (2).wav`).
+5. Click Sensor Files to browse the sensor. Split recordings appear as a collapsible group, for example `iq_20260915_142718` with `_0001.wav` and `_0002.wav` underneath. Select the parent and Download this recording to fetch every listed part, or select individual children to copy only those files. Open recordings folder shows the local copies. A file already saved with the sensor's size is not downloaded again; a different local file with the same name is never overwritten (the download becomes `iq (2).wav`). The **Req.** columns are what was requested; **Recorded (MHz)**, **Recorded (s)** and **Rate (MS/s)** are read from the file itself, or *unknown*. Sizes are decimal (1 MB = 1,000,000 bytes).
 
 The sensor writes the IQ files first. This app copies them here when you download.
 

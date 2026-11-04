@@ -51,19 +51,19 @@ class StorageSnapshot:
 
 
 def format_storage_bytes(size: int) -> str:
-    """Readable MB, GB, or TB for the IQ Storage line."""
+    """Readable MB, GB, or TB (decimal, like file sizes and the estimate) for the IQ Storage line."""
     value = float(max(int(size or 0), 0))
-    tb = 1024.0 ** 4
-    gb = 1024.0 ** 3
-    mb = 1024.0 ** 2
+    tb = 1000.0 ** 4
+    gb = 1000.0 ** 3
+    mb = 1000.0 ** 2
     if value >= tb:
         return _trim(value / tb, 2) + " TB"
     if value >= gb:
         return _trim(value / gb, 1) + " GB"
     if value >= mb:
         return _trim(value / mb, 1) + " MB"
-    if value >= 1024:
-        return _trim(value / 1024.0, 1) + " KB"
+    if value >= 1000:
+        return _trim(value / 1000.0, 1) + " kB"
     return f"{int(value)} B"
 
 

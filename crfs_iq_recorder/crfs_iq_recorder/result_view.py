@@ -21,9 +21,10 @@ from .capture_measure import (
     CaptureMeasurement,
     coverage_differs,
     coverage_text,
+    format_mhz_value,
     received_text,
 )
-from .operator_text import requested_text, seconds_text
+from .operator_text import files_text, requested_text, seconds_text, size_text
 
 TAGS = {
     RESULT_COMPLETED: ("Complete", "badgeOk"),
@@ -108,24 +109,39 @@ def _requested(bandwidth_hz: Any, seconds: float) -> str:
     return f"Requested: {seconds_text(seconds)}"
 
 
+RECEIVED = "Received (read from the files)"
+RECORDED = "Recorded (file metadata)"
+
+
 def _received(measurement: CaptureMeasurement | None, files: int) -> str:
+    """'Received (read from the files): 1 file, 0.503 s at 125 MS/s, 251.4 MB'."""
     if files <= 0:
         return "Received: no files"
-    return f"Received: {received_text(measurement, files)}"
+    seconds = measurement.duration_s if measurement is not None else None
+    if seconds is None:
+        return f"{RECEIVED}: {received_text(measurement, files)}"
+    text = f"{files_text(files)}, {seconds:.3f} s"
+    rate = measurement.sample_rate_hz
+    if rate:
+        text += f" at {format_mhz_value(rate)} MS/s"
+    total = sum(int(part.size or 0) for part in measurement.parts)
+    if total:
+        text += f", {size_text(total)}"
+    return f"{RECEIVED}: {text}"
 
 
 def _recorded(measurement: CaptureMeasurement | None, centre_hz: Any, bandwidth_hz: Any) -> str:
     text = coverage_text(measurement)
     if text == "unknown":
-        return "Recorded range: unknown"
+        return f"{RECORDED}: unknown"
     try:
         start = int(float(centre_hz) - float(bandwidth_hz) / 2)
         stop = int(float(centre_hz) + float(bandwidth_hz) / 2)
     except (TypeError, ValueError):
-        return f"Recorded: {text}"
+        return f"{RECORDED}: {text}"
     if coverage_differs(measurement, start, stop):
-        return f"Recorded: {text}{OTHER_RANGE}"
-    return f"Recorded: {text}"
+        return f"{RECORDED}: {text}{OTHER_RANGE}"
+    return f"{RECORDED}: {text}"
 
 
 def _tag(result: str) -> tuple[str, str]:
@@ -207,7 +223,7 @@ def view_from_task(
     if not data:
         # Rejected or not sent: there is no capture summary, only the task's own outcome.
         view.received = "Received: no files"
-        view.recorded = "Recorded range: unknown"
+        view.recorded = f"{RECORDED}: unknown"
     if files:
         view.transfer_state = transfer_state(files)
         recorded_local = [str(item.get("local_path")) for item in files if item.get("local_path") and Path(str(item.get("local_path"))).is_file()]

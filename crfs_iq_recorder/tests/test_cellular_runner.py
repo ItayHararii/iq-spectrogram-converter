@@ -35,6 +35,8 @@ from crfs_iq_recorder.cellular_capabilities import capability_for
 from crfs_iq_recorder.cellular_plan import build_plan
 from crfs_iq_recorder.cellular_protocol import import_protocol
 from crfs_iq_recorder.cellular_runner import (
+    DL_FAILED,
+    DL_VERIFIED,
     OWNER,
     S_DONE,
     S_INTERRUPTED,
@@ -1426,3 +1428,187 @@ def test_pending_workbook_results_survive_a_restart_and_a_locked_file(qapp, tmp_
     runner2._flush_workbook()
     assert runner2.workbook_pending() == 0
     assert len(list(tmp_path.glob("*.crfs-backup-*"))) == 1, "one backup before the first change"
+
+
+def _wave(frames=1000):
+    from crfs_iq_recorder.iq_wav import crfs_style_wav_bytes
+
+    return crfs_style_wav_bytes(frames=frames, sample_rate=1000, center_hz=708 * MHZ, bandwidth_hz=10 * MHZ,
+                                signal_time="2026-11-04T10:50:00.000Z")
+
+
+class _Sensor:
+    """The sensor as the downloads see it: the first `refuse` new connections are not accepted
+    (its SSH rate limit), the next `broken` transfers fail, then the WAVE body is served."""
+
+    def __init__(self, payload, *, refuse=0, broken=0):
+        self.payload, self.refuse, self.broken = payload, refuse, broken
+        self.connects = 0
+        self.transfers: list[float] = []
+
+    def open(self, _state, cancel=None):
+        if cancel is None:  # the runner's fresh listing before the downloads
+            return self
+        self.connects += 1
+        if self.refuse > 0:
+            self.refuse -= 1
+            from crfs_iq_recorder.sftp_client import SftpConnectError
+
+            raise SftpConnectError("The sensor is not accepting new SFTP connections; trying again in 1 s.", retry_after_s=0.01)
+        return self
+
+    def listdir(self, folder):
+        from crfs_iq_recorder.sftp_client import RemoteEntry
+
+        names = [f"file_{index:06d}_0001.wav" for index in range(1, 4)]
+        return [RemoteEntry(name, f"{folder}/{name}", False, len(self.payload), datetime.now()) for name in names]
+
+    def download(self, remote, local, *, progress=None, cancel=None, expected_size=0):
+        self.transfers.append(time.monotonic())
+        if self.broken > 0:
+            self.broken -= 1
+            from crfs_iq_recorder.sftp_client import SftpError
+
+            raise SftpError("Download incomplete: 100 of 4,044 bytes arrived.")
+        Path(local).write_bytes(self.payload)
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def download_runner(qapp, tmp_path, monkeypatch):
+    """A runner whose downloads go to `sensor`; its download threads are finished before teardown,
+    also when the test fails (deleting a running QThread crashes the interpreter)."""
+    import crfs_iq_recorder.cellular_runner as cr
+
+    monkeypatch.setattr(cr, "FINALIZE_SETTLE_S", 0.01)
+    monkeypatch.setattr("crfs_iq_recorder.sftp_window.random.uniform", lambda _a, _b: 0.0)
+    made = []
+
+    def make(sensor):
+        monkeypatch.setattr("crfs_iq_recorder.sftp_window._open_browser", sensor.open)
+        host = FakeHost()
+        runner = _runner(tmp_path, host)
+        logs: list[str] = []
+        runner.log.connect(lambda message, _level: logs.append(message))
+        runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True))
+        made.append(runner)
+        return host, runner, logs
+
+    yield make
+    for runner in made:
+        runner._downloads_pending.clear()
+        _pump_until(qapp, lambda: not runner._downloads_active, timeout=15.0)
+        runner.shutdown()
+
+
+def test_downloads_wait_for_the_sensor_to_accept_connections_without_using_up_attempts(qapp, tmp_path, download_runner):
+    """Hardware, 4 Nov (R100-18 over the VPN): after a burst of new SSH connections the sensor
+    accepted none for minutes. Each refused connection counted as a download attempt, so 11 of
+    15 files were given up after three. Waiting for a connection is not an attempt; it is logged once."""
+    payload = _wave()
+    sensor = _Sensor(payload, refuse=5)
+    host, runner, logs = download_runner(sensor)
+    # A same-size copy that is not the sensor's file (no WAVE header) is replaced, never doubled.
+    stale = tmp_path / "downloads" / "file_000001_0001.wav"
+    stale.write_bytes(b"\0" * len(payload))
+    host.finish(host.requests[0])
+    _pump(qapp)
+    item = runner.current_tasks()[0].files[0]
+    assert _pump_until(qapp, lambda: item["download_status"] == DL_VERIFIED, timeout=10.0)
+    assert sensor.connects == 6 and len(sensor.transfers) == 1
+    assert item["attempts"] == 1, "refused connections are not download attempts"
+    assert [m for m in logs if m.startswith("Downloads are waiting")] == [
+        "Downloads are waiting: the sensor is not accepting new connections. They try again on their own."
+    ]
+    assert "The sensor accepts connections again. Downloads continue." in logs
+    assert stale.read_bytes() == payload and [p.name for p in stale.parent.glob("*.wav*")] == [stale.name]
+
+
+def test_with_no_connection_for_the_whole_wait_files_stay_on_the_sensor_until_retry_downloads(qapp, monkeypatch, download_runner):
+    monkeypatch.setattr("crfs_iq_recorder.sftp_window.CONNECT_PATIENCE_S", 0.3)
+    sensor = _Sensor(_wave(), refuse=10**6)
+    host, runner, logs = download_runner(sensor)
+    for index in range(3):
+        host.finish(host.requests[index])
+        _pump(qapp)
+    files = [task.files[0] for task in runner.current_tasks()]
+    assert _pump_until(qapp, lambda: all(f["download_status"] == DL_FAILED for f in files) and not runner._downloads_active, timeout=10.0)
+    assert sensor.transfers == [] and all(f["attempts"] == 0 for f in files)
+    assert all(f["note"].endswith("The file stays on the sensor.") for f in files)
+    assert len([m for m in logs if m.startswith("Downloads stopped")]) == 1, logs
+    assert len([m for m in logs if m.startswith("Downloads are waiting")]) == 1, logs
+    assert runner.failed_downloads() == 3 and runner.status()["failed_downloads"] == 3
+    # The sensor accepts connections again; the operator presses Retry downloads.
+    sensor.refuse = 0
+    assert runner.retry_failed_downloads() == "Downloading 3 files again."
+    assert _pump_until(qapp, lambda: all(f["download_status"] == DL_VERIFIED for f in files), timeout=10.0)
+    assert runner.failed_downloads() == 0 and len(sensor.transfers) == 3
+    assert runner.retry_failed_downloads() == "No file is waiting to be downloaded again."
+
+
+def test_a_failed_transfer_is_tried_again_after_a_delay_and_given_up_after_three(qapp, monkeypatch, download_runner):
+    import crfs_iq_recorder.cellular_runner as cr
+
+    monkeypatch.setattr(cr, "DOWNLOAD_RETRY_DELAY_S", 0.3)
+    sensor = _Sensor(_wave(), broken=2)
+    host, runner, logs = download_runner(sensor)
+    host.finish(host.requests[0])
+    _pump(qapp)
+    item = runner.current_tasks()[0].files[0]
+    assert _pump_until(qapp, lambda: item["download_status"] == DL_VERIFIED, timeout=10.0)
+    assert item["attempts"] == 3 and len(sensor.transfers) == 3
+    gaps = [later - earlier for earlier, later in zip(sensor.transfers, sensor.transfers[1:])]
+    assert all(gap >= 0.29 for gap in gaps), gaps
+    assert not [m for m in logs if m.startswith("Download of")], "a retry that works is not reported"
+    sensor.broken = 3
+    host.finish(host.requests[1])
+    _pump(qapp)
+    second = runner.current_tasks()[1].files[0]
+    assert _pump_until(qapp, lambda: second["download_status"] == DL_FAILED, timeout=10.0)
+    assert [m for m in logs if m.startswith("Download of")] == [
+        "Download of file_000002_0001.wav failed 3 times. It stays on the sensor. See details."
+    ]
+    assert runner.failed_downloads() == 1
+
+
+def test_after_a_backlog_pause_the_resume_line_says_which_files_were_not_downloaded(qapp, tmp_path):
+    """Hardware, 4 Nov: "Downloads caught up" was logged after 11 files had been given up."""
+    host = FakeHost()
+    runner = _runner(tmp_path, host)
+    logs: list[str] = []
+    runner.log.connect(lambda message, _level: logs.append(message))
+    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, backlog_limit=1))
+    runner._drain_downloads = lambda: None
+    runner._downloads_pending = [("k", "r", {"name": f"f{i}.wav", "remote_path": f"/x/f{i}.wav", "size": 1}) for i in range(3)]
+    host.finish(host.requests[0])
+    _pump(qapp)
+    assert runner.state == S_PAUSED_BACKLOG
+    runner.current_tasks()[0].files[0]["download_status"] = DL_FAILED  # given up while paused
+    runner._downloads_pending = []
+    runner._tick()
+    assert runner.state == S_RUNNING
+    assert "Not downloaded: 1 file, still on the sensor. The collection continues." in logs
+    assert not [m for m in logs if m.startswith("Downloads caught up")]
+
+
+def test_a_local_copy_counts_as_downloaded_only_when_size_and_samples_match_the_sensor(qapp, tmp_path):
+    from types import SimpleNamespace
+
+    runner = _runner(tmp_path, FakeHost())
+    full, short = _wave(1000), _wave(900)
+    item = {"name": "file_000001_0001.wav", "remote_path": "/mnt/1/remdata/20261104/file_000001_0001.wav", "size": len(full)}
+    read_on_sensor = SimpleNamespace(summary={"measurement": {"parts": [{"path": item["remote_path"], "duration_s": 1.0}]}})
+    local = tmp_path / "copy.wav"
+    local.write_bytes(full)
+    assert runner._local_copy_problem(read_on_sensor, item, local) == ""
+    local.write_bytes(full[:-10])
+    assert runner._local_copy_problem(read_on_sensor, item, local) == f"{len(full) - 10:,} bytes locally, {len(full):,} on the sensor"
+    local.write_bytes(short)
+    shorter = dict(item, size=len(short))
+    assert runner._local_copy_problem(read_on_sensor, shorter, local) == "0.900000 s of samples locally, 1.000000 s read on the sensor"
+    # No reading from the sensor: the size and the WAVE header decide.
+    assert runner._local_copy_problem(SimpleNamespace(summary={}), shorter, local) == ""
+    local.write_bytes(b"\0" * len(short))
+    assert runner._local_copy_problem(SimpleNamespace(summary={}), shorter, local) != ""

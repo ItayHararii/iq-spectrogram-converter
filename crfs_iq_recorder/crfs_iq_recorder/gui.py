@@ -139,6 +139,7 @@ from .recording_history import (
 )
 from .recording_download import RecordingDownload
 from .result_card import ResultCard
+from .file_measurements import record_parts
 from .result_view import ResultView, view_from_summary
 from .waterfall_dialog import WaterfallDialog
 from .recording_status import (
@@ -3300,6 +3301,11 @@ class MainWindow(QMainWindow):
             sensor_reply=dict(self._sensor_reply),
             measurement=measurement.to_dict() if measurement is not None else None,
         )
+        if measurement is not None and not self._conn.demo:
+            # Sensor Files shows these next to the requested values.
+            record_parts(self._conn.host, measurement.parts)
+            if self._sftp_win is not None:
+                self._sftp_win.relabel_files()
         text, level, phase = self._result_message(verdict, measurement, requested, count)
         self._set_phase(phase)
         self._set_msg(text, error=level == "error")

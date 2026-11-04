@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import tempfile
 import threading
 import time
@@ -43,11 +44,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .capture_measure import measure_part
 from .cellular_pickers import format_datetime
 from .connection_state import ConnectionState
 from .constants import DEFAULT_SFTP_PORT
 from .diagnostic_log import diag
-from .download_util import DownloadError, unique_destination
+from .download_util import DownloadError, already_saved, unique_destination
+from .file_measurements import load_measurements, reading_from_local_copy, record_parts, recorded_columns
+from .file_measurements import lookup as lookup_measurement
+from .operator_text import size_detail
 from .listing_sort import (
     COL_MODIFIED,
     COL_NAME,
@@ -70,7 +75,7 @@ from .recording_history import (
     persist_matched_stems,
     remote_directory,
 )
-from .sftp_client import RemoteEntry, SftpBrowser, SftpError, connect_sftp
+from .sftp_client import RemoteEntry, SftpBrowser, SftpConnectError, SftpError, connect_sftp
 from .sftp_paths import parent_directory, resolve_today_directory, today_remdata_directory
 from .spectrogram_preview import (
     PREVIEW_MAX_BYTES,
@@ -85,19 +90,40 @@ from .validation import ValidationError, parse_optional_port
 from .worker_threads import track as track_worker_thread
 
 MAX_PARALLEL_DOWNLOADS = 4
-DOWNLOAD_RETRY_DELAY_S = 3.0
+# A download whose connection the sensor does not accept waits and tries again
+# (first after the pacer's cool-down, else 15 s doubling to 60 s) for this long.
+CONNECT_PATIENCE_S = 600.0
+CONNECT_BACKOFF_S = 15.0
+CONNECT_BACKOFF_MAX_S = 60.0
 _PREVIEW_CACHE = 8
 _TABLE_HEADERS = [
     "New",
     "Name",
     "Size",
     "Modified",
-    "Start (MHz)",
-    "End (MHz)",
-    "Center (MHz)",
-    "Bandwidth (MHz)",
-    "Duration (s)",
+    "Req. start (MHz)",
+    "Req. end (MHz)",
+    "Req. center (MHz)",
+    "Req. bandwidth (MHz)",
+    "Req. duration (s)",
+    "Recorded (MHz)",
+    "Recorded (s)",
+    "Rate (MS/s)",
 ]
+COL_RECORDED_RANGE = 9
+COL_RECORDED_S = 10
+COL_RATE = 11
+_HEADER_TIPS = {
+    2: "Decimal units (1 MB = 1,000,000 bytes). Hover a size for the exact bytes. Combined size for a split recording.",
+    4: "Requested by the application (recording history), not read from the file.",
+    5: "Requested by the application (recording history), not read from the file.",
+    6: "Requested by the application (recording history), not read from the file.",
+    7: "Requested by the application (recording history), not read from the file.",
+    8: "Requested recording time (recording history), not this file.",
+    COL_RECORDED_RANGE: "Centre ± half the bandwidth CRFS stored in the file. \"unknown\" until the file has been read.",
+    COL_RECORDED_S: "Samples in the file divided by its sample rate (WAVE header). \"unknown\" until the file has been read.",
+    COL_RATE: "Sample rate in the file's WAVE header. \"unknown\" until the file has been read.",
+}
 ROLE_PATH = int(Qt.ItemDataRole.UserRole)
 ROLE_KIND = ROLE_PATH + 1
 ROLE_GROUP = ROLE_PATH + 2
@@ -383,11 +409,20 @@ class SftpBackend(QObject):
 
 
 class FileDownloadWorker(QObject):
-    """One SFTP connection per file so several downloads can run at once."""
+    """One SFTP connection per file so several downloads can run at once.
+
+    While the sensor does not accept a new connection the worker waits
+    (`waiting`) and tries again on its own; after `patience_s` without one it
+    gives up (`unreachable`). Nothing was transferred in either case, unlike
+    `failed`.
+    """
 
     finished = Signal(str, str)
     failed = Signal(str, str)
     progress = Signal(str, int, int)
+    waiting = Signal(str, float, str)
+    connected = Signal(str)
+    unreachable = Signal(str, str)
 
     def __init__(
         self,
@@ -398,6 +433,7 @@ class FileDownloadWorker(QObject):
         *,
         expected_size: int = 0,
         cancel: threading.Event | None = None,
+        patience_s: float | None = None,
     ) -> None:
         super().__init__()
         self._state = state
@@ -405,8 +441,14 @@ class FileDownloadWorker(QObject):
         self._local = local_path
         self._name = name
         self._expected_size = int(expected_size or 0)
-        self._cancel = cancel
+        self._cancel = cancel if cancel is not None else threading.Event()
+        self._stop_waiting = threading.Event()
+        self._patience_s = float(CONNECT_PATIENCE_S if patience_s is None else patience_s)
         self._browser: SftpBrowser | None = None
+
+    def stop_waiting(self) -> None:
+        """Give up if no connection has been made yet; a transfer already running continues."""
+        self._stop_waiting.set()
 
     def abort(self) -> None:
         if self._cancel is not None:
@@ -418,19 +460,48 @@ class FileDownloadWorker(QObject):
             except Exception:
                 pass
 
+    def _connect(self) -> SftpBrowser | None:
+        """An open session, or None after `unreachable` was emitted."""
+        started = time.monotonic()
+        tries = 0
+        while True:
+            try:
+                return _open_browser(self._state, cancel=self._cancel)
+            except SftpConnectError as exc:
+                if self._cancel.is_set() or self._stop_waiting.is_set():
+                    raise SftpError("Download cancelled.") from exc
+                tries += 1
+                waited = time.monotonic() - started
+                if waited >= self._patience_s:
+                    self.unreachable.emit(self._name, str(exc))
+                    return None
+                # The pacer says when connections are tried again; otherwise back off.
+                delay = exc.retry_after_s or min(CONNECT_BACKOFF_S * (2 ** (tries - 1)), CONNECT_BACKOFF_MAX_S)
+                delay = min(delay + random.uniform(0.2, 1.5), max(self._patience_s - waited, 0.5))
+                self.waiting.emit(self._name, float(delay), str(exc))
+                until = time.monotonic() + delay
+                while time.monotonic() < until:
+                    if self._cancel.wait(min(0.25, max(until - time.monotonic(), 0.01))) or self._stop_waiting.is_set():
+                        raise SftpError("Download cancelled.") from exc
+
+    def _record_reading(self) -> None:
+        """What the downloaded file holds, for Sensor Files' recorded columns."""
+        if getattr(self._state, "demo", False) or not self._local.lower().endswith(".wav"):
+            return
+        try:
+            reading = reading_from_local_copy(self._remote, Path(self._local))
+            if reading is not None:
+                record_parts(self._state.host, [reading])
+        except Exception:  # noqa: BLE001 - informational; the download itself stands
+            pass
+
     @Slot()
     def run(self) -> None:
         try:
-            try:
-                self._browser = _open_browser(self._state, cancel=self._cancel)
-            except SftpError as exc:
-                # The sensor's SSH server times out handshakes when it is
-                # busy with other sessions. Nothing has been written yet, so
-                # one more try costs nothing.
-                if "timed out" not in str(exc).lower() or (self._cancel is not None and self._cancel.is_set()):
-                    raise
-                time.sleep(DOWNLOAD_RETRY_DELAY_S)
-                self._browser = _open_browser(self._state, cancel=self._cancel)
+            self._browser = self._connect()
+            if self._browser is None:
+                return
+            self.connected.emit(self._name)
 
             def cb(done: int, total: int) -> None:
                 self.progress.emit(self._name, int(done), int(total or 0))
@@ -442,6 +513,7 @@ class FileDownloadWorker(QObject):
                 cancel=self._cancel,
                 expected_size=self._expected_size,
             )
+            self._record_reading()
             self.finished.emit(self._name, self._local)
         except SftpError as exc:
             self.failed.emit(self._name, str(exc))
@@ -464,6 +536,7 @@ class FileDownloadWorker(QObject):
 class PreviewWorker(QObject):
     finished = Signal(int, object)
     failed = Signal(int, str)
+    measured = Signal(object)  # PartMeasurement.to_dict() read from the file's header and trailer
 
     def __init__(
         self,
@@ -510,6 +583,14 @@ class PreviewWorker(QObject):
             self._browser.read_prefix(self._entry.path, tmp, PREVIEW_MAX_BYTES)
             if self._cancel.is_set():
                 raise PreviewError("Preview cancelled.")
+            if self._entry.name.lower().endswith(".wav"):
+                # Same session: two small reads (header and CRFS trailer), no extra connection.
+                try:
+                    part = measure_part(self._browser, self._entry.path, int(self._entry.size or 0))
+                    if part.readable:
+                        self.measured.emit(part.to_dict())
+                except Exception:  # noqa: BLE001 - the Recorded columns then stay "unknown"
+                    pass
             mtime_ts = self._entry.modified.timestamp() if self._entry.modified else 0
             with _PREVIEW_COMPUTE:
                 if self._cancel.is_set():
@@ -577,6 +658,8 @@ class SftpWindow(QWidget):
         self._dl_active: list[tuple[QThread, FileDownloadWorker]] = []
         self._dl_ok = 0
         self._dl_fail = 0
+        self._dl_unreachable = 0
+        self._dl_present = 0
         self._dl_cancel_count = 0
         self._dl_total = 0
         self._dl_bytes: dict[str, tuple[int, int]] = {}
@@ -703,8 +786,8 @@ class SftpWindow(QWidget):
         self.table.setItemDelegateForColumn(0, NewBadgeDelegate(self.table))
         duration_header = self.table.headerItem()
         if duration_header is not None:
-            duration_header.setToolTip(8, "Total recording time, not this file.")
-            duration_header.setToolTip(2, "This file, or combined size for a split recording.")
+            for col, tip in _HEADER_TIPS.items():
+                duration_header.setToolTip(col, tip)
             for col in range(len(_TABLE_HEADERS)):
                 duration_header.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
         self._sync_sort_headers()
@@ -843,9 +926,12 @@ class SftpWindow(QWidget):
         keep = [self._thread]
         _retain_until_finished(self._thread, self._worker)
         for thread, worker in list(self._dl_active):
+            worker.stop_waiting()
             _disconnect_signal(worker.finished, self._on_file_downloaded)
             _disconnect_signal(worker.failed, self._on_file_download_failed)
             _disconnect_signal(worker.progress, self._on_file_progress)
+            _disconnect_signal(worker.waiting, self._on_file_waiting)
+            _disconnect_signal(worker.unreachable, self._on_file_unreachable)
             _disconnect_signal(thread.finished, self._on_download_thread_finished)
             _retain_until_finished(thread, worker)
             keep.append(thread)
@@ -857,6 +943,7 @@ class SftpWindow(QWidget):
                 pass
             _disconnect_signal(worker.finished, self._on_preview_ready)
             _disconnect_signal(worker.failed, self._on_preview_failed)
+            _disconnect_signal(worker.measured, self._on_file_measured)
             _disconnect_signal(thread.finished, self._on_preview_thread_finished)
             thread.quit()
             _retain_until_finished(thread, worker)
@@ -1039,6 +1126,8 @@ class SftpWindow(QWidget):
         """Offer every fully downloaded split recording to the merge controller."""
         saved = dict(self._dl_saved)
         self._dl_saved = {}
+        if self._dl_ok and not self._state.demo:
+            self.relabel_files()  # the downloaded copies were read: Recorded columns
         manual = self._merge_after_download
         self._merge_after_download = None
         if self._merge is None or (not saved and manual is None):
@@ -1401,25 +1490,42 @@ class SftpWindow(QWidget):
             return
         self._sync_download_label()
         jobs: list[tuple[RemoteEntry, str]] = []
+        present: dict[str, str] = {}
         try:
             for entry in files:
-                jobs.append((entry, str(unique_destination(folder / entry.name))))
+                local = folder / entry.name
+                if already_saved(local, entry.size):
+                    # A second "(2)" copy of a file that is already complete would only fill the disk.
+                    present[entry.name] = str(local)
+                    continue
+                jobs.append((entry, str(unique_destination(local))))
         except DownloadError as exc:
             QMessageBox.warning(self, "Download", str(exc))
             return
-        self._queue_downloads(jobs)
+        if present:
+            diag("download_skipped_present", files=sorted(present), folder=str(folder))
+        if not jobs:
+            self._dl_folder = folder
+            self._dl_saved = dict(present)
+            self.status.setText(f"Already saved: {len(present)} file(s) in {folder}, same size as on the sensor.")
+            self._after_downloads_finished()
+            self._open_recordings_folder(folder)
+            return
+        self._queue_downloads(jobs, present=present)
 
-    def _queue_downloads(self, jobs: list[tuple[RemoteEntry, str]]) -> None:
+    def _queue_downloads(self, jobs: list[tuple[RemoteEntry, str]], *, present: dict[str, str] | None = None) -> None:
         if not jobs or self._closing:
             return
         self._dl_cancel = threading.Event()
         self._dl_pending = list(jobs)
         self._dl_ok = 0
         self._dl_fail = 0
+        self._dl_unreachable = 0
+        self._dl_present = len(present or {})
         self._dl_cancel_count = 0
         self._dl_total = len(jobs)
         self._dl_bytes = {}
-        self._dl_saved = {}
+        self._dl_saved = dict(present or {})
         self._dl_folder = Path(jobs[0][1]).parent
         self.progress.setVisible(True)
         self.progress.setRange(0, 100)
@@ -1461,6 +1567,8 @@ class SftpWindow(QWidget):
             worker.finished.connect(self._on_file_downloaded, queued)
             worker.failed.connect(self._on_file_download_failed, queued)
             worker.progress.connect(self._on_file_progress, queued)
+            worker.waiting.connect(self._on_file_waiting, queued)
+            worker.unreachable.connect(self._on_file_unreachable, queued)
             thread.finished.connect(self._on_download_thread_finished, queued)
             thread.started.connect(worker.run)
             self._dl_active.append((thread, worker))
@@ -1488,6 +1596,26 @@ class SftpWindow(QWidget):
         self._dl_fail += 1
         self.status.setText(f"Failed {name} ({self._dl_ok + self._dl_fail}/{self._dl_total})")
         QMessageBox.warning(self, "Download", f"{name}: {message.splitlines()[-1]}")
+
+    @Slot(str, float, str)
+    def _on_file_waiting(self, name: str, delay_s: float, detail: str) -> None:
+        if self._closing:
+            return
+        diag("download_waiting", name, delay_s=round(float(delay_s), 1), detail=detail)
+        self.status.setText(
+            f"Waiting for the sensor to accept a connection; trying again in {int(delay_s + 0.999)} s "
+            f"({self._dl_ok}/{self._dl_total} saved)."
+        )
+
+    @Slot(str, str)
+    def _on_file_unreachable(self, name: str, detail: str) -> None:
+        """Reported once for the batch when it ends, not one message box per file."""
+        if self._closing:
+            return
+        diag("download_unreachable", name, detail=detail)
+        self._dl_fail += 1
+        self._dl_unreachable += 1
+        self.status.setText(f"Not downloaded: {name} ({self._dl_ok + self._dl_fail}/{self._dl_total})")
 
     @Slot(str, int, int)
     def _on_file_progress(self, name: str, done: int, total: int) -> None:
@@ -1524,12 +1652,22 @@ class SftpWindow(QWidget):
         if self._dl_ok:
             loc = f" to {self._dl_folder}" if self._dl_folder else ""
             parts.append(f"Downloaded {self._dl_ok} file(s){loc}")
+        if self._dl_present:
+            parts.append(f"{self._dl_present} already saved")
         if self._dl_fail:
             parts.append(f"{self._dl_fail} failed")
         if self._dl_cancel_count:
             parts.append(f"{self._dl_cancel_count} cancelled")
         self.status.setText("; ".join(parts) + "." if parts else "Download stopped.")
         self._set_busy(False)
+        if self._dl_unreachable:
+            unreachable, self._dl_unreachable = self._dl_unreachable, 0
+            QMessageBox.warning(
+                self,
+                "Download",
+                f"{unreachable} file(s) were not downloaded: the sensor did not accept a new connection for "
+                f"{int(CONNECT_PATIENCE_S // 60)} minutes. The files stay on the sensor; download them again later.",
+            )
         if self._dl_fail or self._dl_cancel_count:
             # An incomplete batch never feeds a merge; the operator can retry.
             self._dl_saved = {}
@@ -1555,8 +1693,8 @@ class SftpWindow(QWidget):
         for col, base in enumerate(_TABLE_HEADERS):
             header.setText(col, header_label(base, active=col == active, descending=descending))
             header.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
-        header.setToolTip(2, "This file, or combined size for a split recording.")
-        header.setToolTip(8, "Total recording time, not this file.")
+        for col, tip in _HEADER_TIPS.items():
+            header.setToolTip(col, tip)
 
     def _on_header_clicked(self, section: int) -> None:
         if section not in SORTABLE_COLUMNS:
@@ -1633,12 +1771,14 @@ class SftpWindow(QWidget):
         modified,
         rec,
         is_new: bool,
+        recorded: list[str] | None = None,
     ) -> list[str]:
         mtime = format_datetime(modified) if modified else ""
         values = ["NEW" if is_new else "", name, size_text, mtime, "", "", "", "", ""]
         if rec is not None:
             start, end, center_hz, bw, duration = format_columns(rec)
-            values[4:] = [start, end, center_hz, bw, duration]
+            values[4:9] = [start, end, center_hz, bw, duration]
+        values.extend(recorded or ["", "", ""])
         return values
 
     def _is_new_entry(self, entry: RemoteEntry, rec, new_paths: set[str]) -> bool:
@@ -1662,6 +1802,13 @@ class SftpWindow(QWidget):
         persist_matched_stems(matched)
         self._matched = matched
         self._entries = list(entries)
+        readings = load_measurements()
+
+        def recorded(files: list[RemoteEntry]) -> list[str]:
+            return recorded_columns(
+                [lookup_measurement(readings, entry.path, entry.size) for entry in files],
+                is_iq=bool(files) and all(entry.name.lower().endswith(".wav") for entry in files),
+            )
         nodes = sort_listing_nodes(
             build_listing_nodes(entries, matched),
             matched=matched,
@@ -1687,6 +1834,7 @@ class SftpWindow(QWidget):
                         modified=newest,
                         rec=rec,
                         is_new=is_new,
+                        recorded=recorded(list(node.entries)),
                     )
                 )
                 child_paths = tuple(entry.path for entry in node.entries)
@@ -1699,11 +1847,11 @@ class SftpWindow(QWidget):
                 )
                 parent.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
                 parent.setToolTip(1, f"{len(node.entries)} parts")
-                parent.setToolTip(2, f"Combined size: {combined:,} B")
+                parent.setToolTip(2, f"Combined size: {size_detail(combined)}")
                 if newest:
                     parent.setToolTip(3, format_datetime(newest))
                 if rec is not None:
-                    parent.setToolTip(8, "Total recording time for this capture.")
+                    parent.setToolTip(8, "Requested recording time for this capture.")
                 for entry in node.entries:
                     child_rec = matched.get(entry.path)
                     child_new = self._is_new_entry(entry, child_rec, new_paths)
@@ -1714,6 +1862,7 @@ class SftpWindow(QWidget):
                             modified=entry.modified,
                             rec=child_rec,
                             is_new=child_new,
+                            recorded=recorded([entry]),
                         )
                     )
                     self._set_item_roles(child, path=entry.path, kind="file", group_key=node.group_key)
@@ -1721,11 +1870,11 @@ class SftpWindow(QWidget):
                         QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicatorWhenChildless
                     )
                     child.setToolTip(1, entry.name)
-                    child.setToolTip(2, f"{entry.size:,} B")
+                    child.setToolTip(2, size_detail(entry.size))
                     if entry.modified:
                         child.setToolTip(3, format_datetime(entry.modified))
                     if child_rec is not None:
-                        child.setToolTip(8, "Total recording time, not this part.")
+                        child.setToolTip(8, "Requested recording time of the whole capture, not this part.")
                     parent.addChild(child)
                 self.table.addTopLevelItem(parent)
                 parent.setExpanded(node.group_key in self._expanded_groups)
@@ -1742,6 +1891,7 @@ class SftpWindow(QWidget):
                     modified=entry.modified,
                     rec=rec,
                     is_new=is_new,
+                    recorded=None if entry.is_dir else recorded([entry]),
                 )
             )
             self._set_item_roles(
@@ -1757,13 +1907,13 @@ class SftpWindow(QWidget):
                 parts = counts.get(stem, 1)
                 combined = totals.get(stem, entry.size)
                 if parts > 1:
-                    item.setToolTip(2, f"This file: {entry.size:,} B. All {parts} parts: {combined:,} B.")
+                    item.setToolTip(2, f"This file: {size_detail(entry.size)}. All {parts} parts: {size_detail(combined)}.")
                 else:
-                    item.setToolTip(2, f"{entry.size:,} B")
+                    item.setToolTip(2, size_detail(entry.size))
             if entry.modified:
                 item.setToolTip(3, format_datetime(entry.modified))
             if rec is not None:
-                item.setToolTip(8, "Total recording time, not this part.")
+                item.setToolTip(8, "Requested recording time, not read from this file.")
             self.table.addTopLevelItem(item)
         self._sync_sort_headers()
         self._restore_selected_identities(selected)
@@ -1846,6 +1996,7 @@ class SftpWindow(QWidget):
         queued = Qt.ConnectionType.QueuedConnection
         worker.finished.connect(self._on_preview_ready, queued)
         worker.failed.connect(self._on_preview_failed, queued)
+        worker.measured.connect(self._on_file_measured, queued)
         thread.finished.connect(self._on_preview_thread_finished, queued)
         thread.started.connect(worker.run)
         self._preview_jobs.append((thread, worker))
@@ -1862,6 +2013,14 @@ class SftpWindow(QWidget):
         if token != self._preview_token:
             return
         self._show_preview(result, token)
+
+    @Slot(object)
+    def _on_file_measured(self, part: object) -> None:
+        """The preview read the file's header and metadata: show them in the Recorded columns."""
+        if self._closing or not isinstance(part, dict) or self._state.demo:
+            return
+        if record_parts(self._state.host, [part]):
+            self.relabel_files()
 
     @Slot(int, str)
     def _on_preview_failed(self, token: int, text: str) -> None:

@@ -1,10 +1,98 @@
-# QA report - CRFS IQ Recorder 1.13.1 / 1.13.0 / 1.12.0 / 1.11.0 / 1.10.0 / 1.9.1 / 1.9.0 / 1.8.10 / 1.8.9 and IQ Spectrogram Converter 1.5.1
+# QA report - CRFS IQ Recorder 1.14.0 / 1.13.1 / 1.13.0 / 1.12.0 / 1.11.0 / 1.10.0 / 1.9.1 / 1.9.0 / 1.8.10 / 1.8.9 and IQ Spectrogram Converter 1.5.1
 
-Nine passes plus a follow-up. Part H (4 November 2026, morning) is an on-screen check of 1.13.0 on the operator's desktop, the investigation of the unexplained series start of 3 November with a guard on every way a recording can start, and a neutral Manual tab while an Excel run records; it fixed nine defects and produced Recorder 1.13.1. Part G (3 November 2026, evening) sends every protocol row as one request, reads every result from the files, splits the window into the Manual Recording and Excel Collection tabs, and ran one hardware campaign through the final application; it found and fixed six defects (the most important one: downloads of a finished collection were lost when the next collection started or the app was closed) and produced Recorder 1.13.0. Part F (3 November 2026, late morning) is the complete end-to-end pass on the Node 100-18 after the 1.11.0 polish: manual recordings in both frequency modes, the SFTP browser, the Cellular Collection with the workbook open in Excel, locked, closed and restarted, connection faults, the executables, and the four presentation observations made on 1.11.0; it found and fixed five defects (the most important one: a scheduled pass whose time went by while the app was closed was started late on its own by *Continue*) and produced Recorder 1.12.0. Part E (3 November 2026, morning) polished the GUI - the Cellular Collection panel above all - and removed the measured window-construction and theme-switch slowness; it produced Recorder 1.11.0 with no change to recording, Excel or scheduling behaviour. Part D (2 November 2026, night) simplified the Cellular Collection to the operator's workflow (the protocol rows are the plan and the result rows, nine columns, compact panel, local-time pickers), fixed the four reliability faults found in the review of the 18:44 run and three more found on the sensor during this pass, and ran the complete path from capture to Excel on the Node 100-18; it produced Recorder 1.10.0. Part C.1 (2 November 2026, evening) ran the Cellular Collection against the operator's own protocol workbook, fixed the import defects that surfaced and added the results sheets in the protocol workbook; it produced Recorder 1.9.1. Part C (2 November 2026) added the Cellular Collection feature and produced Recorder 1.9.0. Part 0 (1 November 2026) fixed the "Time elapsed - file not confirmed" status, investigated why the Node splits recordings, and added the optional merge of recording parts; it produced Recorder 1.8.10 (the Converter did not need a change). Part 1 (31 October 2026) ran against the same RFeye Node and produced Recorder 1.8.9 and Converter 1.5.1. Part 2 (30 October 2026) is the earlier simulation-only pass that produced 1.8.8 / 1.5.0; all are kept unchanged below except where a later result supersedes a statement.
+Ten passes plus a follow-up. Part I (4 November 2026, midday) investigates the operator's Cellular Collection run of 10:50 (repeating file sizes, requested versus recorded values, the 500 MHz row, and 11 of 15 files not downloaded), makes downloads wait for the sensor's SSH connection limit instead of giving up, verifies every download locally, and labels requested and recorded values; it produced Recorder 1.14.0. Part H (4 November 2026, morning) is an on-screen check of 1.13.0 on the operator's desktop, the investigation of the unexplained series start of 3 November with a guard on every way a recording can start, and a neutral Manual tab while an Excel run records; it fixed nine defects and produced Recorder 1.13.1. Part G (3 November 2026, evening) sends every protocol row as one request, reads every result from the files, splits the window into the Manual Recording and Excel Collection tabs, and ran one hardware campaign through the final application; it found and fixed six defects (the most important one: downloads of a finished collection were lost when the next collection started or the app was closed) and produced Recorder 1.13.0. Part F (3 November 2026, late morning) is the complete end-to-end pass on the Node 100-18 after the 1.11.0 polish: manual recordings in both frequency modes, the SFTP browser, the Cellular Collection with the workbook open in Excel, locked, closed and restarted, connection faults, the executables, and the four presentation observations made on 1.11.0; it found and fixed five defects (the most important one: a scheduled pass whose time went by while the app was closed was started late on its own by *Continue*) and produced Recorder 1.12.0. Part E (3 November 2026, morning) polished the GUI - the Cellular Collection panel above all - and removed the measured window-construction and theme-switch slowness; it produced Recorder 1.11.0 with no change to recording, Excel or scheduling behaviour. Part D (2 November 2026, night) simplified the Cellular Collection to the operator's workflow (the protocol rows are the plan and the result rows, nine columns, compact panel, local-time pickers), fixed the four reliability faults found in the review of the 18:44 run and three more found on the sensor during this pass, and ran the complete path from capture to Excel on the Node 100-18; it produced Recorder 1.10.0. Part C.1 (2 November 2026, evening) ran the Cellular Collection against the operator's own protocol workbook, fixed the import defects that surfaced and added the results sheets in the protocol workbook; it produced Recorder 1.9.1. Part C (2 November 2026) added the Cellular Collection feature and produced Recorder 1.9.0. Part 0 (1 November 2026) fixed the "Time elapsed - file not confirmed" status, investigated why the Node splits recordings, and added the optional merge of recording parts; it produced Recorder 1.8.10 (the Converter did not need a change). Part 1 (31 October 2026) ran against the same RFeye Node and produced Recorder 1.8.9 and Converter 1.5.1. Part 2 (30 October 2026) is the earlier simulation-only pass that produced 1.8.8 / 1.5.0; all are kept unchanged below except where a later result supersedes a statement.
 
-Releases: Recorder 1.13.1 (tag `v1.13.1`), Converter 1.5.1 (tag `converter-v1.5.1`). Previous: 1.13.0 (`v1.13.0`), 1.12.0 (`v1.12.0`), 1.11.0 (`v1.11.0`), 1.10.0 (`v1.10.0`), 1.9.1 (`v1.9.1`), 1.9.0 (`v1.9.0`), 1.8.10 (`v1.8.10`), 1.8.9 (`v1.8.9`), 1.8.8 (`v1.8.8`), 1.5.0 (`converter-v1.5.0`), 1.8.7 (`v1.8.7`), 1.4.0 (`converter-v1.4.0`). All earlier releases stay on GitHub.
+Releases: Recorder 1.14.0 (tag `v1.14.0`), Converter 1.5.1 (tag `converter-v1.5.1`). Previous: 1.13.1 (`v1.13.1`), 1.13.0 (`v1.13.0`), 1.12.0 (`v1.12.0`), 1.11.0 (`v1.11.0`), 1.10.0 (`v1.10.0`), 1.9.1 (`v1.9.1`), 1.9.0 (`v1.9.0`), 1.8.10 (`v1.8.10`), 1.8.9 (`v1.8.9`), 1.8.8 (`v1.8.8`), 1.5.0 (`converter-v1.5.0`), 1.8.7 (`v1.8.7`), 1.4.0 (`converter-v1.4.0`). All earlier releases stay on GitHub.
 
 Legend used throughout: **Hardware** = executed against the real sensor in this pass; **Simulated** = executed against the demo transport, a local proxy or synthetic files; **Untested** = not executed.
+
+---
+
+# Part I - Repeating file sizes, requested versus recorded values, and the missing downloads (4 November 2026, Recorder 1.14.0)
+
+## Scope
+
+- **The operator's Cellular Collection run of 4 November** (10:50-10:56, 15 rows, 0.5 s, one pass, automatic download on). Questions: did the app change the workbook's values, why do the file sizes repeat, was 0.5 s requested or measured, what was recorded for 3300-3800 MHz, and why were 11 of the 15 files not downloaded.
+- The operator's 15 sensor files were inspected read-only (ranged SFTP reads of their headers, the collection session, the diagnostic log). This pass did not download, change or delete them.
+- **Fixes, then a hardware check** through the fixed application. A separate, titled test instance from source used an isolated copy of the operator's settings. Then the 1.14.0 EXE was checked through UI Automation. The operator's own Recorder window was neither driven nor closed.
+
+## The operator's run (findings)
+
+- **Workbook values unchanged.** Each of the 15 rows was sent as one request: centre = (start + stop) / 2, bandwidth = stop - start (in Hz, from the workbook's integer MHz), duration = rate = capture_length = 0.5 s, WAVE. For every row the payload in the diagnostic log equals what the workbook gives. There was no splitting.
+- **Why the sizes repeat.** For these bandwidths the Node 100-18 records at one of two sample rates, as read from the files' WAVE header and CRFS metadata:
+  - 30, 35 and 50 MHz → 62.5 MS/s: 31,426,528 samples = 125,706,816 bytes;
+  - 60, 70, 75 and 100 MHz (and the 500 MHz request) → 125 MS/s: 62,853,088 samples = 251,413,056 bytes (two files 251,413,060).
+  
+  Each sample is 16-bit I/Q (4 bytes). The size therefore depends on the rate step and the duration, not on the bandwidth within a step. The listing taken when a recording was confirmed was 660 bytes short of the final size (the file was still being closed); the measurements stored in the session have the final sizes.
+- **0.5 s** is the requested value. The files hold 0.50282 s (sample count / sample rate).
+- **3300-3800 MHz (500 MHz).** The request went out as 3550 MHz / 500 MHz. The sensor's reply already said 100 MHz, and the file's metadata says centre 3550 MHz, bandwidth 100 MHz, 125 MS/s. What was recorded is therefore 3500-3600 MHz.
+- **Downloads.** Automatic download was on. 4 files were verified. 11 were given up after three attempts each, all with *SFTP connection failed: timed out*.
+  - **Cause:** over this VPN path the Node accepts about six new SSH connections in ten seconds. After that, TCP connections to the SSH port time out (while HTTP still answers) until about 15 s pass with no attempt; this was measured in this pass with a connect probe.
+  - **Why it lasted:** two download workers retried at once, and the listings and storage polls each opened a connection, which kept the block in place.
+  - **What the app showed:** the backlog line then said *Downloads caught up* although files had been given up, and a failed file was never tried again.
+
+## Findings and fixes (1.14.0)
+
+| Id | Severity | Finding | Fix |
+| --- | --- | --- | --- |
+| I1 | **High** | **Hardware (operator's run).** A refused SSH connection used up a download attempt, and three came straight after one another; 11 of 15 files were given up. Given-up files were never queued again. The backlog line said *caught up*. | New SSH connections are paced process-wide: 3 per 10 s. After a connect timeout there is a 20-60 s cool-down, then one try at a time. Waiting for a connection is not an attempt; a download waits up to 10 min, then stops with one message. A failed transfer is tried again 10 s later, at most three attempts. **Retry downloads** in the pass summary queues given-up files again. The backlog line says *Not downloaded: N files, still on the sensor.* when that is the case. Tests in `test_sftp_connect_pacing.py` and `test_cellular_runner.py`. |
+| I2 | **High** | **Code review.** *Downloaded* meant the transfer had ended. | Downloaded means checked on this PC: the sensor's size, and for WAVE files the same samples as were read from the file on the sensor. A same-size local copy that fails the check is downloaded again and replaced. A transfer that ends short is reported (*Download incomplete: … of … bytes arrived.*). |
+| I3 | Medium | **Operator's screenshot.** Sensor Files showed the requested values with no label, so 3300-3800 looked recorded. | The history columns are **Req.**, and **Recorded (MHz)**, **Recorded (s)** and **Rate (MS/s)** come from what the app read from each file. That reading is taken at confirmation, preview or download, or from the collection session, and is valid only at the size it was read; otherwise the column says *unknown*. Test `test_sftp_table_shows_saved_recording_parameters`, `test_file_measurements.py`. |
+| I4 | Medium | **Code review.** The result card's *Received* / *Recorded* did not say where the numbers came from. | *Received (read from the files): 1 file, 0.503 s at 125 MS/s, 251.4 MB* and *Recorded (file metadata): …* or *unknown*. Tests in `test_result_view.py`. |
+| I5 | Low | **Code review.** Sizes were binary (MiB) but labelled MB, while the size estimate is decimal. | Decimal everywhere (1 MB = 1,000,000 bytes), IQ Storage included; tooltips give exact bytes and MiB. |
+| I6 | Low | **Code review.** Downloading a file already saved with the same size made `name (2).wav`. | Skipped with *Already saved: …, same size as on the sensor.*; a different local file of the same name is still never overwritten. Tests `test_sftp_begin_downloads_uses_fixed_folder_without_dialogs`, `test_already_saved_means_the_same_name_and_the_sensor_s_size`. |
+
+Found and fixed while building I1-I3, before release: the measurement store could not be written on a fresh install (its folder did not exist yet); a delayed retry would not run once the collection had finished; and the 10-minute patience was read once, when the module loaded, instead of for each download.
+
+## Hardware results (Node 100-18 `rfeye100400`, firmware 2.25-325, over OpenVPN, 4 November 2026, local times)
+
+- **Identity and idle checks** before the capture batch (12:08) and before deleting (12:14): model, serial and firmware matched, the mission list read *Idle*, and no file was growing.
+- **Connection pacing:** six connections in a row through the pacer all succeeded, and the fourth waited for the window (asked at 7.1 s, connected at 11.8 s). No connect timeout happened in the whole pass, so the cool-down and the waiting messages ran **in simulation only**.
+- **Sensor Files** (test instance from source): 12 columns. All 15 of the operator's rows show Recorded values from his collection session; his 3300-3800 row shows *Recorded 3500-3600*, 0.5028 s, 125 MS/s, 251.4 MB.
+- **Collection, 5 rows, 0.5 s, 2 s between recordings.** Every request had duration = rate = capture_length = 0.5 and WAVE format. Every row got HTTP 200, the sensor reported the recording finished, and the row was confirmed:
+
+| Request (MHz) | Sent centre / bandwidth | Sensor reply | File | Bytes | Rate | Samples | Duration | File metadata | Download |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 832-862 | 847 / 30 MHz | 847 / 30 MHz | `iq_20261104_100847_0001.wav` | 125,706,816 | 62.5 MS/s | 31,426,528 | 0.502824 s | 847 / 30 MHz | verified, 1st attempt |
+| 753-803 | 778 / 50 MHz | 778 / 50 MHz | `iq_20261104_100902_0001.wav` | 125,706,816 | 62.5 MS/s | 31,426,528 | 0.502824 s | 778 / 50 MHz | verified, 1st attempt |
+| 2110-2170 | 2140 / 60 MHz | 2140 / 60 MHz | `iq_20261104_100914_0001.wav` | 251,413,056 | 125 MS/s | 62,853,088 | 0.502825 s | 2140 / 60 MHz | verified, 1st attempt |
+| 3500-3600 | 3550 / 100 MHz | 3550 / 100 MHz | `iq_20261104_100930_0001.wav` | 251,413,056 | 125 MS/s | 62,853,088 | 0.502825 s | 3550 / 100 MHz | verified, 1st attempt |
+| 3300-3800 | 3550 / 500 MHz | 3550 / **100** MHz | `iq_20261104_100948_0001.wav` | 251,413,056 | 125 MS/s | 62,853,088 | 0.502825 s | 3550 / **100** MHz | verified, 1st attempt |
+
+- **Local copies:** all five parse as WAVE (2 channels, 16 bit) with the sizes above; a SHA-256 was taken of each. Sensor Files showed Req. and Recorded side by side for them (3300-3800 requested, 3500-3600 recorded). Downloading one again gave *Already saved*, with no second copy.
+- **Retry downloads:** one file was marked as given up and its local copy removed. The pass summary read *Not downloaded: 1 file, still on the sensor.* with **Retry downloads**, which fetched and verified the file in 33.6 s; the button was hidden afterwards.
+- **Throughput over the VPN:** two downloads at once ran at about 1.8-1.9 MB/s each (about 3.7 MB/s together). One download alone ran at 3.75 MB/s. All five files (1.006 GB) went from the first download start to the last verified in 290 s, while the collection was still recording for the first minute.
+- **1.14.0 EXE** (isolated test instance, UI Automation, no real input): its window appeared within 5 s; it connected, read the identity, and its Sensor Files showed the same 12 columns and values for the operator's files. It closed with exit code 0. Smart App Control did not block it this time: no Code Integrity event was logged after the build. The EXE made no recording.
+
+Sensor files created by this pass: the five above. They were deleted by exact name through the application's SFTP code after an identity and idle check. The operator's 15 files were all still present afterwards.
+
+## Simulated and offscreen results
+
+- Pacer window, cool-down, single probe and cancel; a connect timeout gives a cool-down and no second connect; refused versus authentication errors.
+- A download worker waiting, connecting after a refusal and finishing; the patience limit leading to *unreachable*; Stop while waiting ending at once.
+- Runner: waits that use no attempt; a stale same-size copy replaced; one waiting line and one *accepts connections again* line; the patience limit leading to *Download failed*, one *Downloads stopped* line and Retry downloads; delayed transfer retries with one failure line; the backlog line; the local-copy check (size, samples, header).
+- Sensor Files columns before and after a reading; *Already saved*; the card labels and decimal sizes.
+
+## Incident notes
+
+- **Build.** The first build stopped because the portable EXE in the build folder was in use by the operator's running 1.13.1 Recorder, which was not closed. The 1.14.0 files were built with the same steps into a separate output folder. The portable EXE in the usual place is still 1.13.1 until that window is closed.
+- **EXE check.** The first launch inherited the offscreen Qt platform from the test shell and showed no window. It had connected and read the identity (no recording); it was stopped and started again correctly.
+- The operator's Recorder was open during the pass. Its connections count against the same SSH limit.
+
+## Not done / still to verify
+
+- The operator's 11 files that were not downloaded are still only on the sensor; this pass did not download them. Sensor Files → Download fetches them in 1.14.0. Whether **Retry downloads** appears for his 1.13.1 session after the update was **not checked**.
+- The cool-down and waiting paths were not exercised on hardware (no timeout occurred).
+- The installer was built, not installed. The releases are still unsigned.
+
+## Test and release status
+
+| Item | Result |
+| --- | --- |
+| Recorder unit + GUI suite (offscreen Qt) | 512 collected: **510 pass, 2 skip** (no local copy of the protocol workbook), 0 fail, 96 s, on the final code before the build, not overlapping it. |
+| Build | Same steps as `build_exe.bat` with the installer, into a separate output folder (above): `CRFS_IQ_Recorder.exe` 57,384,061 B (SHA-256 `A38668C2…12DAEDF`), `CRFS_IQ_Recorder_Setup.exe` 43,533,793 B (SHA-256 `781F8FAA…044290B`), version resources 1.14.0. Not Authenticode-signed (unchanged). |
+| EXE test | Portable EXE, isolated settings, real sensor, read-only (above). |
+| Git | Branch `cursor/polish-gui-easy-launch`, annotated tag `v1.14.0`, remote `personal`; GitHub Release `v1.14.0` with both files. 1.13.1 and older releases kept. |
 
 ---
 

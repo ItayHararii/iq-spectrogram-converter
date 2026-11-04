@@ -503,12 +503,19 @@ class CellularPanel(QFrame):
             starts=True,
         )
         self.retry_btn.clicked.connect(self._retry_failed)
+        self.retry_dl_btn = _ghost(
+            "Retry downloads",
+            tooltip="Downloads the files that could not be downloaded. They are still on the sensor; nothing is recorded again.",
+            starts=True,
+        )
+        self.retry_dl_btn.clicked.connect(self._retry_downloads)
         self.pass_hint = QLabel("")
         self.pass_hint.setObjectName("muted")
         self.pass_hint.setWordWrap(True)
         self.pass_dismiss_btn = _ghost("Dismiss", tooltip="Hide this summary")
         self.pass_dismiss_btn.clicked.connect(self._dismiss_pass)
         pass_buttons.addWidget(self.retry_btn)
+        pass_buttons.addWidget(self.retry_dl_btn)
         pass_buttons.addWidget(self.pass_hint, 1)
         pass_buttons.addStretch(0)  # takes the width while the hint is hidden
         pass_buttons.addWidget(self.pass_dismiss_btn)
@@ -1273,7 +1280,11 @@ class CellularPanel(QFrame):
         out: list[str] = []
         downloads = int(status.get("pending_downloads") or 0)
         if downloads:
-            out.append(f"Downloads: {downloads} waiting")
+            sensor = " for the sensor to accept connections" if status.get("downloads_waiting") else ""
+            out.append(f"Downloads: {downloads} waiting{sensor}")
+        failed = int(status.get("failed_downloads") or 0)
+        if failed and not downloads:
+            out.append(f"Not downloaded: {_plural(failed, 'file')} (on the sensor)")
         pending = int(status.get("workbook_pending") or 0)
         wb_status = str(status.get("workbook_status") or "")
         if pending:
@@ -1313,14 +1324,21 @@ class CellularPanel(QFrame):
         session = self.runner.session
         index = next((i + 1 for i, r in enumerate(session.rounds) if r.round_id == round_id), 0) if session else 0
         self.pass_title.setText(f"Pass {index} finished" if index else "Pass finished")
-        self.pass_counts.setText(str(status.get("pass_summary") or ""))
+        summary = str(status.get("pass_summary") or "")
         failed = int(counts.get("failed", 0) or 0)
         uncertain = int(counts.get("uncertain", 0) or 0)
         active = bool(status.get("active"))
         legacy = bool(status.get("legacy"))
+        not_downloaded = int(status.get("failed_downloads") or 0)
+        downloading = int(status.get("pending_downloads") or 0)
+        if not_downloaded:
+            summary += f"\nNot downloaded: {_plural(not_downloaded, 'file')}, still on the sensor."
+        self.pass_counts.setText(summary)
         can_retry = (failed or uncertain) and not active and not legacy
         self.retry_btn.setVisible(bool(failed or uncertain))
         self.retry_btn.setEnabled(bool(can_retry))
+        self.retry_dl_btn.setVisible(bool(not_downloaded) and not legacy)
+        self.retry_dl_btn.setEnabled(bool(not_downloaded) and not downloading)
         if active and (failed or uncertain):
             hint = "Available when the collection has stopped."
         elif uncertain and not failed:
@@ -1346,6 +1364,13 @@ class CellularPanel(QFrame):
             self._on_status(self.runner.status())
 
         self.runner.retry_failed(round_id or None, done)
+
+    def _retry_downloads(self) -> None:
+        self._log_trigger("retry downloads", self.retry_dl_btn)
+        self.retry_dl_btn.setEnabled(False)
+        message = self.runner.retry_failed_downloads()
+        self._host_log(message)
+        self._on_status(self.runner.status())
 
     def _dismiss_pass(self) -> None:
         self._pass_dismissed = str(self.runner.status().get("last_round_id") or "")

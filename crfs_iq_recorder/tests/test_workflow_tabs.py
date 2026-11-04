@@ -216,7 +216,7 @@ def test_manual_result_card_downloads_then_opens_the_folder_and_the_waterfall(qa
         assert not card.isHidden()
         assert card.title.text() == "156-162 MHz"
         assert card.requested.text() == "Requested: 6 MHz for 0.05 s"
-        assert card.received.text().startswith("Received: 1 file, ")
+        assert card.received.text().startswith("Received (read from the files): 1 file, ")
         assert card.states.text() == "Files ready · On the sensor"
         assert not card.open_btn.isEnabled() and card.open_btn.toolTip() == "Download required."
         assert not card.waterfall_btn.isEnabled() and card.download_btn.isEnabled()

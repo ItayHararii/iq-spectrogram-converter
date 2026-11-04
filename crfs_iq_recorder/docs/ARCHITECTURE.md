@@ -1,6 +1,6 @@
 # CRFS IQ Recorder - architecture
 
-**Version documented:** 1.13.1
+**Version documented:** 1.14.0
 **Code:** `crfs_iq_recorder/` as of this file (3 November 2026). The Excel Collection rows below (called Cellular Collection before 1.13.0) describe the 1.13.0 design; `docs/CELLULAR_COLLECTION.md` has the detail.
 **Related app:** IQ Spectrogram Converter (`iq_gui.py`, `iq_data.py`) at the repository root
 
@@ -127,7 +127,7 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | Cellular workbook | Cell-level writer for the protocol worksheet: block 0 filled in place, later passes appended as blocks, backup before the first change of a session, persistent `WorkbookQueue` with busy/error retries, openpyxl or Excel COM when the workbook is open (1.10.0) | `cellular_workbook.py`, `excel_com.py` |
 | Cellular quality | Pre-run checks, post-download WAV validation sampling begin/middle/end, sampled preview PNG, coverage summary (1.9.0) | `cellular_quality.py` |
 | Cellular panel | The Excel Collection tab (1.13.0): header with state badge, lazily built form, action bar pinned under the tab, plan preview, result card, pass summary with Retry failed rows, recovery notice (interrupted session: Check with the sensor / Continue / Skip uncertain; missed pass: Run now / Skip; unfinished downloads: Continue) | `cellular_panel.py`, `cellular_pickers.py` |
-| Sensor Files window | Listing, sort, groups, download, delete, waterfall | `sftp_window.py` |
+| Sensor Files window | Listing, sort, groups, download, delete, waterfall; requested (**Req.**) and recorded columns side by side, recorded values from what was read from each file (1.14.0) | `sftp_window.py`, `file_measurements.py` |
 | SFTP backend | One listing thread and one SSH session for browse/delete | `sftp_window.py` (`SftpBackend`) |
 | SFTP client | Paramiko connect (8 s), read (20 s), download via `.part` | `sftp_client.py`, `download_util.py` |
 | Listing groups | `_0001` / `_0002` as one capture; NEW badge | `listing_sort.py` |
@@ -199,7 +199,7 @@ Repeat (count or until stopped) waits after the current capture (default 5 s). *
 | Action | Trigger | Notes |
 | --- | --- | --- |
 | Sensor Files | Button | Own window and SFTP session |
-| Download | Selection + Download | Up to four files at once; never overwrites (`name (2).wav`) |
+| Download | Selection + Download | Up to four files at once; a file already saved with the sensor's size is skipped; never overwrites another file (`name (2).wav`) (1.14.0) |
 | Waterfall | Click a WAVE | Prefix only; quiet start does not mean a quiet file |
 | Delete remote | Delete key on the list | Sensor files only; local copies and Excel stay |
 | IQ Storage | Connect, timer 30 s, after record/delete | Separate SFTP from Sensor Files |
@@ -233,7 +233,7 @@ flowchart TB
 | Paint, tables, dialogs | UI | - | - |
 | EMP POST, identity, link probe | `Worker` QThread | HTTP timeout from Settings (default 30 s); link probe 4 s | Log; recording failure stops the series |
 | SFTP list / mkdir probe / delete | `SftpBackend` | Connect 8 s, read 20 s; abort closes the SSH socket | Empty-state text "Could not list files" plus the error; no modal for list failure |
-| Download | One QThread per file, max 4 | Cancel event; `.part` cleaned up | Status + per-file warning |
+| Download | One QThread per file, max 4 | Cancel event; `.part` cleaned up; waits up to 10 min for the sensor to accept a connection (1.14.0) | Status + per-file warning; one message for files the sensor never accepted a connection for |
 | Waterfall | QThread; matplotlib under a semaphore of 1 | Cancel; temp prefix deleted | Caption error; cache skipped |
 | Collection watch / IQ Storage | `Worker` QThread, new SFTP each time | Cancel event on the previous job | Log; last good storage kept as stale |
 | Excel write | UI thread calling COM or openpyxl | Busy → stay in queue | Pending count on the main window |
@@ -243,7 +243,7 @@ flowchart TB
 
 - Matplotlib is serialized (`_PREVIEW_COMPUTE`). A preview still should not run on the UI thread.
 - Sensor Files listing uses one Paramiko session. A slow `listdir` blocks other list/delete commands on that same backend thread, not the UI.
-- IQ Storage and collection watch each open **another** SSH session. Several connects at once can slow the Node or hit the 8 s connect timeout (that is what "SFTP connection failed: timed out" is).
+- IQ Storage and collection watch each open **another** SSH session. Several connects at once can slow the Node or hit the 8 s connect timeout (that is what "SFTP connection failed: timed out" is). Over OpenVPN the Node 100-18 also stopped accepting new SSH connections for ~15 s after about six in ten seconds; since 1.14.0 new connections are paced process-wide (3 per 10 s) and, after a connect timeout, held back for 20-60 s (`sftp_client.ConnectPacer`).
 - EMP POST close-on-timer avoids waiting for HTTP, but a stuck TCP send is not fully characterized here ([Unverified](#unverified)).
 - Excel COM runs on the UI thread. A hung Excel automation call would freeze the window until it returns.
 
@@ -274,8 +274,8 @@ erDiagram
 
 **Requested vs recorded**
 
-- **Requested:** values on Start (and in history, Sensor Files columns, Excel Freq Start/Stop). The EMP `bandwidth` field is sent as typed. 1.8.3 does not clamp it to instantaneous bandwidth.
-- **Verified on disk:** WAVE `fmt` sample rate and byte length after download or preview. The waterfall X axis is baseband `±fs/2`, not the typed MHz window, unless the operator reads the history columns.
+- **Requested:** values on Start (and in history, Sensor Files **Req.** columns, Excel Freq Start/Stop). The EMP `bandwidth` field is sent as typed. 1.8.3 does not clamp it to instantaneous bandwidth.
+- **Verified on disk:** WAVE `fmt` sample rate, sample count and CRFS `meta` centre/bandwidth, read at confirmation, preview or download and kept per sensor path in `.crfs_iq_recorder_file_measurements.json` (Sensor Files **Recorded** columns and the result card; *unknown* when not read at the file's current size) (1.14.0). The waterfall X axis is baseband `±fs/2`, not the typed MHz window, unless the operator reads the history columns.
 - **Class band** in the workbook is wider than one capture. Excel is filled with the **typed capture window**, not the whole class.
 
 Matching: prefer a remembered `iq_stem`; otherwise the lead part's timestamp must fall in `[started_at - 180 s, started_at + duration + 180 s]`. One recording maps to at most one group. Host is a weak preference so an IP change does not drop metadata.

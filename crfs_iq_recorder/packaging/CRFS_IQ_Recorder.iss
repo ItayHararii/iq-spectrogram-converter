@@ -12,7 +12,7 @@
 ;
 ; Built by build_exe.bat when CRFS_BUILD_INSTALLER=1 (needs Inno Setup 6,
 ; "winget install JRSoftware.InnoSetup"). Compile manually with:
-;   ISCC.exe /DAppVersion=1.13.1 /DSourceDir=..\dist\onedir\CRFS_IQ_Recorder packaging\CRFS_IQ_Recorder.iss
+;   ISCC.exe /DAppVersion=1.14.0 /DSourceDir=..\dist\onedir\CRFS_IQ_Recorder packaging\CRFS_IQ_Recorder.iss
 ; Add /DSign /S"crfs=<command> $f" to sign Setup and the uninstaller.
 ;
 ; Repackaging is not a trust mechanism: an unsigned installer gets the same

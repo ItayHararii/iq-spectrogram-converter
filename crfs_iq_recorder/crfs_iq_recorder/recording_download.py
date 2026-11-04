@@ -66,6 +66,8 @@ class RecordingDownload(QObject):
             queued = Qt.ConnectionType.QueuedConnection
             worker.finished.connect(self._on_file_done, queued)
             worker.failed.connect(self._on_file_failed, queued)
+            worker.unreachable.connect(self._on_file_unreachable, queued)
+            worker.waiting.connect(self._on_file_waiting, queued)
             thread.started.connect(worker.run)
             self._thread, self._worker = thread, worker
             track_worker_thread(thread, worker)
@@ -89,6 +91,17 @@ class RecordingDownload(QObject):
         diag("download_failed", name, error=text)
         cancelled = "cancel" in (text or "").casefold()
         self.failed.emit("Download cancelled." if cancelled else f"Download of {name} failed. See details.")
+
+    @Slot(str, float, str)
+    def _on_file_waiting(self, name: str, delay_s: float, detail: str) -> None:
+        diag("download_waiting", name, delay_s=round(float(delay_s), 1), detail=detail)
+        self.progress.emit("Waiting for the sensor to accept a connection")
+
+    @Slot(str, str)
+    def _on_file_unreachable(self, name: str, detail: str) -> None:
+        self._thread = self._worker = None
+        diag("download_unreachable", name, detail=detail)
+        self.failed.emit("Not downloaded: the sensor accepted no new connection. The files stay on the sensor.")
 
 
 __all__ = ["RecordingDownload"]

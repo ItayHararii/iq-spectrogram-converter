@@ -64,7 +64,9 @@ def fake_paramiko(monkeypatch):
     return meter
 
 
-def test_at_most_two_handshakes_run_at_once(fake_paramiko):
+def test_at_most_two_handshakes_run_at_once(fake_paramiko, monkeypatch):
+    # The gate alone: new-connection pacing (test_sftp_connect_pacing.py) would spread six over 20 s.
+    monkeypatch.setattr(sftp_client, "SSH_CONNECTS_PER_WINDOW", 100)
     results: list[object] = []
 
     def work() -> None:

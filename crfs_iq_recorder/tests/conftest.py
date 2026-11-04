@@ -69,6 +69,14 @@ def release_closed_windows():
 
 
 @pytest.fixture(autouse=True)
+def fresh_connect_pacer(monkeypatch):
+    """Each test starts with no SSH connection paced or held back by an earlier test."""
+    from crfs_iq_recorder import sftp_client
+
+    monkeypatch.setattr(sftp_client, "connect_pacer", sftp_client.ConnectPacer())
+
+
+@pytest.fixture(autouse=True)
 def reset_demo_sftp():
     from crfs_iq_recorder.demo_sftp import reset_shared_demo_browser
 

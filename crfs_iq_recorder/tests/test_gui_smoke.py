@@ -572,18 +572,32 @@ def test_sftp_table_shows_saved_recording_parameters(qapp, tmp_path):
             demo=True,
         )
     )
+    from crfs_iq_recorder.file_measurements import record_parts
+
     window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
     try:
         _wait_listing(window, qapp)
-        assert window.table.columnCount() == 9
-        shown = [
-            (item.text(4), item.text(8))
-            for item in (
-                window.table.topLevelItem(i) for i in range(window.table.topLevelItemCount())
-            )
-            if item is not None
-        ]
-        assert any(start == "790" and duration == "4" for start, duration in shown)
+        assert window.table.columnCount() == 12
+        assert _header_text(window, 4) == "Req. start (MHz)" and _header_text(window, 8) == "Req. duration (s)"
+        assert [_header_text(window, c) for c in (9, 10, 11)] == ["Recorded (MHz)", "Recorded (s)", "Rate (MS/s)"]
+
+        def rows():
+            items = (window.table.topLevelItem(i) for i in range(window.table.topLevelItemCount()))
+            return [tuple(item.text(c) for c in (1, 4, 8, 9, 10, 11)) for item in items if item is not None]
+
+        assert any(start == "790" and duration == "4" for _n, start, duration, *_r in rows())
+        # Requested values come from the history; what the files hold is "unknown" until read.
+        iq_rows = [row for row in rows() if row[1] == "790"]
+        assert iq_rows and all(row[3:] == ("unknown", "unknown", "unknown") for row in iq_rows)
+        wavs = [e for e in window._entries if not e.is_dir and e.name.lower().endswith(".wav")]
+        record_parts("192.0.2.10", [
+            {"path": e.path, "size": e.size, "duration_s": 1.0, "sample_rate_hz": 25.6e6,
+             "centre_hz": 800e6, "bandwidth_hz": 20e6} for e in wavs
+        ])
+        window.relabel_files()
+        qapp.processEvents()
+        recorded = [row[3:] for row in rows() if row[1] == "790"]
+        assert recorded and all(r[0] == "790–810" and r[2] == "25.6" and r[1] != "unknown" for r in recorded), recorded
     finally:
         window.close()
         qapp.processEvents()
@@ -658,16 +672,25 @@ def test_sftp_begin_downloads_uses_fixed_folder_without_dialogs(qapp, tmp_path, 
         assert (dest / files[0].name).is_file()
         assert (dest / files[1].name).is_file()
         existing = dest / files[0].name
+        renamed = dest / f"{Path(files[0].name).stem} (2){Path(files[0].name).suffix}"
+        # Hardware, 4 Nov: downloading a file that is already saved made "… (2).wav", a second
+        # 251 MB copy. A complete copy (same name, the sensor's size) is not downloaded again.
+        window._begin_downloads(files[:1])
+        qapp.processEvents()
+        assert not window._dl_active and not window._busy
+        assert not renamed.exists()
+        assert window.status.text().startswith("Already saved: 1 file(s)")
+        # A different file under that name is never overwritten: the download gets its own name.
+        existing.write_bytes(b"not the sensor's file")
         window._begin_downloads(files[:1])
         deadline = time.time() + 4
-        renamed = dest / f"{Path(files[0].name).stem} (2){Path(files[0].name).suffix}"
         while time.time() < deadline:
             qapp.processEvents()
             if renamed.is_file() and not window._dl_active and not window._busy:
                 break
             time.sleep(0.05)
-        assert existing.is_file()
-        assert renamed.is_file()
+        assert existing.read_bytes() == b"not the sensor's file"
+        assert renamed.is_file() and renamed.stat().st_size == files[0].size
     finally:
         window.close()
         qapp.processEvents()

@@ -32,6 +32,14 @@ def unique_destination(dest: Path) -> Path:
             raise DownloadError(f"Could not find a free name near {dest}.")
 
 
+def already_saved(dest: Path, size: int) -> bool:
+    """A finished local copy: the same name and exactly the size the sensor lists."""
+    try:
+        return int(size or 0) > 0 and Path(dest).is_file() and Path(dest).stat().st_size == int(size)
+    except OSError:
+        return False
+
+
 def cleanup_part(path: Path) -> None:
     try:
         Path(path).unlink(missing_ok=True)
