@@ -1288,9 +1288,13 @@ class CellularPanel(QFrame):
         pending = int(status.get("workbook_pending") or 0)
         wb_status = str(status.get("workbook_status") or "")
         if pending:
-            out.append(f"Excel updates pending: {pending}" + (" (the workbook is busy)" if wb_status == "busy" else ""))
+            out.append(f"Waiting for Excel: {pending} update" + ("s" if pending != 1 else "") + (" (the workbook is busy)" if wb_status == "busy" else ""))
         elif wb_status == "error":
             out.append("Excel update failed; trying again")
+        elif wb_status == "saved" and status.get("protocol_results"):
+            out.append("Excel updated")
+        if status.get("preflight_pending"):
+            out.append("Pre-collection check running")
         return out
 
     def _sync_bar_texts(self, status: dict) -> None:
@@ -1385,7 +1389,14 @@ class CellularPanel(QFrame):
         view = self.result_card.view
         if view is None or not view.local_paths:
             return
-        self._waterfall = WaterfallDialog(view.local_paths[0], center_hz=view.centre_hz, bandwidth_hz=view.bandwidth_hz, parent=self.window())
+        self._waterfall = WaterfallDialog(
+            view.local_paths[0],
+            center_hz=view.centre_hz,
+            bandwidth_hz=view.bandwidth_hz,
+            requested_start_hz=view.requested_start_hz,
+            requested_stop_hz=view.requested_stop_hz,
+            parent=self.window(),
+        )
         self._waterfall.show()
 
     def _host_busy_reason(self) -> str:
@@ -1496,6 +1507,10 @@ class CellularPanel(QFrame):
             record = session.round(missed[0])
             when = format_datetime(record.scheduled_local.astimezone()) if record is not None else "its time"
             lines.append(f"A scheduled pass was missed at {when}. Run it now or skip it.")
+        if interrupted and not legacy:
+            pending = self.runner.pending_work_text()
+            if pending:
+                lines.append(pending + " Nothing is recorded again; Continue resumes the pending work.")
         self.recovery_label.setText("\n".join(lines))
         self.reconcile_btn.setVisible(interrupted and bool(uncertain))
         self.resume_session_btn.setVisible(interrupted and not legacy)

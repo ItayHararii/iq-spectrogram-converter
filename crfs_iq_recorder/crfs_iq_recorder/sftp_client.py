@@ -129,6 +129,13 @@ class SftpBrowser:
 
         return StorageSnapshot.unavailable("Storage query is not implemented.")
 
+    def remote_sha256(self, remote_path: str, *, timeout_s: float = 0.0) -> tuple[str, str]:
+        """(hex digest, note) computed on the sensor; ('' , why) when the sensor offers none."""
+        return "", "no checksum available from this connection"
+
+
+REMOTE_CHECKSUM_TIMEOUT_S = 180.0  # a 500 MB part takes the Node a few seconds; a slow disk much longer
+
 
 def _raise_if_cancelled(cancel: threading.Event | None) -> None:
     if cancel is not None and cancel.is_set():
@@ -419,6 +426,28 @@ class ParamikoSftpBrowser(SftpBrowser):
             raise SftpError(f"Could not delete {remote_path}: {exc}") from exc
         except Exception as exc:
             raise SftpError(f"Could not delete {remote_path}: {exc}") from exc
+
+    def remote_sha256(self, remote_path: str, *, timeout_s: float = REMOTE_CHECKSUM_TIMEOUT_S) -> tuple[str, str]:
+        """(hex digest, note) of the sensor's file, computed on the sensor over SSH.
+
+        The Node exposes no checksum in its HTTP API; its Linux has GNU
+        ``sha256sum`` (seen on the R40-8, coreutils 8.30), so the digest is
+        read over the same SSH session the files come from. Read-only. The
+        digest is '' with a note when the command is unavailable or slow.
+        """
+        import shlex
+
+        quoted = shlex.quote(remote_path)
+        try:
+            _stdin, stdout, stderr = self._client.exec_command(f"sha256sum {quoted}", timeout=float(timeout_s))
+            text = stdout.read().decode("utf-8", errors="replace").strip()
+            err = stderr.read().decode("utf-8", errors="replace").strip()
+        except Exception as exc:  # noqa: BLE001 - the checksum is one of three verifications, not the download
+            return "", f"sha256sum over SSH failed: {exc}"
+        digest = text.split()[0].casefold() if text else ""
+        if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+            return digest, "sha256sum computed on the sensor over SSH"
+        return "", f"sha256sum over SSH gave no digest ({err or text or 'no output'})"
 
     def storage_usage(self, path: str):
         from .sensor_storage import snapshot_from_df_text, snapshot_from_statvfs
@@ -842,6 +871,23 @@ class DemoSftpBrowser(SftpBrowser):
         except DownloadError as exc:
             cleanup_part(tmp)
             raise SftpError(str(exc)) from exc
+
+    def remote_sha256(self, remote_path: str, *, timeout_s: float = 0.0) -> tuple[str, str]:
+        import hashlib
+
+        with self._lock:
+            payload = self._files.get((remote_path or "").replace("\\", "/"))
+            fail = getattr(self, "_checksum_fail", False)
+        if payload is None:
+            return "", f"File not found: {remote_path}"
+        if fail:
+            return "", "sha256sum unavailable (demo)"
+        return hashlib.sha256(payload).hexdigest(), "sha256 of the demo file"
+
+    def set_checksum_available(self, available: bool) -> None:
+        """Simulate a sensor without a usable sha256sum."""
+        with self._lock:
+            self._checksum_fail = not available
 
     def set_storage(self, *, total: int | None = None, free: int | None = None, fail: bool | None = None) -> None:
         with self._lock:

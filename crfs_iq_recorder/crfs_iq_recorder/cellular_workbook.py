@@ -42,15 +42,19 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .cellular_protocol import ColumnMapping, ProtocolImport, _normalise_header, parse_direction_cell, parse_frequency_cell
-from .excel_com import XL_FORMULAS, XL_PART, XL_BY_ROWS, XL_PREVIOUS, _norm, excel_has_workbook
+from .excel_com import BUSY, OPEN, XL_FORMULAS, XL_PART, XL_BY_ROWS, XL_PREVIOUS, _norm, com_busy_reason, excel_workbook_state
 from .excel_writer import ExcelBusyError, backup_workbook
 from .json_store import read_json, write_json
 from .recording_history import iq_group_key, sort_iq_filenames
+from .xdat_header import is_xdat_sidecar
 
 QUEUE_SCHEMA = 1
 QUEUE_FILENAME = "workbook_queue.json"
 DATETIME_FORMAT = "dd/mm/yyyy hh:mm:ss"
 DURATION_FORMAT = "0.000"
+# Written into the time cell when the sensor gave no timestamp for the files
+# (neither CRFS metadata nor a UTC time in the file name): never a guess.
+TIME_UNKNOWN = "unknown"
 # Seconds of IQ are kept to the millisecond: finer digits are the byte model's noise.
 DURATION_DIGITS = 3
 _SENSOR_HEADERS = {
@@ -345,7 +349,10 @@ def build_row_result(round_id: str, plan_index: int, tasks: list[dict[str, Any]]
             continue
         confirmed += 1
         summary = task.get("summary") or {}
-        names = [str(f.get("name") or "") for f in (task.get("files") or []) if f.get("name")]
+        # The sample files only; XDAT header/marker sidecars are kept beside
+        # them in the same folder and would otherwise appear or not depending
+        # on when the sensor wrote them.
+        names = [str(f.get("name") or "") for f in (task.get("files") or []) if f.get("name") and not is_xdat_sidecar(str(f.get("name")))]
         files.extend(names)
         held = summary.get("held_s")
         if held is None:
@@ -717,6 +724,14 @@ def _write_row(sheet, layout: SheetLayout, row: int, result: RowResult) -> tuple
         if _as_naive(sheet.value(row, layout.time)) != wanted_dt:
             sheet.set_value(row, layout.time, wanted_dt, number_format=DATETIME_FORMAT)
             changed = True
+    elif layout.time and result.files and result.recorded_at is None:
+        # Files exist but the sensor gave no start time: say so in the cell
+        # rather than leave it empty (an empty cell reads as "not yet written").
+        # A later reconciliation that finds the time replaces the word.
+        current = sheet.value(row, layout.time)
+        if current in (None, "") and _text(current) != TIME_UNKNOWN:
+            sheet.set_value(row, layout.time, TIME_UNKNOWN)
+            changed = True
     return changed, None
 
 
@@ -826,33 +841,66 @@ def write_results_com(path: Path, *, layout: SheetLayout, plan: list[PlanRow], r
         raise ExcelBusyError("Excel COM is not available on this PC.") from exc
     pythoncom.CoInitialize()
     try:
-        app = win32com.client.GetActiveObject("Excel.Application")
+        try:
+            app = win32com.client.GetActiveObject("Excel.Application")
+        except Exception as exc:  # noqa: BLE001 - no instance, or one that cannot be asked
+            raise ExcelBusyError(f"Excel could not be reached for {Path(path).name}: {com_busy_reason(exc) or exc}") from exc
         want = _norm(Path(path))
         book = None
-        for item in app.Workbooks:
-            try:
-                if _norm(Path(str(item.FullName))) == want:
-                    book = item
-                    break
-            except Exception:  # noqa: BLE001
-                continue
+        try:
+            for item in app.Workbooks:
+                try:
+                    if _norm(Path(str(item.FullName))) == want:
+                        book = item
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    if com_busy_reason(exc):
+                        raise
+                    continue
+        except Exception as exc:  # noqa: BLE001
+            reason = com_busy_reason(exc)
+            if reason:
+                raise ExcelBusyError(f"{reason}; {Path(path).name} is written when Excel is free.") from exc
+            raise
         if book is None:
             raise ExcelBusyError(f"{Path(path).name} is not open in Excel any more.")
         try:
             sheet = book.Worksheets(layout.worksheet)
         except Exception as exc:  # noqa: BLE001
+            if com_busy_reason(exc):
+                raise ExcelBusyError(f"{com_busy_reason(exc)}; {Path(path).name} is written when Excel is free.") from exc
             raise WorkbookError(f"Worksheet {layout.worksheet!r} is not in {Path(path).name}.") from exc
-        alerts = app.DisplayAlerts
-        app.DisplayAlerts = False
         try:
-            report = apply_results(_ComSheet(sheet), layout=layout, plan=plan, results=results, blocks=blocks)
-            if report.written or report.blocks != blocks:
+            alerts = app.DisplayAlerts
+            app.DisplayAlerts = False
+        except Exception as exc:  # noqa: BLE001 - the first property call is where a busy Excel refuses
+            raise ExcelBusyError(f"{com_busy_reason(exc) or 'Excel refused the call'}; {Path(path).name} is written when Excel is free.") from exc
+        try:
+            try:
+                report = apply_results(_ComSheet(sheet), layout=layout, plan=plan, results=results, blocks=blocks)
+            except Exception as exc:  # noqa: BLE001
+                reason = com_busy_reason(exc)
+                if reason:
+                    # Cells written so far are in the open workbook; the next
+                    # flush finds them unchanged and only saves. Nothing is
+                    # marked done until Excel confirms the save.
+                    raise ExcelBusyError(f"{reason}; the results stay queued and are written when Excel is free.") from exc
+                raise
+            # Save when something was written now, or when an earlier flush
+            # wrote cells that Excel has not confirmed as saved yet.
+            if report.written or report.blocks != blocks or not _book_saved(book):
                 try:
                     book.Save()
-                except Exception as exc:  # noqa: BLE001 - the cells are in the open workbook either way
-                    report.skipped.append(f"written into the open workbook, but Excel could not save it ({exc}); save it in Excel")
+                except Exception as exc:  # noqa: BLE001 - the save is what counts as "updated"
+                    reason = com_busy_reason(exc) or f"Excel could not save it ({exc})"
+                    raise ExcelBusyError(f"{Path(path).name}: written into the open workbook, but {reason}; saved again when Excel is free.") from exc
+                if not _book_saved(book):
+                    raise ExcelBusyError(f"{Path(path).name}: Excel did not confirm the save (Workbook.Saved is false); tried again shortly.")
         finally:
-            app.DisplayAlerts = alerts
+            try:
+                app.DisplayAlerts = alerts
+            except Exception:  # noqa: BLE001
+                pass
         return report
     finally:
         import gc
@@ -862,6 +910,14 @@ def write_results_com(path: Path, *, layout: SheetLayout, plan: list[PlanRow], r
             pythoncom.CoUninitialize()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _book_saved(book) -> bool:
+    """Excel's own word that the workbook has no unsaved changes (Workbook.Saved)."""
+    try:
+        return bool(book.Saved)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ----------------------------------------------------------------------------- queue
@@ -1102,12 +1158,31 @@ def ensure_backup(queue: WorkbookQueue, workbook: Path) -> Path | None:
     return target
 
 
-def flush_queue(queue: WorkbookQueue, *, excel_open: Callable[[Path], bool] = excel_has_workbook) -> FlushReport:
-    """Write every pending result. Runs on a worker; never raises for a busy or missing workbook."""
+def _open_state(excel_open: Callable[[Path], Any], file: Path) -> str:
+    """'open' / 'closed' / 'busy' from either a tri-state or a boolean probe."""
+    state = excel_open(file)
+    if isinstance(state, str):
+        return state
+    return OPEN if state else "closed"
+
+
+def flush_queue(queue: WorkbookQueue, *, excel_open: Callable[[Path], Any] | None = None) -> FlushReport:
+    """Write every pending result. Runs on a worker; never raises for a busy or missing workbook.
+
+    The workbook is written through the running Excel when it is open there,
+    through openpyxl when it is closed, and not at all while Excel cannot be
+    asked which it is (a busy instance): a file open in an Excel that is in
+    edit mode must never be rewritten on disk behind it.
+    """
     report = FlushReport()
     items = queue.pending_items()
     if not items:
         return report
+    if excel_open is None:
+        # Resolved at call time so a test can replace the probe on the module.
+        from . import excel_com
+
+        excel_open = excel_com.excel_workbook_state
     by_book: dict[str, list[PendingItem]] = {}
     for item in items:
         by_book.setdefault(_norm(Path(item.workbook)), []).append(item)
@@ -1118,6 +1193,9 @@ def flush_queue(queue: WorkbookQueue, *, excel_open: Callable[[Path], bool] = ex
             queue.mark_failed(group, report.error)
             continue
         try:
+            state = _open_state(excel_open, file)
+            if state == BUSY:
+                raise ExcelBusyError(f"Excel is busy (a cell is being edited or a dialog is open); {file.name} is written when it is free.")
             backup = ensure_backup(queue, file)
             if backup is not None:
                 report.backups.append(str(backup))
@@ -1126,7 +1204,7 @@ def flush_queue(queue: WorkbookQueue, *, excel_open: Callable[[Path], bool] = ex
             results = [item.result for item in group if item.layout.worksheet == layout.worksheet]
             blocks = queue.blocks_for(file)
             before = {rid: b.to_dict() for rid, b in blocks.items()}
-            if excel_open(file):
+            if state == OPEN:
                 written = write_results_com(file, layout=layout, plan=plan, results=results, blocks=blocks)
                 report.notes.append(f"written through the open Excel window into {file.name}")
             else:

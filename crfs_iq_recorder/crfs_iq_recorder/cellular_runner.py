@@ -15,6 +15,7 @@ which use worker threads with queued signals back to the runner.
 
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -79,8 +80,9 @@ from .cellular_workbook import (
     flush_queue,
     queue_path,
 )
+from .cellular_preflight import PreflightResult, default_probes, gather_preflight
 from .diagnostic_log import diag
-from .download_util import already_saved
+from .download_util import already_saved, part_path
 from .excel_writer import ExcelBusyError
 from .operator_text import clip, files_text, seconds_text
 from .result_view import EXCEL_FAILED, EXCEL_PENDING, EXCEL_UPDATED, ResultView, view_from_task
@@ -134,6 +136,18 @@ DEFAULT_LOCAL_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 # Seconds between a confirmed capture and the fresh listing that precedes its
 # downloads (the sensor finishes headers and sidecars after reporting done).
 FINALIZE_SETTLE_S = 5.0
+# The sensor's folder is listed again until every file of the capture keeps
+# its size between two listings (bounded): a file still being written is not
+# downloaded, and the size the download is checked against is the final one.
+FINALIZE_POLLS = 3
+# Verification stages of a downloaded file, in order.
+V_SIZE = "size"
+V_STRUCTURE = "structure"
+V_CHECKSUM = "checksum"
+V_OK = "verified"
+V_FAILED = "failed"
+V_NA = "not_available"
+V_SKIPPED = "not_applicable"
 TICK_MS = 500
 # When the sensor still lists the previous remote-recording mission after the
 # bounded poll, the next request waits this long before the list is read again.
@@ -148,6 +162,8 @@ WORKBOOK_BUSY_RETRY_S = 15.0
 # A write that failed for another reason (file missing, backup folder full) is retried too,
 # more slowly; the queue is on disk and every write reconciles, so nothing is duplicated.
 WORKBOOK_ERROR_RETRY_S = 60.0
+# Excel log rows deferred because the log workbook is busy in Excel are tried again this often.
+EXCEL_RETRY_S = 10.0
 
 
 @dataclass
@@ -399,6 +415,8 @@ class SessionState:
     updated_utc: str = ""
     sensor: dict[str, Any] = field(default_factory=dict)
     timezone_label: str = ""
+    # Pre-collection check results per round_id (the latest one for each pass).
+    preflight: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -417,6 +435,7 @@ class SessionState:
             "updated_utc": self.updated_utc,
             "sensor": dict(self.sensor),
             "timezone_label": self.timezone_label,
+            "preflight": {rid: dict(item) for rid, item in self.preflight.items()},
         }
 
     @classmethod
@@ -439,6 +458,7 @@ class SessionState:
             updated_utc=str(data.get("updated_utc") or ""),
             sensor=dict(data.get("sensor") or {}),
             timezone_label=str(data.get("timezone_label") or ""),
+            preflight={str(rid): dict(item) for rid, item in (data.get("preflight") or {}).items() if isinstance(item, dict)},
         )
 
     def round(self, round_id: str | None) -> RoundRecord | None:
@@ -480,15 +500,36 @@ def _utc_now_text() -> str:
 
 class _ChecksumWorker(QObject):
     done = Signal(str, str, str)  # task_key, name, sha256 or ""
+    remote = Signal(str, str, str)  # name, sensor's sha256 or "", note
 
-    def __init__(self, task_key: str, name: str, path: str) -> None:
+    def __init__(self, task_key: str, name: str, path: str, *, conn: Any = None, remote_path: str = "") -> None:
         super().__init__()
         self._task_key = task_key
         self._name = name
         self._path = path
+        self._conn = conn
+        self._remote_path = remote_path
 
     @Slot()
     def run(self) -> None:
+        if self._conn is not None and self._remote_path:
+            # A copy that was already on disk (restart, retry): the sensor's own
+            # digest is fetched here, since no download worker did it.
+            digest, note = "", ""
+            try:
+                from .sftp_window import _open_browser
+
+                browser = _open_browser(self._conn)
+                try:
+                    digest, note = browser.remote_sha256(self._remote_path)
+                finally:
+                    try:
+                        browser.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception as exc:  # noqa: BLE001 - no digest = "not available", never a crash
+                note = f"the sensor could not be asked ({type(exc).__name__})"
+            self.remote.emit(self._name, digest, note)
         try:
             digest = sha256_of_file(Path(self._path))
         except OSError:
@@ -517,6 +558,8 @@ class _QualityWorker(QObject):
         expected_parts: list[str],
         preview_path: str,
         label: str,
+        requested_start_hz: int | float | None = None,
+        requested_stop_hz: int | float | None = None,
     ) -> None:
         super().__init__()
         self._round_id = round_id
@@ -529,6 +572,7 @@ class _QualityWorker(QObject):
         self._parts = expected_parts
         self._preview = preview_path
         self._label = label
+        self._requested = (requested_start_hz, requested_stop_hz)
 
     @Slot()
     def run(self) -> None:
@@ -543,12 +587,25 @@ class _QualityWorker(QObject):
                 expected_sample_rate_hz=self._rate,
                 expected_parts=self._parts,
             )
+            axis: dict = {}
             if self._preview and report.level not in {cq.LEVEL_ERROR, cq.LEVEL_NOT_CHECKED}:
                 try:
-                    report.preview_path = str(cq.write_preview(self._paths, self._preview, center_hz=self._center, label=self._label))
+                    report.preview_path = str(
+                        cq.write_preview(
+                            self._paths,
+                            self._preview,
+                            center_hz=self._center,
+                            label=self._label,
+                            requested_start_hz=self._requested[0],
+                            requested_stop_hz=self._requested[1],
+                        )
+                    )
+                    axis = cq.describe_preview_axis(self._paths, requested_start_hz=self._requested[0], requested_stop_hz=self._requested[1])
                 except Exception as exc:  # noqa: BLE001 - the preview is optional
                     report.warnings.append(f"Preview not drawn: {exc}")
             payload = report.to_dict()
+            if axis:
+                payload["preview_axis"] = axis
         except Exception as exc:  # noqa: BLE001 - never let a check crash the session
             payload = {"level": "unknown", "flags": ["check_failed"], "errors": [f"Quality check failed: {exc}"], "warnings": [], "files": []}
         self.done.emit(self._round_id, self._task_key, payload)
@@ -598,6 +655,7 @@ class CellularRunner(QObject):
         # A finished session reopened with downloads that never completed: Continue only downloads them.
         self._downloads_only = False
         self._excel_retry: set[tuple[str, str]] = set()
+        self._excel_retry_at = 0.0  # monotonic time of the last deferred Excel log attempt
         # Protocol workbook results: a persistent queue flushed on a worker,
         # one flush at a time, bursts coalesced.
         self._workbook_queue: WorkbookQueue | None = None
@@ -610,6 +668,10 @@ class CellularRunner(QObject):
         # Pre-request check of the sensor's mission list (one at a time).
         self._idle_check_pending = False
         self._idle_retries = 0
+        # Pre-collection check before each pass (worker); due again after a pause it caused.
+        self._preflight_pending = False
+        self._preflight_due = False
+        self._preflight_last: PreflightResult | None = None
         self._last_tick_wall = 0.0
         self._save_error_noted = False
         self._status_text = "Idle"
@@ -1033,6 +1095,8 @@ class CellularRunner(QObject):
         if delayed:
             text += f", {format_seconds(late)} late (the previous pass was still running)"
         self._log(text + ".")
+        # Every pass begins with the pre-collection check (sensor, clock, storage, workbook, plan).
+        self._preflight_due = True
         self._save()
         self._start_next_task()
 
@@ -1062,6 +1126,11 @@ class CellularRunner(QObject):
             self._finish_round()
             return
         state, planned = item
+        if self._preflight_pending:
+            return
+        if self._preflight_due:
+            self._begin_preflight()
+            return
         reason = self._backlog_reason(planned)
         if reason is not None:
             self.state = S_PAUSED_BACKLOG
@@ -1120,6 +1189,116 @@ class CellularRunner(QObject):
             self._idle_check_pending = False
             diag("sensor_idle_check_skipped", f"{type(exc).__name__}: {exc}")
             self._submit_task(state, planned)
+
+    # ------------------------------------------------------------------ pre-collection check
+    def _begin_preflight(self) -> None:
+        """Run the pre-collection check on a worker; the pass starts when it passes, pauses when it does not."""
+        if self.session is None or self._preflight_pending:
+            return
+        self._preflight_pending = True
+        self._status_text = "Checking before the pass"
+        self._emit_status()
+        session = self.session
+        settings = session.settings
+        round_id = session.current_round_id or ""
+        host = self.host
+        conn = getattr(host, "_conn", None)
+        probes = default_probes(host, conn)
+        expected = {"model": settings.sensor_model, "serial": settings.sensor_serial}
+        previous = dict(session.sensor) if session.sensor else None
+        plan = session.plan
+        local_dir = Path(self._download_dir())
+        reserve = int(settings.local_reserve_bytes)
+        workbook = settings.protocol_path if self.protocol_results_enabled() or settings.protocol_path else ""
+        sheet = settings.protocol_sheet
+        protocol_loaded = bool(settings.plan_rows)
+        excel_on = self.protocol_results_enabled() or self._excel_target() is not None
+
+        def work() -> PreflightResult:
+            return gather_preflight(
+                plan=plan,
+                local_dir=local_dir,
+                reserve_bytes=reserve,
+                expected_identity=expected,
+                workbook_path=workbook if excel_on else None,
+                workbook_sheet=sheet,
+                protocol_loaded=protocol_loaded,
+                fetch_info=probes["fetch_info"],
+                fetch_clock=probes["fetch_clock"],
+                fetch_storage=probes["fetch_storage"],
+                workbook_state=probes["workbook_state"],
+                previous_identity=previous,
+            )
+
+        def apply(result) -> None:
+            self._preflight_pending = False
+            if self.session is None or self.session is not session:
+                return
+            if not isinstance(result, PreflightResult):
+                from .cellular_quality import LEVEL_WARNING, Check
+
+                result = PreflightResult()
+                result.checks.append(Check("preflight", LEVEL_WARNING, "The pre-collection check could not be completed; the pass starts and every request is verified by its files."))
+            self._preflight_last = result
+            session.preflight[round_id or "no_round"] = result.to_dict()
+            self._note_clock(result)
+            diag("preflight", result.level, round=round_id, checks=[c.to_dict() for c in result.checks], duration_s=round(result.duration_s, 2))
+            for check in result.problems():
+                self._log(clip(f"Check: {check.message}", 140), "error")
+            if result.excel_waiting():
+                self._workbook_status = self._workbook_status or "pending"
+            blocking = result.blocking()
+            if blocking:
+                self._preflight_due = True  # checked again on Resume
+                self.state = S_PAUSED
+                session.pause_reason = result.summary_line() + " Fix it, then Resume."
+                self._log("Pre-collection check failed: the pass waits and nothing was sent. See the checks above.", "error")
+                self._save()
+                self._emit_status()
+                return
+            self._preflight_due = False
+            self._log(clip(result.summary_line(), 140))
+            self._save()
+            if self.state in {S_RUNNING, S_PAUSE_REQUESTED, S_STOP_REQUESTED} and not self._capture_in_flight:
+                self._start_next_task()
+            self._emit_status()
+
+        runner = getattr(host, "_start_job", None)
+        if runner is None:
+            apply(work())
+        else:
+            runner(work, apply)
+
+    def _note_clock(self, result: PreflightResult) -> None:
+        """Keep the sensor clock reading (offset to the computer, time source) with the session."""
+        if self.session is None:
+            return
+        clock = dict(result.clock or {})
+        sensor = self.session.sensor if isinstance(self.session.sensor, dict) else {}
+        identity = result.identity or {}
+        for key in ("model", "serial", "firmware"):
+            if identity.get(key) and not sensor.get(key):
+                sensor[key] = identity[key]
+        if clock.get("available"):
+            offset = clock.get("offset_s")
+            source = str(clock.get("source") or "")
+            time_source = str(clock.get("time_source") or "")
+            sensor["clock_offset_s"] = offset
+            sensor["clock_source"] = source
+            sensor["clock_time_source"] = time_source
+            sensor["clock_checked_utc"] = clock.get("pc_utc")
+            sensor["clock_status"] = (
+                f"sensor minus computer {float(offset):+.1f} s ({source}" + (f"; sensor time source {time_source}" if time_source else "") + ")"
+                if offset is not None else f"read ({source})"
+            )
+        elif clock:
+            sensor["clock_status"] = f"unknown ({clock.get('error') or 'not read'})"
+        if clock.get("gnss_status"):
+            sensor["gnss_status"] = clock["gnss_status"]
+        self.session.sensor = sensor
+
+    def last_preflight(self) -> PreflightResult | None:
+        return self._preflight_last
 
     def _submit_task(self, state: TaskState, planned: PlannedTask) -> None:
         if self._capture_in_flight or self.session is None:
@@ -1380,6 +1559,8 @@ class CellularRunner(QObject):
             seconds=planned.duration_s,
             excel_state=self.row_excel_state(state, planned),
             local_dir=self._download_dir(),
+            requested_start_hz=planned.requested_start_hz or None,
+            requested_stop_hz=planned.requested_stop_hz or None,
         )
         if state.status in {T_SENSOR_ERROR, T_NOT_SENT, T_FAILED}:
             view.recording_state = "Rejected by the sensor" if state.status == T_SENSOR_ERROR else "Not recorded"
@@ -1494,7 +1675,12 @@ class CellularRunner(QObject):
         self._refreshes += 1
         QTimer.singleShot(int(FINALIZE_SETTLE_S * 1000), lambda: self._refresh_files_then_download(round_id, task_key))
 
-    def _refresh_files_then_download(self, round_id: str, task_key: str) -> None:
+    def _refresh_files_then_download(self, round_id: str, task_key: str, *, settle: bool = True) -> None:
+        """List the capture's files on the sensor, add late ones, then queue the downloads.
+
+        ``settle=False`` (after a restart): the sensor finished the files long
+        ago, so one listing is taken as final instead of waiting for two to agree.
+        """
         state = self.session.task_by_key(round_id, task_key) if self.session is not None else None
         if state is None or not state.files:
             self._refreshes = max(self._refreshes - 1, 0)
@@ -1510,7 +1696,25 @@ class CellularRunner(QObject):
             try:
                 browser = _open_browser(conn)
                 try:
-                    return [(e.path, int(e.size or 0)) for e in browser.listdir(folder) if not e.is_dir and _stem_of(e.path) == stem]
+                    def listing() -> dict[str, int]:
+                        return {e.path: int(e.size or 0) for e in browser.listdir(folder) if not e.is_dir and _stem_of(e.path) == stem}
+
+                    # Two listings with the same sizes = the sensor has finished
+                    # writing (header, trailer, sidecars). Bounded: after
+                    # FINALIZE_POLLS listings the files are taken as they are
+                    # and the download's own final-size check still applies.
+                    previous = listing()
+                    stable = not settle
+                    polls = 1
+                    while settle and polls < FINALIZE_POLLS:
+                        time.sleep(FINALIZE_SETTLE_S)
+                        current = listing()
+                        polls += 1
+                        if current == previous:
+                            stable = True
+                            break
+                        previous = current
+                    return {"files": sorted(previous.items()), "stable": stable, "polls": polls}
                 finally:
                     try:
                         browser.close()
@@ -1528,9 +1732,11 @@ class CellularRunner(QObject):
             current = self.session.task_by_key(round_id, task_key)
             if current is None:
                 return
-            if isinstance(result, list) and result:
+            files = result.get("files") if isinstance(result, dict) else None
+            if files:
+                stable = bool(result.get("stable"))
                 known = {str(item["remote_path"]): item for item in current.files}
-                for path, size in result:
+                for path, size in files:
                     item = known.get(path)
                     if item is None:
                         current.files.append(
@@ -1542,13 +1748,22 @@ class CellularRunner(QObject):
                                 "local_path": "",
                                 "sha256": "",
                                 "attempts": 0,
+                                "remote_size_stable": stable,
                                 "note": "Listed after the capture was confirmed (written by the sensor while finishing the recording).",
                             }
                         )
                         current.notes.append(f"{path.rsplit('/', 1)[-1]} appeared on the sensor after the capture was confirmed; it is downloaded with the capture.")
-                    elif size and size != int(item.get("size") or 0):
-                        item["listed_size"] = int(item.get("size") or 0)
-                        item["size"] = size
+                    else:
+                        item["remote_size_stable"] = stable
+                        if size and size != int(item.get("size") or 0):
+                            item["listed_size"] = int(item.get("size") or 0)
+                            item["size"] = size
+                diag("remote_files_settled", task_key, stable=stable, polls=result.get("polls"), files=[p.rsplit("/", 1)[-1] for p, _s in files])
+                if not stable:
+                    current.notes.append(
+                        f"The sensor was still changing the files' sizes after {result.get('polls')} listings; "
+                        "they are downloaded and checked against the final size on the sensor."
+                    )
             else:
                 detail = result.get("error") if isinstance(result, dict) else "no entries"
                 current.notes.append(f"The sensor's folder could not be listed again before the download ({detail}); files are downloaded as listed at confirmation.")
@@ -1593,22 +1808,47 @@ class CellularRunner(QObject):
         folder.mkdir(parents=True, exist_ok=True)
         local = folder / str(item["name"])
         state = self.session.task_by_key(round_id, task_key)
+        leftover = part_path(local)
+        if leftover.exists():
+            # An interrupted transfer (.part) from before a restart or a lost
+            # connection: never counted as the file; replaced by this download.
+            try:
+                size = leftover.stat().st_size
+            except OSError:
+                size = 0
+            diag("download_part_leftover", str(item["name"]), part_bytes=size)
+            item["note"] = f"An unfinished download ({size:,} bytes, .part) was found and is replaced by a fresh transfer."
         if already_saved(local, int(item.get("size") or 0)):
-            problem = self._local_copy_problem(state, item, local)
+            problem, stages = self._verify_local_copy(state, item, local)
             if not problem:
-                item["download_status"] = DL_VERIFIED if not self.session.settings.verify_checksums else "present"
                 item["local_path"] = str(local)
-                diag("download_present", str(item["name"]), size=int(item.get("size") or 0))
+                item["verification"] = stages
+                diag("download_present", str(item["name"]), size=int(item.get("size") or 0), verification=stages)
                 if self.session.settings.verify_checksums:
-                    self._start_checksum(task_key, str(item["name"]), str(local))
+                    item["download_status"] = "present"
+                    item["remote_sha256"] = ""
+                    self._start_checksum(task_key, str(item["name"]), str(local), remote_path=str(item.get("remote_path") or ""))
+                else:
+                    item["download_status"] = DL_VERIFIED
+                    stages[V_CHECKSUM] = V_SKIPPED
+                    item["verified_text"] = verification_text(stages)
                 self._save()
                 return
             # A same-size copy that does not check out is downloaded again (it is replaced, never doubled).
-            diag("download_present_unverified", str(item["name"]), problem=problem)
+            diag("download_present_unverified", str(item["name"]), problem=problem, verification=stages)
         item["download_status"] = DL_ACTIVE
         item["attempts"] = int(item.get("attempts") or 0) + 1
+        item["verification"] = {}
+        item["verified_text"] = "downloading"
         thread = QThread()
-        worker = FileDownloadWorker(conn, str(item["remote_path"]), str(local), str(item["name"]), expected_size=int(item.get("size") or 0))
+        worker = FileDownloadWorker(
+            conn,
+            str(item["remote_path"]),
+            str(local),
+            str(item["name"]),
+            expected_size=int(item.get("size") or 0),
+            want_remote_checksum=bool(self.session.settings.verify_checksums),
+        )
         worker.moveToThread(thread)
         queued = Qt.ConnectionType.QueuedConnection
         worker.finished.connect(self._on_download_finished, queued)
@@ -1616,6 +1856,7 @@ class CellularRunner(QObject):
         worker.waiting.connect(self._on_download_waiting, queued)
         worker.connected.connect(self._on_download_connected, queued)
         worker.unreachable.connect(self._on_download_unreachable, queued)
+        worker.remote_checksum.connect(self._on_remote_checksum, queued)
         thread.started.connect(worker.run)
         thread.finished.connect(self._on_download_thread_finished, queued)
         self._downloads_active.append((thread, worker, task_key, round_id))
@@ -1623,39 +1864,122 @@ class CellularRunner(QObject):
         thread.start()
         self._save()
 
-    def _local_copy_problem(self, state: TaskState | None, item: dict[str, Any], path: Path) -> str:
-        """Why a local file is not a verified copy of the sensor's file ('' when it is).
+    def _verify_local_copy(self, state: TaskState | None, item: dict[str, Any], path: Path) -> tuple[str, dict[str, str]]:
+        """(problem, stages) for a local file against the sensor's; problem is '' when size and structure check out.
 
-        The size must be the sensor's; a WAVE file must also parse and hold the
-        samples that were read from the same file on the sensor.
+        Stage "size": the local size is the sensor's final size. Stage
+        "structure" (WAVE only): RIFF/WAVE parses, the fmt chunk is PCM
+        stereo, the data chunk length agrees with the file size, and the
+        sample count agrees with what was read from the same file on the
+        sensor (duration x rate). A readable header on a short file is
+        reported as truncation, not as a good file.
         """
+        stages: dict[str, str] = {}
         try:
             size = path.stat().st_size
         except OSError as exc:
-            return f"not readable ({exc.strerror or exc})"
+            stages[V_SIZE] = V_FAILED
+            return f"not readable ({exc.strerror or exc})", stages
         expected = int(item.get("size") or 0)
         if expected and size != expected:
-            return f"{size:,} bytes locally, {expected:,} on the sensor"
-        if not str(item.get("name") or path.name).lower().endswith(".wav"):
-            return ""
+            stages[V_SIZE] = V_FAILED
+            return f"{size:,} bytes locally, {expected:,} on the sensor", stages
+        stages[V_SIZE] = V_OK if expected else "unchecked (no size from the sensor)"
+        name = str(item.get("name") or path.name).lower()
+        if name.endswith(".xdat"):
+            return self._verify_xdat_structure(state, item, path, size, stages)
+        if not name.endswith(".wav"):
+            stages[V_STRUCTURE] = V_SKIPPED
+            return "", stages
         from .iq_merge import MergeError, inspect_part
 
         try:
             info = inspect_part(path)
         except MergeError as exc:
-            return str(exc)
+            stages[V_STRUCTURE] = V_FAILED
+            return str(exc), stages
         except Exception as exc:  # noqa: BLE001 - an unreadable copy is not verified
-            return f"header not readable ({type(exc).__name__})"
-        if any("truncated" in problem for problem in info.problems):
-            return "the local copy is cut short"
+            stages[V_STRUCTURE] = V_FAILED
+            return f"header not readable ({type(exc).__name__})", stages
+        for problem in info.problems:
+            lowered = problem.casefold()
+            if "truncated" in lowered or "cut short" in lowered or "riff size" in lowered or "no samples" in lowered:
+                stages[V_STRUCTURE] = V_FAILED
+                return f"the local copy is cut short ({problem})", stages
+        if info.fmt.channels < 2 or info.fmt.bits not in (8, 16, 32):
+            stages[V_STRUCTURE] = V_FAILED
+            return f"unexpected WAVE format ({info.fmt.channels} ch, {info.fmt.bits} bit)", stages
+        block = int(info.fmt.block_align or 0)
+        if block > 0 and info.data_size % block:
+            stages[V_STRUCTURE] = V_FAILED
+            return f"the data chunk ends in the middle of a sample ({info.data_size:,} bytes, {block} per frame)", stages
+        if info.data_offset + info.data_size > size:
+            stages[V_STRUCTURE] = V_FAILED
+            return f"the header promises {info.data_offset + info.data_size:,} bytes, the file holds {size:,}", stages
         rate = float(info.fmt.sample_rate or 0)
         measured = _measured_part(state, item)
         if rate > 0 and measured is not None and measured.get("duration_s") is not None:
             local_s = info.frames / rate
             sensor_s = float(measured["duration_s"])
             if abs(local_s - sensor_s) > 1.5 / rate:
-                return f"{local_s:.6f} s of samples locally, {sensor_s:.6f} s read on the sensor"
-        return ""
+                stages[V_STRUCTURE] = V_FAILED
+                return f"{local_s:.6f} s of samples locally, {sensor_s:.6f} s read on the sensor", stages
+        stages[V_STRUCTURE] = V_OK
+        return "", stages
+
+    def _verify_xdat_structure(
+        self, state: TaskState | None, item: dict[str, Any], path: Path, size: int, stages: dict[str, str]
+    ) -> tuple[str, dict[str, str]]:
+        """Stage "structure" for a .xdat: whole int16 I/Q samples, as many as the sensor's header lists.
+
+        The sample count comes from the local .xhdr when it has been downloaded,
+        otherwise from the header read on the sensor when the capture was
+        confirmed. Without either the stage is "not available", never guessed
+        from the size.
+        """
+        from .iq_merge import MergeError
+        from .xdat_header import BYTES_PER_IQ_SAMPLE, XdatHeaderMissing, inspect_xdat
+
+        if size % BYTES_PER_IQ_SAMPLE:
+            stages[V_STRUCTURE] = V_FAILED
+            return f"the file ends in the middle of a sample ({size:,} bytes, {BYTES_PER_IQ_SAMPLE} per I/Q sample)", stages
+        frames = size // BYTES_PER_IQ_SAMPLE
+        try:
+            info = inspect_xdat(path)
+        except XdatHeaderMissing:
+            info = None
+        except MergeError as exc:
+            if "not decoded here" in str(exc):
+                stages[V_STRUCTURE] = V_NA
+                return "", stages
+            stages[V_STRUCTURE] = V_FAILED
+            return str(exc), stages
+        if info is not None:
+            for problem in info.problems:
+                if "truncated" in problem or "middle of a sample" in problem:
+                    stages[V_STRUCTURE] = V_FAILED
+                    return f"the local copy is cut short ({problem})", stages
+                if "holds" in problem:
+                    stages[V_STRUCTURE] = V_FAILED
+                    return problem, stages
+            stages[V_STRUCTURE] = V_OK
+            return "", stages
+        measured = _measured_part(state, item)
+        rate = float((measured or {}).get("sample_rate_hz") or 0)
+        sensor_s = (measured or {}).get("duration_s")
+        if rate > 0 and sensor_s is not None:
+            sensor_frames = int(round(float(sensor_s) * rate))
+            if frames != sensor_frames:
+                stages[V_STRUCTURE] = V_FAILED
+                return f"{frames:,} samples locally, {sensor_frames:,} listed in the header read on the sensor", stages
+            stages[V_STRUCTURE] = V_OK
+            return "", stages
+        stages[V_STRUCTURE] = V_NA
+        return "", stages
+
+    def _local_copy_problem(self, state: TaskState | None, item: dict[str, Any], path: Path) -> str:
+        """Why a local file is not a verified copy of the sensor's file ('' when it is)."""
+        return self._verify_local_copy(state, item, path)[0]
 
     def _find_file(self, name: str) -> tuple[TaskState, dict[str, Any]] | None:
         if self.session is None:
@@ -1683,22 +2007,40 @@ class CellularRunner(QObject):
         except OSError:
             actual = 0
         listed = int(item.get("size") or 0)
-        if actual and actual != listed:
+        if actual and actual != listed and not item.get("remote_size_stable"):
+            # The listing was not confirmed stable (the sensor could not be listed
+            # again): the download read to the end, so its length is the best size.
             item["listed_size"] = listed
             item["size"] = actual
-        problem = self._local_copy_problem(state, item, Path(path))
+        problem, stages = self._verify_local_copy(state, item, Path(path))
+        item["verification"] = stages
         if problem:
+            item["verified_text"] = verification_text(stages)
             self._transfer_failed(state, item, f"Local copy check failed: {problem}")
             return
         if self.session.settings.verify_checksums:
             item["download_status"] = "present"
+            item["verified_text"] = verification_text(stages) + "; checksum pending"
             self._start_checksum(state.task_key, name, path)
         else:
+            stages[V_CHECKSUM] = V_SKIPPED
             item["download_status"] = DL_VERIFIED
-            diag("download_verified", name, size=int(item.get("size") or 0))
+            item["verified_text"] = verification_text(stages)
+            diag("download_verified", name, size=int(item.get("size") or 0), verification=stages)
             self._after_file_verified(state)
         self._save()
         self._emit_status()
+
+    @Slot(str, str, str)
+    def _on_remote_checksum(self, name: str, digest: str, note: str) -> None:
+        """The sensor's own sha256 of the file (over SSH), kept until the local digest is ready."""
+        found = self._find_file(name)
+        if found is None:
+            return
+        _state, item = found
+        item["remote_sha256"] = digest
+        item["remote_sha256_note"] = note
+        diag("remote_checksum", name, available=bool(digest), note=note)
 
     @Slot(str, str)
     def _on_download_failed(self, name: str, detail: str) -> None:
@@ -1845,10 +2187,13 @@ class CellularRunner(QObject):
         # The Start button waits for the last download (previous_work_reason).
         self._emit_status()
 
-    def _start_checksum(self, task_key: str, name: str, path: str) -> None:
+    def _start_checksum(self, task_key: str, name: str, path: str, *, remote_path: str = "") -> None:
+        """Local SHA-256 on a worker; with ``remote_path`` the sensor's digest is fetched first."""
         thread = QThread()
-        worker = _ChecksumWorker(task_key, name, path)
+        conn = getattr(self.host, "_conn", None) if remote_path else None
+        worker = _ChecksumWorker(task_key, name, path, conn=conn, remote_path=remote_path)
         worker.moveToThread(thread)
+        worker.remote.connect(self._on_remote_checksum, Qt.ConnectionType.QueuedConnection)
         worker.done.connect(self._on_checksum_done, Qt.ConnectionType.QueuedConnection)
         thread.started.connect(worker.run)
         thread.finished.connect(self._on_checksum_thread_finished, Qt.ConnectionType.QueuedConnection)
@@ -1866,11 +2211,40 @@ class CellularRunner(QObject):
                     continue
                 for item in state.files:
                     if item.get("name") == name:
+                        stages = dict(item.get("verification") or {})
+                        remote = str(item.get("remote_sha256") or "").casefold()
+                        if digest and remote and digest.casefold() != remote:
+                            # The bytes differ from the sensor's: not a verified copy. It is
+                            # downloaded again (retry budget), never kept as if it were good.
+                            # The copy is set aside (not deleted) so the retry is a fresh
+                            # transfer and the sensor's digest is read again.
+                            stages[V_CHECKSUM] = V_FAILED
+                            item["sha256"] = digest
+                            item["verification"] = stages
+                            item["verified_text"] = verification_text(stages)
+                            diag("checksum_mismatch", name, local=digest, remote=remote)
+                            self._set_aside_unverified(item)
+                            item["remote_sha256"] = ""
+                            self._transfer_failed(state, item, f"SHA-256 differs: local {digest[:12]}…, sensor {remote[:12]}…")
+                            return
                         if digest:
                             item["sha256"] = digest
+                            if remote:
+                                stages[V_CHECKSUM] = V_OK
+                            else:
+                                stages[V_CHECKSUM] = V_NA
+                                item["sha256_note"] = (
+                                    "local SHA-256 recorded; no checksum from the sensor to compare with "
+                                    f"({item.get('remote_sha256_note') or 'the sensor API exposes none'})"
+                                )
                             item["download_status"] = DL_VERIFIED
-                            diag("download_verified", name, sha256=digest, size=int(item.get("size") or 0))
+                            item["verification"] = stages
+                            item["verified_text"] = verification_text(stages)
+                            diag("download_verified", name, sha256=digest, size=int(item.get("size") or 0), verification=stages)
                         else:
+                            stages[V_CHECKSUM] = V_FAILED
+                            item["verification"] = stages
+                            item["verified_text"] = verification_text(stages)
                             item["download_status"] = DL_FAILED
                             item["note"] = "Checksum could not be computed."
                             diag("checksum_failed", name)
@@ -1879,6 +2253,22 @@ class CellularRunner(QObject):
                         self._save()
                         self._emit_status()
                         return
+
+    def _set_aside_unverified(self, item: dict[str, Any]) -> None:
+        """Rename a copy whose bytes differ from the sensor's to '<name>.unverified' (never deleted)."""
+        local = str(item.get("local_path") or "")
+        if not local:
+            return
+        path = Path(local)
+        aside = path.with_name(path.name + ".unverified")
+        try:
+            if path.is_file():
+                os.replace(path, aside)
+                item["set_aside"] = str(aside)
+        except OSError as exc:
+            diag("set_aside_failed", path.name, error=f"{type(exc).__name__}: {exc}")
+            return
+        item["local_path"] = ""
 
     @Slot()
     def _on_checksum_thread_finished(self) -> None:
@@ -1929,6 +2319,8 @@ class CellularRunner(QObject):
             expected_parts=[str(n) for n in (state.summary or {}).get("sensor_parts") or []],
             preview_path=preview,
             label=planned.label() if planned else state.task_key,
+            requested_start_hz=int(planned.requested_start_hz) if planned and planned.requested_start_hz else None,
+            requested_stop_hz=int(planned.requested_stop_hz) if planned and planned.requested_stop_hz else None,
         )
         # One check at a time: file reads stay sequential on the disk and the
         # preview renderer is only used from one thread.
@@ -2044,10 +2436,15 @@ class CellularRunner(QObject):
                     return
             except ExcelBusyError as exc:
                 state.excel_status = "deferred"
-                state.notes.append(f"Excel deferred: {exc}")
-                self._excel_retry.add((state.round_id, state.task_key))
-                diag("excel_deferred", str(exc))
-                self._log("Excel is busy. Update queued.")
+                key = (state.round_id, state.task_key)
+                if key not in self._excel_retry:
+                    # Said once per recording; the retries are silent until
+                    # Excel is free (the status line shows "Waiting for Excel").
+                    state.notes.append(f"Excel deferred: {exc}")
+                    diag("excel_deferred", str(exc))
+                    self._log("Waiting for Excel: " + clip(str(exc).rstrip(". "), 100) + ". The row stays queued.")
+                self._excel_retry.add(key)
+                self._excel_retry_at = time.monotonic()
                 return
         info = getattr(self.host, "_sensor_info", None)
         sensor_name = workbook_sensor_name(getattr(info, "model", "") or "", list(getattr(catalog, "sensor_names", []) or []))
@@ -2083,7 +2480,8 @@ class CellularRunner(QObject):
             return
         info = getattr(self.host, "_sensor_info", None)
         sensor_id = getattr(info, "serial", "") or ""
-        for key in list(self._excel_retry):
+        due = self._excel_retry and (time.monotonic() - self._excel_retry_at) >= EXCEL_RETRY_S
+        for key in list(self._excel_retry) if due else []:
             state = self.session.task_by_key(*key)
             planned = self.session.planned(key[1]) if state is not None else None
             if state is None or planned is None:
@@ -2221,7 +2619,7 @@ class CellularRunner(QObject):
                     self._workbook_status = "busy"
                     self._workbook_note = report.busy
                     if not self._workbook_busy_logged:
-                        self._log("Excel is busy. Update queued.")
+                        self._log("Waiting for Excel: " + clip(str(report.busy).rstrip(". "), 100) + ". Results stay queued.")
                         self._workbook_busy_logged = True
                     self._workbook_not_before = time.monotonic() + WORKBOOK_BUSY_RETRY_S
                     QTimer.singleShot(int(WORKBOOK_BUSY_RETRY_S * 1000) + 50, self, self._flush_workbook)
@@ -2260,6 +2658,17 @@ class CellularRunner(QObject):
                 return 0
             queue = self.workbook_queue()
         return queue.pending_count()
+
+    def workbook_text(self) -> str:
+        """'Excel updated' / 'Waiting for Excel' / 'Excel update failed' / '' for the status line."""
+        pending = self.workbook_pending() if (self.protocol_results_enabled() or self._workbook_queue is not None) else 0
+        if self._workbook_status in {"busy", "writing", "pending"} or pending:
+            return "Waiting for Excel" + (f" ({pending} update{'s' if pending != 1 else ''})" if pending else "")
+        if self._workbook_status == "error":
+            return "Excel update failed; trying again"
+        if self._workbook_status == "saved":
+            return "Excel updated"
+        return ""
 
     # ------------------------------------------------------------------ sleep and missed passes
     def _note_sleep_gap(self) -> None:
@@ -2610,6 +3019,8 @@ class CellularRunner(QObject):
             self._finish_round()
         else:
             self.state = S_RUNNING if record is not None else S_WAITING_SCHEDULE
+            # The sensor, storage and workbook are checked again before the first request after a restart.
+            self._preflight_due = record is not None
         self._log("Collection continued." + (f" Downloads: {requeued} waiting." if requeued else ""))
         self._save()
         self._timer.start()
@@ -2649,6 +3060,53 @@ class CellularRunner(QObject):
         """The interrupted session only has downloads left (Continue downloads them)."""
         return self._downloads_only and self.state == S_INTERRUPTED
 
+    def leftover_parts(self) -> list[str]:
+        """Unfinished '.part' transfers of this session's files found in the download folder."""
+        if self.session is None:
+            return []
+        try:
+            folder = Path(self._download_dir())
+        except Exception:  # noqa: BLE001
+            return []
+        out: list[str] = []
+        for tasks in self.session.tasks.values():
+            for state in tasks:
+                for item in state.files:
+                    name = str(item.get("name") or "")
+                    if name and part_path(folder / name).exists():
+                        out.append(name)
+        return out
+
+    def pending_work(self) -> dict[str, Any]:
+        """What a reopened session still has to do, so the operator sees it before pressing Continue."""
+        uncertain = len(self.uncertain_tasks())
+        return {
+            "downloads": self.unfinished_downloads(),
+            "failed_downloads": self.failed_downloads(),
+            "leftover_parts": self.leftover_parts(),
+            "excel_rows": self.workbook_pending(),
+            "uncertain": uncertain,
+        }
+
+    def pending_work_text(self) -> str:
+        """'Pending: 2 downloads, 1 unfinished transfer (.part), 3 Excel updates.' or ''."""
+        work = self.pending_work()
+        parts: list[str] = []
+        if work["downloads"]:
+            parts.append(files_text(work["downloads"]) + " to download")
+        if work["leftover_parts"]:
+            n = len(work["leftover_parts"])
+            parts.append(f"{n} unfinished transfer{'s' if n != 1 else ''} (.part, replaced when downloaded again)")
+        if work["failed_downloads"]:
+            parts.append(files_text(work["failed_downloads"]) + " not downloaded (still on the sensor)")
+        if work["excel_rows"]:
+            n = work["excel_rows"]
+            parts.append(f"{n} Excel update{'s' if n != 1 else ''} waiting")
+        if work["uncertain"]:
+            n = work["uncertain"]
+            parts.append(f"{n} recording{'s' if n != 1 else ''} not confirmed (checked with the sensor first, never sent again on its own)")
+        return ("Pending: " + ", ".join(parts) + ".") if parts else ""
+
     def previous_work_reason(self) -> str:
         """Why a new collection waits for the last one ('' when it need not).
 
@@ -2670,15 +3128,33 @@ class CellularRunner(QObject):
         if self.session is None or not self.session.settings.auto_download:
             return 0
         count = 0
+        relist: list[tuple[str, str]] = []
         for tasks in self.session.tasks.values():
             for state in tasks:
                 if state.status != T_CONFIRMED:
                     continue
-                for item in state.files:
-                    if item.get("download_status") in {DL_PENDING, DL_ACTIVE, "present"} and not any(entry[2] is item for entry in self._downloads_pending):
+                unfinished = [item for item in state.files if item.get("download_status") in {DL_PENDING, DL_ACTIVE, "present"}]
+                if not unfinished:
+                    continue
+                if not any("remote_size_stable" in item for item in state.files):
+                    # The application closed before this capture's files were
+                    # listed again: the sensor may have written its XDAT
+                    # sidecars (.xhdr/.xmrk) or the WAVE trailer after the
+                    # confirmation. One fresh listing picks them up and queues
+                    # the downloads (see _refresh_files_then_download).
+                    for item in unfinished:
+                        item["download_status"] = DL_PENDING
+                    count += len(unfinished)
+                    relist.append((state.round_id, state.task_key))
+                    continue
+                for item in unfinished:
+                    if not any(entry[2] is item for entry in self._downloads_pending):
                         item["download_status"] = DL_PENDING
                         self._downloads_pending.append((state.task_key, state.round_id, item))
                         count += 1
+        for round_id, task_key in relist:
+            self._refreshes += 1
+            self._refresh_files_then_download(round_id, task_key, settle=False)
         return count
 
     def skip_task(self, round_id: str, task_key: str) -> None:
@@ -2862,6 +3338,9 @@ class CellularRunner(QObject):
                 "workbook_pending": self.workbook_pending(),
                 "workbook_status": self._workbook_status,
                 "workbook_note": self._workbook_note,
+                "workbook_text": self.workbook_text(),
+                "preflight_pending": False,
+                "pending_work": "",
             }
         tasks = self.current_tasks()
         record = self.current_round()
@@ -2892,6 +3371,8 @@ class CellularRunner(QObject):
         recording = f"Recording {row_position}: {planned.range_text}" if planned is not None else ""
         if self._idle_check_pending and not recording:
             recording = "Checking the sensor is free"
+        if self._preflight_pending and not recording:
+            recording = "Checking before the pass: sensor, clock, storage, workbook"
         if self.state == S_WAITING and countdown is not None:
             text = f"Next recording in {max(int(round(countdown)), 0)} s"
         elif self.state == S_PAUSE_REQUESTED:
@@ -2980,6 +3461,10 @@ class CellularRunner(QObject):
             "workbook_pending": workbook_pending,
             "workbook_status": self._workbook_status,
             "workbook_note": self._workbook_note,
+            "workbook_text": self.workbook_text(),
+            "preflight_pending": self._preflight_pending,
+            "preflight_level": self._preflight_last.level if self._preflight_last is not None else "",
+            "pending_work": self.pending_work_text() if self.state in {S_INTERRUPTED, S_DONE} else "",
         }
 
     def _emit_status(self) -> None:
@@ -3029,6 +3514,28 @@ def _measured_part(state: Any, item: dict[str, Any]) -> dict[str, Any] | None:
         if path == remote or (name and path.rsplit("/", 1)[-1] == name):
             return part
     return None
+
+
+def verification_text(stages: dict[str, str]) -> str:
+    """'size verified, structure verified, checksum verified' - one word per stage, nothing implied.
+
+    'checksum not available' means the sensor offered no digest to compare
+    with (its HTTP API has none; the SSH sha256sum was unavailable), so only
+    size and structure vouch for the copy.
+    """
+    words = {
+        V_OK: "verified",
+        V_FAILED: "FAILED",
+        V_NA: "not available from the sensor",
+        V_SKIPPED: "not applicable",
+    }
+    parts = []
+    for stage in (V_SIZE, V_STRUCTURE, V_CHECKSUM):
+        value = stages.get(stage)
+        if value is None:
+            continue
+        parts.append(f"{stage} {words.get(value, value)}")
+    return ", ".join(parts) if parts else "not verified"
 
 
 def _identity_text(value: Any) -> str:

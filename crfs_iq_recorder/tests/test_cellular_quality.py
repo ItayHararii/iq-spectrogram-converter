@@ -108,7 +108,8 @@ def test_validate_file_detects_empty_corrupt_clipping_zero_and_level_change(tmp_
 
 def test_non_wave_recordings_are_not_called_corrupt_and_are_reported_as_not_checked(tmp_path):
     # The sensor writes XDAT when the recorder's Format box says so (seen on hardware):
-    # a .xdat payload plus a small .xmrk sidecar. Their layout is not published.
+    # a .xdat payload plus .xhdr/.xmrk sidecars. Without the .xhdr (the sensor
+    # writes it last) the samples cannot be read, so nothing is claimed about them.
     xdat = tmp_path / "file_135548_0001.xdat"
     xdat.write_bytes(b"\x01\x02" * 4096)
     xmrk = tmp_path / "file_135548_0001.xmrk"
@@ -117,16 +118,23 @@ def test_non_wave_recordings_are_not_called_corrupt_and_are_reported_as_not_chec
     assert report.level == cq.LEVEL_NOT_CHECKED
     assert report.errors == [] and report.warnings == []
     assert report.flags == ["not_wave"]
-    assert any("XDAT" in n and "WAVE recordings only" in n for n in report.notes)
-    assert all(f.container in {"XDAT", "XMRK"} and not f.readable for f in report.files)
+    assert any("XDAT" in n and "WAVE and XDAT (with .xhdr) recordings only" in n for n in report.notes)
+    assert any("Kept with the recording" in n and xmrk.name in n for n in report.notes), "the marker file is listed, not checked"
+    assert [f.container for f in report.files] == ["XDAT"] and not report.files[0].readable
+    assert any(".xhdr" in p for p in report.files[0].problems)
     assert report.actual_duration_s == 0.0, "no duration is claimed for a format that was not parsed"
     assert report.to_dict()["notes"] == report.notes
+    # An unknown format (no reader at all) is reported the same way.
+    ncp = tmp_path / "file_135548_0001.ncp"
+    ncp.write_bytes(b"\x01\x02" * 64)
+    unknown = cq.validate_capture([ncp], expected_duration_s=2.0)
+    assert unknown.level == cq.LEVEL_NOT_CHECKED and unknown.files[0].container == "NCP"
     # A WAVE file keeps the full checks.
     paths, _ = make_recording(tmp_path, (400,))
     assert cq.validate_capture(paths).level in {cq.LEVEL_OK, cq.LEVEL_WARNING}
     # Mixed: the WAVE part is checked, the sidecar is only listed.
     mixed = cq.validate_capture([paths[0], xmrk])
-    assert mixed.level in {cq.LEVEL_OK, cq.LEVEL_WARNING} and "not_wave" in mixed.flags
+    assert mixed.level in {cq.LEVEL_OK, cq.LEVEL_WARNING} and "not_wave" not in mixed.flags and len(mixed.files) == 1
 
 
 def test_preview_samples_begin_middle_end(tmp_path):
@@ -183,8 +191,50 @@ def test_pre_run_checks_report_identity_clocks_storage_and_plan(tmp_path):
     assert by_name["sensor_storage"][0].level == cq.LEVEL_WARNING, by_name["sensor_storage"][0].message
     assert by_name["local_storage"][0].level in {cq.LEVEL_OK, cq.LEVEL_ERROR}
     assert by_name["plan"][0].level == cq.LEVEL_OK
-    assert by_name["test_capture"][0].level == cq.LEVEL_INFO
+    assert by_name["destination"][0].level == cq.LEVEL_OK
+    assert "test_capture" not in by_name  # nothing is recorded by the check itself
     assert cq.worst_level(checks) in {cq.LEVEL_WARNING, cq.LEVEL_ERROR}
+
+
+def test_pre_run_checks_compare_identity_clock_offset_and_workbook_state(tmp_path):
+    sensor = StorageSnapshot(path="/mnt/1", total_bytes=200 * 1024 ** 3, free_bytes=60 * 1024 ** 3, ok=True)
+    common = dict(sensor_info=_Info(), sensor_storage=sensor, local_dir=tmp_path, plan=_plan(), local_reserve_bytes=0)
+    # The sensor the plan was made for is the one that answered: ok. A different serial blocks the pass.
+    same = {c.name: c for c in cq.pre_run_checks(**common, expected_identity={"serial": "rfeye000123", "model": "R40-8"})}
+    assert same["identity_match"].level == cq.LEVEL_OK
+    other = {c.name: c for c in cq.pre_run_checks(**common, expected_identity={"serial": "rfeye999999", "model": "R40-8"})}
+    assert other["identity_match"].level == cq.LEVEL_ERROR and "rfeye999999" in other["identity_match"].message
+    assert [c.name for c in cq.blocking_checks(list(other.values()))] == ["identity_match"]
+    # Clock drift is reported with its source; a small offset is fine, a large one is an error.
+    small = {c.name: c for c in cq.pre_run_checks(**common, clock_offset_s=0.4, clock_source="status.json system time")}
+    assert small["sensor_clock"].level == cq.LEVEL_OK and "0.4" in small["sensor_clock"].message
+    drift = {c.name: c for c in cq.pre_run_checks(**common, clock_offset_s=12.0, clock_source="HTTP Date header")}
+    assert drift["sensor_clock"].level == cq.LEVEL_WARNING and "ahead" in drift["sensor_clock"].message
+    far = {c.name: c for c in cq.pre_run_checks(**common, clock_offset_s=-400.0, clock_source="status.json system time")}
+    assert far["sensor_clock"].level == cq.LEVEL_ERROR and "behind" in far["sensor_clock"].message
+    assert "sensor_clock" not in [c.name for c in cq.blocking_checks(list(far.values()))]  # reported, never stops the pass
+    unknown = {c.name: c for c in cq.pre_run_checks(**common)}
+    assert "unknown" in unknown["sensor_clock"].message
+    # Workbook: busy is a warning (results queue), missing with a loaded protocol is a warning, missing without is an error.
+    book = tmp_path / "book.xlsm"
+    book.write_bytes(b"x")
+    busy = {c.name: c for c in cq.pre_run_checks(**common, workbook_path=book, workbook_sheet="Cellular Protocol", workbook_state="busy", protocol_loaded=True)}
+    assert busy["workbook"].level == cq.LEVEL_WARNING and "queued" in busy["workbook"].message.casefold()
+    is_open = {c.name: c for c in cq.pre_run_checks(**common, workbook_path=book, workbook_sheet="Cellular Protocol", workbook_state="open", protocol_loaded=True)}
+    assert is_open["workbook"].level == cq.LEVEL_OK and "open in Excel" in is_open["workbook"].message
+    missing = {c.name: c for c in cq.pre_run_checks(**common, workbook_path=tmp_path / "gone.xlsm", workbook_sheet="S", workbook_state="closed", protocol_loaded=True)}
+    assert missing["workbook"].level == cq.LEVEL_WARNING
+    missing_no_plan = {c.name: c for c in cq.pre_run_checks(**common, workbook_path=tmp_path / "gone.xlsm", workbook_sheet="S", workbook_state="closed", protocol_loaded=False)}
+    assert missing_no_plan["workbook"].level == cq.LEVEL_ERROR
+    assert "workbook" not in cq.BLOCKING_CHECKS
+    # A destination that cannot be written blocks; the check never deletes anything.
+    (tmp_path / "file.txt").write_text("not a folder")
+    unwritable = {c.name: c for c in cq.pre_run_checks(**{**common, "local_dir": tmp_path / "file.txt"}, check_writable=True)}
+    assert unwritable["destination"].level == cq.LEVEL_ERROR
+    assert (tmp_path / "file.txt").read_text() == "not a folder"
+    # Local storage: the estimate plus the reserve must fit; a tiny free space blocks and nothing is deleted.
+    low = {c.name: c for c in cq.pre_run_checks(**{**common, "local_reserve_bytes": 10 ** 18})}
+    assert low["local_storage"].level == cq.LEVEL_ERROR and "local_storage" in [c.name for c in cq.blocking_checks(list(low.values()))]
 
 
 def test_pre_run_checks_flag_disconnected_bad_clock_and_full_sensor(tmp_path):
@@ -359,10 +409,14 @@ def test_results_sheet_is_created_once_with_headers_and_backup(tmp_path, monkeyp
     wb.close()
     backups = list(tmp_path.glob("book*.crfs-backup-*"))
     assert len(backups) == 1
-    monkeypatch.setattr("crfs_iq_recorder.excel_com.excel_has_workbook", lambda _p: True)
+    # Open in Excel: the sheet is added through Excel (1.15); when Excel cannot take the
+    # call the work stays queued and the file is not rewritten underneath Excel.
+    monkeypatch.setattr("crfs_iq_recorder.excel_com.excel_workbook_state", lambda _p: "open")
+    monkeypatch.setattr("crfs_iq_recorder.excel_com.add_worksheet_com", lambda *_a: False)
     other = _workbook(tmp_path / "open.xlsx")
     with pytest.raises(ExcelBusyError):
         ensure_results_sheet(store, other)
+    assert RESULTS_SHEET not in load_workbook(other, read_only=True).sheetnames
 
 
 def test_worksheet_choice_and_rows_through_the_queue_dedupe(tmp_path, monkeypatch):

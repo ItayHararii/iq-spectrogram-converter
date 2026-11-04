@@ -183,3 +183,6 @@ def isolated_excel_log(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("crfs_iq_recorder.excel_log.excel_has_workbook", lambda _path: False)
     monkeypatch.setattr("crfs_iq_recorder.excel_com.excel_has_workbook", lambda _path: False)
+    # The protocol-workbook queue asks Excel through this tri-state probe; a test
+    # machine may well have Excel open, so it is never asked here.
+    monkeypatch.setattr("crfs_iq_recorder.excel_com.excel_workbook_state", lambda _path: "closed")

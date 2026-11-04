@@ -26,9 +26,110 @@ XL_PART = 2
 XL_BY_ROWS = 1
 XL_PREVIOUS = 2
 
+# COM HRESULTs that mean "Excel cannot take the call right now" (not "the write is wrong"):
+# a modal dialog or a cell being edited rejects every automation call until the user is done.
+RPC_E_CALL_REJECTED = 0x80010001
+RPC_E_SERVERCALL_RETRYLATER = 0x8001010A
+RPC_E_SERVERCALL_REJECTED = 0x80010100
+RPC_E_DISCONNECTED = 0x80010108
+RPC_S_SERVER_UNAVAILABLE = 0x800706BA
+VBA_E_IGNORE = 0x800AC472  # Excel is in cell edit mode (or shows a dialog)
+COM_BUSY_HRESULTS = {
+    RPC_E_CALL_REJECTED,
+    RPC_E_SERVERCALL_RETRYLATER,
+    RPC_E_SERVERCALL_REJECTED,
+    RPC_E_DISCONNECTED,
+    RPC_S_SERVER_UNAVAILABLE,
+    VBA_E_IGNORE,
+}
+_BUSY_TEXT = ("locked", "access", "deny", "busy", "in use", "permission", "rejected", "retry", "edit mode", "unavailable")
+
+OPEN = "open"
+CLOSED = "closed"
+BUSY = "busy"
+
 
 def _norm(path: Path) -> str:
     return str(path.resolve()).casefold()
+
+
+def _hresults_of(exc: BaseException) -> set[int]:
+    """Every HRESULT a pywin32 com_error carries (its own and the one in EXCEPINFO)."""
+    codes: set[int] = set()
+    for value in (getattr(exc, "hresult", None), *(exc.args[:1] if exc.args else ())):
+        if isinstance(value, int):
+            codes.add(value & 0xFFFFFFFF)
+    if len(exc.args) >= 3 and isinstance(exc.args[2], (tuple, list)) and len(exc.args[2]) >= 6:
+        scode = exc.args[2][5]
+        if isinstance(scode, int):
+            codes.add(scode & 0xFFFFFFFF)
+    return codes
+
+
+def com_busy_reason(exc: BaseException) -> str | None:
+    """Why the COM call must be retried later, or None when the error is not a busy state.
+
+    Excel refuses automation calls while a cell is being edited or a dialog is
+    open (RPC_E_CALL_REJECTED 0x80010001, RPC_E_SERVERCALL_RETRYLATER
+    0x8001010A, 0x800AC472), and a closing instance answers with
+    RPC_E_DISCONNECTED / RPC_S_SERVER_UNAVAILABLE. These are "wait and try
+    again" states: the results stay queued.
+    """
+    codes = _hresults_of(exc)
+    if codes & {VBA_E_IGNORE}:
+        return "Excel is busy (a cell is being edited or a dialog is open)"
+    if codes & {RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER, RPC_E_SERVERCALL_REJECTED}:
+        return "Excel rejected the call (busy)"
+    if codes & {RPC_E_DISCONNECTED, RPC_S_SERVER_UNAVAILABLE}:
+        return "the Excel instance went away (closing or restarting)"
+    text = str(exc).casefold()
+    if any(token in text for token in _BUSY_TEXT):
+        return "Excel is busy or the file is locked"
+    return None
+
+
+def excel_workbook_state(path: Path) -> str:
+    """'open' when the running Excel holds the workbook, 'closed' when it does not, 'busy' when Excel could not be asked.
+
+    'busy' is distinct from 'closed' on purpose: a workbook may well be open
+    in an Excel that is in cell edit mode, and writing the file with openpyxl
+    meanwhile would race the open instance. Callers treat 'busy' as "wait".
+    """
+    try:
+        import win32com.client  # type: ignore
+        import pythoncom  # type: ignore
+    except ImportError:
+        return CLOSED
+    if not _excel_window_exists():
+        return CLOSED
+    # Callers may run on a worker thread that never initialised COM.
+    try:
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
+    try:
+        try:
+            app = win32com.client.GetActiveObject("Excel.Application")
+        except Exception as exc:
+            return BUSY if com_busy_reason(exc) else CLOSED
+        want = _norm(path)
+        try:
+            for book in app.Workbooks:
+                try:
+                    if _norm(Path(str(book.FullName))) == want:
+                        return OPEN
+                except Exception as exc:
+                    if com_busy_reason(exc):
+                        return BUSY
+                    continue
+        except Exception as exc:
+            return BUSY if com_busy_reason(exc) else CLOSED
+        return CLOSED
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
 
 
 def _excel_window_exists() -> bool:
@@ -47,39 +148,8 @@ def _excel_window_exists() -> bool:
 
 
 def excel_has_workbook(path: Path) -> bool:
-    try:
-        import win32com.client  # type: ignore
-        import pythoncom  # type: ignore
-    except ImportError:
-        return False
-    if not _excel_window_exists():
-        return False
-    # Callers may run on a worker thread that never initialised COM.
-    try:
-        pythoncom.CoInitialize()
-    except Exception:
-        pass
-    try:
-        try:
-            app = win32com.client.GetActiveObject("Excel.Application")
-        except Exception:
-            return False
-        want = _norm(path)
-        try:
-            for book in app.Workbooks:
-                try:
-                    if _norm(Path(str(book.FullName))) == want:
-                        return True
-                except Exception:
-                    continue
-        except Exception:
-            return False
-        return False
-    finally:
-        try:
-            pythoncom.CoUninitialize()
-        except Exception:
-            pass
+    """True when the running Excel instance holds this workbook (see excel_workbook_state)."""
+    return excel_workbook_state(path) == OPEN
 
 
 def _range_values(sheet, first_row: int, first_col: int, last_row: int, last_col: int) -> list[list]:
@@ -378,6 +448,8 @@ def _append_rows_com_impl(win32com_client, path: Path, rows: list[ExcelRow]) -> 
                     pass
                 written.append(dest)
             book.Save()
+            if not _saved(book):
+                raise ExcelBusyError(f"Excel did not confirm that {path.name} was saved; the rows are written again when it is.")
         finally:
             app.DisplayAlerts = alerts
         if (started or headless) and book is not None:
@@ -394,15 +466,106 @@ def _append_rows_com_impl(win32com_client, path: Path, rows: list[ExcelRow]) -> 
     except ExcelBusyError:
         raise
     except Exception as exc:
-        message = str(exc).lower()
-        busy = any(token in message for token in ("locked", "access", "deny", "busy", "in use", "permission"))
-        if busy:
-            raise ExcelBusyError(f"Excel could not save {path.name} right now.") from exc
+        reason = com_busy_reason(exc)
+        if reason:
+            raise ExcelBusyError(f"Excel could not take the update for {path.name} right now: {reason}.") from exc
         raise
     finally:
         sheet = None
         book = None
         app = None
+
+
+def add_worksheet_com(path: Path, sheet: str, headers: list[str]) -> bool:
+    """Create `sheet` with `headers` in row 1 through the Excel that has the workbook open, then save.
+
+    Returns True when the sheet exists afterwards (already there or created
+    and saved), False when the running Excel does not hold the workbook.
+    Raises ExcelBusyError when Excel cannot take the call right now or did
+    not confirm the save; the caller keeps the work queued.
+    """
+    try:
+        import win32com.client  # type: ignore
+        import pythoncom  # type: ignore
+    except ImportError as exc:
+        raise ExcelBusyError("Excel COM is not available on this PC.") from exc
+    if not _excel_window_exists():
+        return False
+    pythoncom.CoInitialize()
+    try:
+        return _add_worksheet_com_impl(win32com.client, path, sheet, headers)
+    finally:
+        import gc
+
+        gc.collect()
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+def _add_worksheet_com_impl(win32com_client, path: Path, sheet: str, headers: list[str]) -> bool:
+    want = _norm(path)
+    app = None
+    book = None
+    try:
+        try:
+            app = win32com_client.GetActiveObject("Excel.Application")
+        except Exception as exc:
+            if com_busy_reason(exc):
+                raise ExcelBusyError(f"Excel could not be asked about {path.name} right now: {com_busy_reason(exc)}.") from exc
+            return False
+        for item in app.Workbooks:
+            try:
+                if _norm(Path(str(item.FullName))) == want:
+                    book = item
+                    break
+            except Exception:
+                continue
+        if book is None:
+            return False
+        for existing in book.Worksheets:
+            try:
+                if str(existing.Name).strip().casefold() == sheet.strip().casefold():
+                    return True
+            except Exception:
+                continue
+        alerts = app.DisplayAlerts
+        app.DisplayAlerts = False
+        try:
+            count = int(book.Worksheets.Count)
+            new_sheet = book.Worksheets.Add(After=book.Worksheets(count))
+            new_sheet.Name = sheet
+            if headers:
+                new_sheet.Range(new_sheet.Cells(1, 1), new_sheet.Cells(1, len(headers))).Value = [list(headers)]
+                try:
+                    new_sheet.Rows(1).Font.Bold = True
+                except Exception:
+                    pass
+            book.Save()
+            if not _saved(book):
+                raise ExcelBusyError(f"Excel did not confirm that {path.name} was saved; the results sheet is created again when it is.")
+        finally:
+            app.DisplayAlerts = alerts
+        return True
+    except ExcelBusyError:
+        raise
+    except Exception as exc:
+        reason = com_busy_reason(exc)
+        if reason:
+            raise ExcelBusyError(f"Excel could not add the results sheet to {path.name} right now: {reason}.") from exc
+        raise
+    finally:
+        book = None
+        app = None
+
+
+def _saved(book) -> bool:
+    """Excel's own word that the workbook has no unsaved changes (Workbook.Saved)."""
+    try:
+        return bool(book.Saved)
+    except Exception:
+        return False
 
 
 def _col_letter(index: int) -> str:

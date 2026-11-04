@@ -167,9 +167,37 @@ def _auto_db_limits(power_db):
     return vmin - pad, vmax + pad
 
 
+def _read_xdat_prefix(path: Path, max_samples: int) -> tuple[Any, int, int, bool]:
+    """First samples of an XDAT part, laid out as its own .xhdr states (int16 interleaved I/Q)."""
+    import numpy as np
+
+    from .iq_merge import MergeError
+    from .xdat_header import BYTES_PER_IQ_SAMPLE, inspect_xdat
+
+    try:
+        info = inspect_xdat(path)
+    except MergeError as exc:
+        raise PreviewError(str(exc)) from exc
+    n_frames = int(info.frames)
+    take = min(n_frames, int(max_samples))
+    with path.open("rb") as handle:
+        raw = handle.read(take * BYTES_PER_IQ_SAMPLE)
+    whole = take >= n_frames
+    samples = np.frombuffer(raw, dtype="<i2")
+    if samples.size < 4:
+        raise PreviewError("Not enough samples.")
+    usable = (samples.size // 2) * 2
+    stereo = samples[:usable].reshape(-1, 2).astype(np.float32) * np.float32(1.0 / 32768.0)
+    return stereo, int(info.fmt.sample_rate), n_frames, whole
+
+
 def _read_stereo_prefix(path: Path, max_samples: int) -> tuple[Any, int, int, bool]:
     import numpy as np
 
+    from .xdat_header import is_xdat_file
+
+    if is_xdat_file(path):
+        return _read_xdat_prefix(path, max_samples)
     with wave.open(str(path), "rb") as handle:
         channels = handle.getnchannels()
         width = handle.getsampwidth()
@@ -192,6 +220,23 @@ def _read_stereo_prefix(path: Path, max_samples: int) -> tuple[Any, int, int, bo
     return stereo, int(fs), int(n_frames), whole
 
 
+def _file_axis(path: Path, fs: float, requested_start_hz, requested_stop_hz):
+    """Axis from the file's own CRFS metadata (absolute RF) or relative when it has none."""
+    from .cellular_quality import PreviewAxis, preview_axis
+
+    try:
+        from .xdat_header import inspect_recording
+
+        info = inspect_recording(path)
+        return preview_axis([info], requested_start_hz=requested_start_hz, requested_stop_hz=requested_stop_hz)
+    except Exception:  # noqa: BLE001 - no metadata: relative axis, nothing inferred
+        return PreviewAxis(
+            sample_rate_hz=float(fs),
+            requested_start_hz=float(requested_start_hz) if requested_start_hz is not None else None,
+            requested_stop_hz=float(requested_stop_hz) if requested_stop_hz is not None else None,
+        )
+
+
 def build_preview_from_path(
     path: Path | str,
     *,
@@ -199,7 +244,16 @@ def build_preview_from_path(
     center_hz: int | None = None,
     bandwidth_hz: int | None = None,
     max_samples: int = PREVIEW_MAX_SAMPLES,
+    requested_start_hz: int | float | None = None,
+    requested_stop_hz: int | float | None = None,
 ) -> PreviewResult:
+    """Waterfall of the file's first samples.
+
+    The frequency axis is absolute RF only when the file itself carries the
+    sensor's centre frequency (CRFS metadata); ``center_hz`` from the caller is
+    shown as text, never used to place the axis. The requested start/stop are
+    drawn as labelled markers on an absolute axis.
+    """
     ok, reason = preview_dependencies()
     if not ok:
         raise PreviewError(reason)
@@ -212,6 +266,8 @@ def build_preview_from_path(
 
     path = Path(path)
     stereo, fs, total_frames, whole_from_header = _read_stereo_prefix(path, max_samples)
+    axis = _file_axis(path, fs, requested_start_hz, requested_stop_hz)
+    file_layout = "int16 interleaved I/Q XDAT (layout from its .xhdr)" if path.suffix.casefold() == ".xdat" else "stereo I/Q WAVE"
     sampled = stereo.shape[0]
     whole = bool(whole_from_header and sampled >= total_frames)
     sampled_seconds = float(sampled) / float(fs) if fs else 0.0
@@ -230,7 +286,7 @@ def build_preview_from_path(
         auto_db = converter._auto_db_limits
         to_db = converter._to_dbfs_bin
         cmap = converter._normalize_cmap("jet")
-        layout = "stereo I/Q WAVE"
+        layout = file_layout
     else:
         iq = _iq_from_stereo(stereo)
         window, scale = _blackmanharris(n_fft)
@@ -240,7 +296,7 @@ def build_preview_from_path(
         auto_db = _auto_db_limits
         to_db = None
         cmap = "jet"
-        layout = "stereo I/Q WAVE"
+        layout = file_layout
     del stereo, iq
 
     if power.size == 0 or power.shape[1] < 1:
@@ -260,25 +316,37 @@ def build_preview_from_path(
 
     f_scale, f_unit = axis_units(fs)
     f_max = (float(fs) / 2.0) / f_scale
+    if axis.absolute:
+        # Absolute RF in MHz, exact centre from the file's metadata.
+        x_lo, x_hi = axis.extent_mhz()
+        x_label = "Frequency (MHz)"
+    else:
+        x_lo, x_hi = -f_max, f_max
+        x_label = f"{f_unit} from centre (centre unknown: no frequency metadata in the file)"
 
-    fig, ax = plt.subplots(figsize=PREVIEW_FIGSIZE, dpi=PREVIEW_DPI)
+    fig, ax = plt.subplots(figsize=(PREVIEW_FIGSIZE[0], PREVIEW_FIGSIZE[1] + 0.9), dpi=PREVIEW_DPI)
     im = ax.imshow(
         power_db.T,
         cmap=cmap,
         origin="lower",
         aspect="auto",
         interpolation="nearest",
-        extent=[-f_max, f_max, 0.0, sampled_seconds],
+        extent=[x_lo, x_hi, 0.0, sampled_seconds],
         vmin=vmin,
         vmax=vmax,
     )
-    ax.set_xlim(-f_max, f_max)
+    ax.set_xlim(x_lo, x_hi)
     ax.set_ylim(0.0, sampled_seconds)
-    ax.set_xlabel(f"Frequency ({f_unit})")
+    for x_mhz, text in axis.markers_mhz():
+        ax.axvline(x_mhz, color="white", linestyle="--", linewidth=1.0, alpha=0.9)
+        if x_lo <= x_mhz <= x_hi:
+            ax.text(x_mhz, sampled_seconds * 0.97, text, fontsize=7, color="white", rotation=90, ha="right", va="top")
+    ax.set_xlabel(x_label, fontsize=8)
     ax.set_ylabel("Time (s)")
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("dBFS/bin")
-    fig.tight_layout()
+    fig.text(0.01, 0.01, "\n".join(axis.legend_lines()), fontsize=6.5, va="bottom", ha="left", family="monospace")
+    fig.tight_layout(rect=(0.0, 0.22, 1.0, 1.0))
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=PREVIEW_DPI)
     plt.close(fig)
@@ -287,8 +355,14 @@ def build_preview_from_path(
     png = buf.getvalue()
 
     caption = f"First {sampled_seconds:.3f} s"
-    if center_hz:
-        caption += f" · {center_hz / 1e6:g} MHz"
+    if axis.absolute:
+        from .cellular_quality import _mhz
+
+        caption += f" · centre {_mhz(axis.center_hz)} MHz (file metadata)"
+    elif center_hz:
+        caption += f" · planned {center_hz / 1e6:g} MHz (centre not confirmed by the file)"
+    else:
+        caption += " · centre unknown"
     if not whole:
         caption += " (sample)"
     if (not whole) and peak is not None and peak < QUIET_DBFS:

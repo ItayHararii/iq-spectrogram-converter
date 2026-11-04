@@ -101,10 +101,18 @@ def ensure_results_sheet(store: ExcelLogStore, workbook: Path, sheet: str = RESU
         wb.close()
     if exists:
         return True
-    from .excel_com import excel_has_workbook
+    from .excel_com import BUSY, add_worksheet_com, excel_workbook_state
 
-    if excel_has_workbook(workbook):
-        raise ExcelBusyError(f"{workbook.name} is open in Excel; the results sheet will be created when it is closed.")
+    state = excel_workbook_state(workbook)
+    if state == BUSY:
+        raise ExcelBusyError(f"Excel is busy; the results sheet in {workbook.name} is created when it is free.")
+    if state == "open":
+        # Open in Excel: the sheet is added through the open window (the file
+        # on disk is Excel's to write), and saved there.
+        store.ensure_backup(workbook)
+        if add_worksheet_com(workbook, sheet, list(RESULTS_HEADERS)):
+            return True
+        raise ExcelBusyError(f"{workbook.name} is open in Excel; the results sheet is created when Excel is free.")
     store.ensure_backup(workbook)
     try:
         wb = load_workbook(workbook, keep_vba=workbook.suffix.casefold() == ".xlsm")
@@ -144,9 +152,15 @@ def queue_capture_rows(
     duration_s: float | None,
     local_dir: Path,
 ) -> int:
-    """Queue one row per split part (the writer merges parts of one capture into one row)."""
+    """Queue one row per split part (the writer merges parts of one capture into one row).
+
+    Sample files only: XDAT header/marker sidecars stay beside them in the
+    download folder and are not recordings in their own right.
+    """
+    from .xdat_header import is_xdat_sidecar
+
     queued = 0
-    names = sort_iq_filenames([str(f.get("name") or "") for f in files if f.get("name")])
+    names = sort_iq_filenames([str(f.get("name") or "") for f in files if f.get("name") and not is_xdat_sidecar(str(f.get("name")))])
     by_name = {str(f.get("name")): f for f in files}
     for name in names:
         entry = by_name[name]

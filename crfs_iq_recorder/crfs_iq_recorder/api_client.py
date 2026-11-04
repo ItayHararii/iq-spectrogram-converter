@@ -1158,8 +1158,154 @@ class EmpClient:
         missions = parse_emp_missions(raw.text)
         return MissionList(available=True, missions=missions, recording=remote_recording_missions(missions))
 
+    # ------------------------------------------------------------------ sensor clock
+    def fetch_sensor_clock(self, target: ConnectionTarget, password: str, *, timeout_s: float = 6.0) -> "SensorClock":
+        """Read-only GET of the Node's status page values: its system time and time source.
+
+        Firmware 2.25 answers `/api/values/status.json` with
+        ``values["02-system-time"] = "2026-11-04 17:24:51+0000"`` (UTC, with
+        offset) and ``values["03-time-source"]`` ("NTP", "GPS", ...). The HTTP
+        Date header is the fallback. The offset is sensor minus computer,
+        measured against the middle of the request, so a slow link does not
+        read as clock drift. Never POSTs.
+        """
+        _ensure_requests()
+        from datetime import datetime, timezone
+
+        if self.demo:
+            now = datetime.now(timezone.utc)
+            return SensorClock(available=True, sensor_utc=now, pc_utc=now, offset_s=0.0, source="demo", time_source="demo")
+        sent = datetime.now(timezone.utc)
+        try:
+            raw = self._get(target, password, STATUS_VALUES_PATH, timeout=float(timeout_s or 6.0))
+        except Exception as exc:  # noqa: BLE001 - the caller reports "unknown"
+            if RequestsConnectionError is not None and isinstance(exc, RequestsConnectionError):
+                reason = connection_failure_reason(exc)
+            else:
+                reason = redact_text(str(exc)) or type(exc).__name__
+            return SensorClock(available=False, error=reason)
+        received = datetime.now(timezone.utc)
+        middle = sent + (received - sent) / 2
+        if raw.status_code >= 400:
+            return SensorClock(available=False, error=f"HTTP {raw.status_code}")
+        values = {}
+        body = self._json_body(raw)
+        if isinstance(body, dict) and isinstance(body.get("values"), dict):
+            values = body["values"]
+        warnings = []
+        if isinstance(body, dict):
+            for item in body.get("pageErrors") or []:
+                if isinstance(item, dict) and item.get("message"):
+                    warnings.append(str(item["message"]))
+        system_time = parse_sensor_time(values.get("02-system-time"))
+        time_source = str(values.get("03-time-source") or "").strip()
+        info = values.get("04-time-info") if isinstance(values.get("04-time-info"), dict) else {}
+        fix = str(info.get("02-time-fix") or "").strip()
+        satellites = str(info.get("03-time-satellites") or "").strip()
+        gnss = ""
+        if info:
+            gnss_source = str(info.get("01-time-source") or "").strip()
+            has_fix = fix not in {"", "\u2718", "x", "X", "no", "No"}
+            gnss = f"{gnss_source or 'GNSS'}: {'time fix' if has_fix else 'no time fix'}" + (f", {satellites} satellites" if satellites else "")
+        if system_time is not None:
+            return SensorClock(
+                available=True,
+                sensor_utc=system_time,
+                pc_utc=middle,
+                offset_s=round((system_time - middle).total_seconds(), 3),
+                source="status page system time (UTC)",
+                time_source=time_source,
+                gnss_status=gnss,
+                warnings=warnings,
+            )
+        header_time = parse_http_date((raw.headers or {}).get("Date") or (raw.headers or {}).get("date"))
+        if header_time is not None:
+            return SensorClock(
+                available=True,
+                sensor_utc=header_time,
+                pc_utc=middle,
+                offset_s=round((header_time - middle).total_seconds(), 3),
+                source="HTTP Date header (whole seconds)",
+                time_source=time_source,
+                gnss_status=gnss,
+                warnings=warnings,
+            )
+        return SensorClock(available=False, error="the status page has no system time", time_source=time_source, gnss_status=gnss, warnings=warnings)
+
 
 EMP_MISSIONS_PATH = "/emp/missions"
+STATUS_VALUES_PATH = "/api/values/status.json"
+
+
+@dataclass
+class SensorClock:
+    """The sensor's clock as read from its API, next to the computer's at the same moment."""
+
+    available: bool
+    sensor_utc: Any = None  # datetime (UTC) or None
+    pc_utc: Any = None
+    offset_s: float | None = None  # sensor minus computer, seconds
+    source: str = ""
+    time_source: str = ""  # what the sensor says it disciplines its clock with (NTP, GPS, ...)
+    gnss_status: str = ""
+    warnings: list[str] = field(default_factory=list)
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "available": self.available,
+            "sensor_utc": self.sensor_utc.isoformat() if self.sensor_utc is not None else None,
+            "pc_utc": self.pc_utc.isoformat() if self.pc_utc is not None else None,
+            "offset_s": self.offset_s,
+            "source": self.source,
+            "time_source": self.time_source,
+            "gnss_status": self.gnss_status,
+            "warnings": list(self.warnings),
+            "error": self.error,
+        }
+
+
+def parse_sensor_time(value: Any):
+    """'2026-11-04 17:24:51+0000' (or ISO 8601) as an aware UTC datetime; None when unreadable."""
+    from datetime import datetime, timezone
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    candidate = text.replace("T", " ")
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+0000"
+    for fmt in ("%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S.%f%z", "%Y-%m-%d %H:%M:%S"):
+        try:
+            parsed = datetime.strptime(candidate, fmt)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def parse_http_date(value: Any):
+    from datetime import timezone
+    from email.utils import parsedate_to_datetime
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 @dataclass

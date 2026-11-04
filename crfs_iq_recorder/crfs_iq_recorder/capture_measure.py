@@ -2,9 +2,10 @@
 
 The WAVE header gives the number of samples and the sample rate (so the
 seconds recorded); the CRFS `meta` trailer gives the start time, centre
-frequency, bandwidth and sample rate the sensor used. Nothing here is
-estimated from file sizes or from the time that elapsed: a value that cannot
-be read stays unknown.
+frequency, bandwidth and sample rate the sensor used. An XDAT part is read
+the same way from the `.xhdr` the sensor writes beside it (see
+`xdat_header`). Nothing here is estimated from file sizes or from the time
+that elapsed: a value that cannot be read stays unknown.
 
 Result classes:
 
@@ -54,7 +55,7 @@ class PartMeasurement:
 
     @property
     def name(self) -> str:
-        return self.path.rsplit("/", 1)[-1]
+        return self.path.replace("\\", "/").rsplit("/", 1)[-1]
 
     @property
     def readable(self) -> bool:
@@ -64,6 +65,11 @@ class PartMeasurement:
     def final(self) -> bool:
         """Header and metadata look finished (not still being written by the sensor)."""
         return self.readable and self.signal_time is not None and not any("still being written" in p for p in self.problems)
+
+    @property
+    def header_pending(self) -> bool:
+        """The sensor has not finished the header yet (worth reading again shortly)."""
+        return (self.readable and not self.final) or any("still being written" in p for p in self.problems)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -169,12 +175,27 @@ def _opt_float(value: Any) -> float | None:
 
 
 def measure_part(browser, path: str, size: int = 0) -> PartMeasurement:
-    """Read one file's header and metadata on the sensor (or a local path when `browser` is None)."""
+    """Read one file's header and metadata on the sensor (or a local path when `browser` is None).
+
+    WAVE parts are read from their own header and CRFS ``meta`` trailer; XDAT
+    parts from the ``.xhdr`` the sensor writes beside them (sample count, rate,
+    centre, bandwidth and ``start_capture``). The sensor writes the ``.xhdr``
+    after the samples, so a ``.xdat`` without one is "still being written" and
+    is read again by the caller; it is never measured from its size.
+    """
     from .iq_merge import MergeError, inspect_part
+    from .xdat_header import XdatHeaderMissing, inspect_xdat, inspect_xdat_remote, is_xdat_file
 
     out = PartMeasurement(path=path, size=int(size or 0))
     try:
-        info = inspect_part(path) if browser is None else browser.inspect_wave(path)
+        if is_xdat_file(path):
+            info = inspect_xdat(path) if browser is None else inspect_xdat_remote(browser, path, out.size)
+        else:
+            info = inspect_part(path) if browser is None else browser.inspect_wave(path)
+    except XdatHeaderMissing as exc:
+        detail = str(exc).replace(f"{out.name}: ", "")
+        out.problems.append(f"header still being written ({detail.rstrip('.')})")
+        return out
     except MergeError as exc:
         out.problems.append(str(exc).replace(f"{out.name}: ", "").replace(f"{out.name} ", ""))
         return out
@@ -200,8 +221,11 @@ def measure_part(browser, path: str, size: int = 0) -> PartMeasurement:
 
 
 def measure_parts(browser, paths: Iterable[str], sizes: dict[str, int] | None = None) -> CaptureMeasurement:
+    """Measure the sample files; XDAT sidecars (.xhdr/.xmrk) are not parts and are left out."""
+    from .xdat_header import is_xdat_sidecar
+
     sizes = sizes or {}
-    return CaptureMeasurement(parts=[measure_part(browser, path, sizes.get(path, 0)) for path in paths])
+    return CaptureMeasurement(parts=[measure_part(browser, path, sizes.get(path, 0)) for path in paths if not is_xdat_sidecar(path)])
 
 
 @dataclass(frozen=True)

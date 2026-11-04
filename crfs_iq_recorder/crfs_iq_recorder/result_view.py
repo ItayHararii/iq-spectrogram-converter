@@ -71,6 +71,9 @@ class ResultView:
     centre_hz: float | None = None
     bandwidth_hz: float | None = None
     attempt: int = 1
+    # The range the operator asked for, exactly as sent (markers on the waterfall).
+    requested_start_hz: float | None = None
+    requested_stop_hz: float | None = None
 
     @property
     def local_ready(self) -> bool:
@@ -168,6 +171,13 @@ def view_from_summary(
     recorded = _recorded(measurement if paths else None, centre, bandwidth)
     tag, style = OTHER_RANGE_TAG if result == RESULT_COMPLETED and recorded.endswith(OTHER_RANGE) else _tag(result)
     local = local_copies(paths, local_dir)
+    req_start = req_stop = None
+    try:
+        if centre is not None and bandwidth:
+            req_start = float(centre) - float(bandwidth) / 2
+            req_stop = float(centre) + float(bandwidth) / 2
+    except (TypeError, ValueError):
+        req_start = req_stop = None
     return ResultView(
         title=title,
         requested=_requested(bandwidth, seconds),
@@ -182,6 +192,8 @@ def view_from_summary(
         local_paths=local,
         centre_hz=measurement.centre_hz,
         bandwidth_hz=measurement.bandwidth_hz,
+        requested_start_hz=req_start,
+        requested_stop_hz=req_stop,
     )
 
 
@@ -209,6 +221,8 @@ def view_from_task(
     seconds: float,
     excel_state: str = "",
     local_dir: Path | str | None = None,
+    requested_start_hz: Any = None,
+    requested_stop_hz: Any = None,
 ) -> ResultView:
     """An Excel Collection row from its task state (cellular_runner.TaskState)."""
     data = dict(getattr(state, "summary", None) or {})
@@ -220,6 +234,12 @@ def view_from_task(
         bandwidth_hz=bandwidth_hz,
         centre_hz=centre_hz,
     )
+    if requested_start_hz is not None and requested_stop_hz is not None:
+        try:
+            view.requested_start_hz = float(requested_start_hz)
+            view.requested_stop_hz = float(requested_stop_hz)
+        except (TypeError, ValueError):
+            pass
     if not data:
         # Rejected or not sent: there is no capture summary, only the task's own outcome.
         view.received = "Received: no files"

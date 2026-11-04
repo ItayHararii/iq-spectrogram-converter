@@ -94,8 +94,10 @@ def build_capture_manifest(
     recorded_range: Any = UNKNOWN
     if centre is not None and bandwidth:
         recorded_range = [float(centre) - float(bandwidth) / 2, float(centre) + float(bandwidth) / 2]
-    started = _parse(summary.get("started_at"))
+    submitted = _parse(summary.get("started_at"))
     finished = _parse(summary.get("finished_at"))
+    started, start_source = capture_start(task_state)
+    clock = sensor_clock_block(sensor)
     return {
         "schema": MANIFEST_SCHEMA,
         "kind": "cellular_capture",
@@ -121,12 +123,23 @@ def build_capture_manifest(
             "scheduled_utc": _or_unknown(round_record.get("scheduled_utc")),
             "round_actual_start_utc": _or_unknown(round_record.get("actual_start_utc")),
             "round_status": _or_unknown(round_record.get("status")),
+            # The sensor's own timestamp of the first sample (CRFS metadata, UTC),
+            # else the UTC time in the file name; never the time the request was
+            # sent, the download or the Excel update.
             "capture_started_local": _iso(started),
             "capture_started_utc": _iso(started.astimezone(timezone.utc)) if started else UNKNOWN,
-            "capture_finished_local": _iso(finished),
-            "capture_finished_utc": _iso(finished.astimezone(timezone.utc)) if finished else UNKNOWN,
+            "capture_start_source": start_source,
+            "capture_start_note": (
+                "Local time is the computer's time zone applied to the sensor's UTC timestamp. "
+                "The sensor's clock offset to the computer at the pre-collection check is under 'clock'."
+            ),
+            "request_submitted_local": _iso(submitted),
+            "request_submitted_utc": _iso(submitted.astimezone(timezone.utc)) if submitted else UNKNOWN,
+            "request_finished_local": _iso(finished),
+            "request_finished_utc": _iso(finished.astimezone(timezone.utc)) if finished else UNKNOWN,
             "time_zone": timezone_label,
         },
+        "clock": clock,
         "target": {
             "band": _or_unknown(task.get("band")),
             "band_label": _or_unknown(task.get("band_label")),
@@ -242,6 +255,68 @@ def _parse(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.astimezone()
     return parsed
+
+
+START_SOURCE_METADATA = "sensor file metadata (CRFS meta signaltime or XDAT header start_capture, UTC)"
+START_SOURCE_STEM = "file name (UTC time in the sensor's file stem; whole seconds)"
+START_SOURCE_UNKNOWN = "unknown (no sensor timestamp in the files)"
+
+
+def capture_start(task_state: dict[str, Any]) -> tuple[datetime | None, str]:
+    """(start as an aware local datetime, where it came from) for a task's files.
+
+    Only the sensor's own timestamps count: the ``signaltime`` it wrote into
+    each part's CRFS metadata (earliest part), else the UTC time in the file
+    name. When neither exists the start is unknown - the request time is
+    never substituted.
+    """
+    from .cellular_workbook import capture_start_from_stem
+
+    summary = task_state.get("summary") or {}
+    candidates: list[datetime] = []
+    for item in task_state.get("files") or []:
+        parsed = _parse_utc(item.get("signal_time"))
+        if parsed is not None:
+            candidates.append(parsed)
+    for part in (summary.get("measurement") or {}).get("parts") or []:
+        if isinstance(part, dict):
+            parsed = _parse_utc(part.get("signal_time"))
+            if parsed is not None:
+                candidates.append(parsed)
+    if candidates:
+        return min(candidates).astimezone(), START_SOURCE_METADATA
+    from_stem = capture_start_from_stem(str(summary.get("stem") or ""))
+    if from_stem is not None:
+        return from_stem.astimezone(), START_SOURCE_STEM
+    return None, START_SOURCE_UNKNOWN
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def sensor_clock_block(sensor: dict[str, Any]) -> dict[str, Any]:
+    """The sensor clock reading taken at the pre-collection check, or 'unknown'."""
+    offset = sensor.get("clock_offset_s")
+    return {
+        "sensor_minus_computer_s": offset if offset is not None else UNKNOWN,
+        "source": _or_unknown(sensor.get("clock_source")),
+        "sensor_time_source": _or_unknown(sensor.get("clock_time_source")),
+        "checked_utc": _or_unknown(sensor.get("clock_checked_utc")),
+        "status": _or_unknown(sensor.get("clock_status")),
+        "note": (
+            "Positive: the sensor's clock is ahead of the computer. Recording times follow the sensor's "
+            "timestamps and are not corrected by this offset."
+        ),
+    }
 
 
 def write_manifest(path: Path, data: dict[str, Any]) -> Path:

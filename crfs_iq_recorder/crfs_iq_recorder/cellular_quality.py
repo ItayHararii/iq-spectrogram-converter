@@ -15,8 +15,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .cellular_plan import CellularPlan, format_bytes
-from .iq_merge import MergeError, PartInfo, inspect_part, part_number
+from .iq_merge import MergeError, PartInfo, part_number
 from .sensor_storage import StorageSnapshot, format_storage_bytes, needed_bytes_with_margin
+from .xdat_header import XdatHeaderMissing, inspect_recording, is_xdat_file, is_xdat_sidecar
 
 LEVEL_OK = "ok"
 LEVEL_WARNING = "warning"
@@ -270,16 +271,27 @@ def validate_file(path: Path | str, *, block_frames: int = BLOCK_FRAMES) -> File
         result.flags.append("empty")
         result.problems.append("the file is empty")
         return result
-    if not is_wave_file(path):
-        # XDAT, NCP, HDF5 (and their sidecar files): the on-disk layout is not
-        # published, so nothing here claims to have checked their content.
+    if not is_wave_file(path) and not is_xdat_file(path):
+        # NCP, HDF5 (and sidecar files): the on-disk layout is not published,
+        # so nothing here claims to have checked their content.
         result.container = path.suffix.lstrip(".").upper() or "unknown"
         result.flags.append("not_wave")
-        result.problems.append(f"{result.container} file: content checks apply to WAVE recordings only")
+        result.problems.append(f"{result.container} file: content checks apply to WAVE and XDAT recordings only")
         return result
     try:
-        info = inspect_part(path)
+        # XDAT is decoded only as its own .xhdr describes it (int16 I/Q).
+        info = inspect_recording(path)
+    except XdatHeaderMissing as exc:
+        result.container = "XDAT"
+        result.flags.append("not_wave")
+        result.problems.append(f"{exc} The .xhdr is needed to read the samples; nothing was checked.")
+        return result
     except MergeError as exc:
+        if is_xdat_file(path) and "not decoded here" in str(exc):
+            result.container = "XDAT"
+            result.flags.append("not_wave")
+            result.problems.append(str(exc))
+            return result
         result.flags.append("corrupt")
         result.problems.append(str(exc))
         return result
@@ -346,7 +358,12 @@ def validate_capture(
     """Validate every part of one logical capture and compare it with what was requested."""
     result = CaptureQuality(checked_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     result.expected_duration_s = expected_duration_s
-    files = [validate_file(p, block_frames=block_frames) for p in paths]
+    sidecars = [Path(p).name for p in paths if is_xdat_sidecar(p)]
+    if sidecars:
+        # The XDAT header and marker files travel with the recording; they
+        # hold no samples. The .xhdr is read when its .xdat is checked.
+        result.notes.append("Kept with the recording (not sample data): " + ", ".join(sorted(sidecars)) + ".")
+    files = [validate_file(p, block_frames=block_frames) for p in paths if not is_xdat_sidecar(p)]
     files.sort(key=lambda f: (f.part is None, f.part or 0, f.name))
     result.files = files
     if not files:
@@ -360,6 +377,8 @@ def validate_capture(
     if expected_parts:
         have = {f.name for f in files}
         for name in expected_parts:
+            if is_xdat_sidecar(name):
+                continue
             if name not in have:
                 result.flags.append("missing_part")
                 result.errors.append(f"Part {name} reported by the sensor is not among the checked files.")
@@ -375,7 +394,7 @@ def validate_capture(
         formats = ", ".join(sorted({f.container for f in unchecked}))
         result.notes.append(
             f"Recording format {formats}: sample checks, duration measurement and previews apply to WAVE "
-            "recordings only. File sizes and SHA-256 checksums were verified by the download."
+            "and XDAT (with .xhdr) recordings only. File sizes and SHA-256 checksums were verified by the download."
         )
     for f in files:
         total += f.duration_s
@@ -455,6 +474,137 @@ def preview_path_for(first_file: Path | str, stem: str = "") -> Path:
     return first.with_name(base + PREVIEW_SUFFIX)
 
 
+@dataclass
+class PreviewAxis:
+    """How a spectrogram's frequency axis is labelled, decided from the file's own metadata.
+
+    The axis is absolute (RF MHz) only when the file carries a centre
+    frequency written by the sensor (CRFS ``meta`` trailer ``rf_frequency``);
+    otherwise it stays relative to an unknown centre. The displayed span is
+    always the sample rate (complex IQ shows fs of spectrum); the sensor's
+    stated bandwidth is a separate number and is never read off the picture.
+    """
+
+    sample_rate_hz: float
+    center_hz: float | None = None  # verified from the file; None = unknown
+    sensor_bandwidth_hz: float | None = None  # from the file's metadata; None = unknown
+    requested_start_hz: float | None = None
+    requested_stop_hz: float | None = None
+
+    @property
+    def absolute(self) -> bool:
+        return self.center_hz is not None
+
+    @property
+    def span_hz(self) -> float:
+        return float(self.sample_rate_hz)
+
+    def extent_mhz(self) -> tuple[float, float]:
+        half = self.span_hz / 2.0 / 1e6
+        if self.absolute:
+            c = float(self.center_hz) / 1e6
+            return c - half, c + half
+        return -half, half
+
+    def xlabel(self) -> str:
+        return "Frequency (MHz)" if self.absolute else "MHz from centre (centre unknown: no frequency metadata in the file)"
+
+    def markers_mhz(self) -> list[tuple[float, str]]:
+        """Requested start/stop as absolute MHz; only on an absolute axis (never inferred)."""
+        if not self.absolute:
+            return []
+        out: list[tuple[float, str]] = []
+        if self.requested_start_hz is not None:
+            out.append((float(self.requested_start_hz) / 1e6, f"requested start {_mhz(self.requested_start_hz)} MHz"))
+        if self.requested_stop_hz is not None:
+            out.append((float(self.requested_stop_hz) / 1e6, f"requested stop {_mhz(self.requested_stop_hz)} MHz"))
+        return out
+
+    def requested_text(self) -> str:
+        if self.requested_start_hz is None or self.requested_stop_hz is None:
+            return "Requested range: unknown"
+        width = (float(self.requested_stop_hz) - float(self.requested_start_hz)) / 1e6
+        return f"Requested range: {_mhz(self.requested_start_hz)}-{_mhz(self.requested_stop_hz)} MHz ({width:g} MHz wide)"
+
+    def legend_lines(self) -> list[str]:
+        """What each number is, so a 125 MS/s span is never read as a verified 125 MHz bandwidth."""
+        lines = [self.requested_text()]
+        if self.absolute:
+            lines.append(f"Centre (file metadata): {_mhz(self.center_hz)} MHz")
+        else:
+            lines.append("Centre: unknown (no frequency metadata in the file)")
+        if self.sensor_bandwidth_hz:
+            lines.append(f"Sensor-reported bandwidth (metadata): {_mhz(self.sensor_bandwidth_hz)} MHz")
+        else:
+            lines.append("Sensor-reported bandwidth: unknown")
+        lines.append(f"Sample rate: {_mhz(self.sample_rate_hz)} MS/s")
+        lines.append(f"Displayed span: {_mhz(self.span_hz)} MHz (= sample rate for complex IQ; not a measured bandwidth)")
+        return lines
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "axis": "absolute RF (MHz)" if self.absolute else "relative (MHz from centre), centre unknown",
+            "center_hz": self.center_hz,
+            "center_source": "file metadata (CRFS meta rf_frequency / XDAT header center_frequency)" if self.absolute else "unknown",
+            "sensor_bandwidth_hz": self.sensor_bandwidth_hz,
+            "sample_rate_hz": self.sample_rate_hz,
+            "displayed_span_hz": self.span_hz,
+            "requested_start_hz": self.requested_start_hz,
+            "requested_stop_hz": self.requested_stop_hz,
+        }
+
+
+def _mhz(value: Any) -> str:
+    """Exact MHz text (no rounding to a tidy number): 1842.5, 1805, 1880.000001."""
+    try:
+        mhz = float(value) / 1e6
+    except (TypeError, ValueError):
+        return "unknown"
+    text = f"{mhz:.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def preview_axis(
+    infos: list[PartInfo],
+    *,
+    requested_start_hz: int | float | None = None,
+    requested_stop_hz: int | float | None = None,
+) -> PreviewAxis:
+    """Decide the axis from the parts' headers and CRFS metadata; nothing is inferred from the samples."""
+    fs = float(infos[0].fmt.sample_rate or 0) if infos else 0.0
+    centers = [float(i.meta.rf_frequency_hz) for i in infos if i.meta is not None and i.meta.rf_frequency_hz]
+    bandwidths = [float(i.meta.bandwidth_hz) for i in infos if i.meta is not None and i.meta.bandwidth_hz]
+    center = centers[0] if centers and all(abs(c - centers[0]) <= TUNING_TOLERANCE_HZ for c in centers) else None
+    bandwidth = bandwidths[0] if bandwidths else None
+    return PreviewAxis(
+        sample_rate_hz=fs,
+        center_hz=center,
+        sensor_bandwidth_hz=bandwidth,
+        requested_start_hz=float(requested_start_hz) if requested_start_hz is not None else None,
+        requested_stop_hz=float(requested_stop_hz) if requested_stop_hz is not None else None,
+    )
+
+
+def describe_preview_axis(
+    paths: list[Path | str],
+    *,
+    requested_start_hz: int | float | None = None,
+    requested_stop_hz: int | float | None = None,
+) -> dict[str, Any]:
+    """The axis decision for these files as a dictionary (for manifests and quality records)."""
+    infos: list[PartInfo] = []
+    for p in paths:
+        if is_xdat_sidecar(p):
+            continue
+        try:
+            infos.append(inspect_recording(p))
+        except (MergeError, OSError):
+            continue
+    if not infos:
+        return {"axis": "unknown (no readable WAVE or XDAT part)", "center_hz": None, "center_source": "unknown"}
+    return preview_axis(infos, requested_start_hz=requested_start_hz, requested_stop_hz=requested_stop_hz).to_dict()
+
+
 def write_preview(
     paths: list[Path | str],
     out_path: Path | str,
@@ -462,11 +612,16 @@ def write_preview(
     center_hz: int | None = None,
     label: str = "",
     block_frames: int = BLOCK_FRAMES,
+    requested_start_hz: int | float | None = None,
+    requested_stop_hz: int | float | None = None,
 ) -> Path:
     """Three small waterfalls: beginning, middle and end of the logical capture.
 
     Only ``block_frames`` samples are read at each point; the picture is a sample,
-    not a full-file spectrogram, and says so in its title.
+    not a full-file spectrogram, and says so in its title. The frequency axis is
+    absolute RF only when the files carry the sensor's centre frequency; the
+    requested start/stop are drawn as labelled markers on that axis. ``center_hz``
+    (the planned centre) is shown as text only; it never positions the axis.
     """
     import numpy as np
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -476,8 +631,10 @@ def write_preview(
 
     infos: list[PartInfo] = []
     for p in paths:
+        if is_xdat_sidecar(p):
+            continue
         try:
-            infos.append(inspect_part(p))
+            infos.append(inspect_recording(p))
         except MergeError:
             continue
     infos = [i for i in infos if i.frames > 0 and _dtype_for(i.fmt) is not None and i.fmt.channels >= 2]
@@ -486,6 +643,7 @@ def write_preview(
     infos.sort(key=lambda i: (i.part is None, i.part or 0, i.name))
     total_frames = sum(i.frames for i in infos)
     fs = infos[0].fmt.sample_rate or 1
+    axis = preview_axis(infos, requested_start_hz=requested_start_hz, requested_stop_hz=requested_stop_hz)
 
     def locate(global_offset: int) -> tuple[PartInfo, int]:
         remaining = global_offset
@@ -523,32 +681,50 @@ def write_preview(
     if vmin is not None and vmax is not None and vmax - vmin < 8:
         mid = 0.5 * (vmin + vmax)
         vmin, vmax = mid - 4, mid + 4
-    f_max = (fs / 2.0) / 1e6
+    x_lo, x_hi = axis.extent_mhz()
     title = "Sampled preview (not the whole file)"
     if label:
         title = f"{label} — {title}"
-    if center_hz:
-        title += f" · {center_hz / 1e6:g} MHz"
+    if axis.absolute:
+        title += f" · centre {_mhz(axis.center_hz)} MHz (file metadata)"
+    elif center_hz:
+        title += f" · planned centre {_mhz(center_hz)} MHz (not confirmed by the file)"
+    else:
+        title += " · centre unknown"
+    markers = axis.markers_mhz()
+    legend = axis.legend_lines()
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     # The object-oriented Agg API keeps clear of pyplot's global figure registry;
     # the lock serialises FreeType text rendering, which is not thread-safe.
     with _RENDER_LOCK:
-        fig = Figure(figsize=(2.6 * len(panels) + 1.0, 2.8), dpi=80)
+        fig = Figure(figsize=(2.9 * len(panels) + 1.0, 3.9), dpi=80)
         FigureCanvasAgg(fig)
         axes = fig.subplots(1, len(panels), squeeze=False)
         for ax, (position, offset, frames, power_db) in zip(axes[0], panels):
             seconds = frames / fs
             ax.imshow(
                 power_db.T, cmap="jet", origin="lower", aspect="auto", interpolation="nearest",
-                extent=[-f_max, f_max, 0.0, seconds], vmin=vmin, vmax=vmax,
+                extent=[x_lo, x_hi, 0.0, seconds], vmin=vmin, vmax=vmax,
             )
+            ax.set_xlim(x_lo, x_hi)
+            for x_mhz, text in markers:
+                inside = x_lo <= x_mhz <= x_hi
+                ax.axvline(x_mhz, color="white", linestyle="--", linewidth=1.0, alpha=0.9)
+                if not inside:
+                    # Outside the displayed span: an arrow at the edge says where it is.
+                    edge = x_lo if x_mhz < x_lo else x_hi
+                    ax.annotate(text, xy=(edge, seconds * 0.5), xytext=(edge, seconds * 0.5), fontsize=6, color="white",
+                                ha="left" if x_mhz < x_lo else "right", va="center")
+                else:
+                    ax.text(x_mhz, seconds * 0.97, text, fontsize=6, color="white", rotation=90, ha="right", va="top")
             ax.set_title(f"{position} @ {offset / fs:.3f} s", fontsize=9)
-            ax.set_xlabel("MHz from centre", fontsize=8)
+            ax.set_xlabel(axis.xlabel(), fontsize=7)
             ax.tick_params(labelsize=7)
         axes[0][0].set_ylabel("Time (s)", fontsize=8)
         fig.suptitle(title, fontsize=9)
-        fig.tight_layout()
+        fig.text(0.01, 0.01, "\n".join(legend), fontsize=6.5, va="bottom", ha="left", family="monospace")
+        fig.tight_layout(rect=(0.0, 0.2, 1.0, 1.0))
         fig.savefig(out, format="png", dpi=80)
     return out
 
@@ -590,6 +766,30 @@ def plausible_time(stamp: datetime | None, *, now: datetime | None = None) -> st
     return None
 
 
+CLOCK_DRIFT_WARN_S = 5.0
+CLOCK_DRIFT_ERROR_S = 120.0
+# "Blocking" checks stop the pass; the others are reported and the pass goes on.
+BLOCKING_CHECKS = {"connection", "identity_match", "sensor_storage", "local_storage", "destination", "plan"}
+
+
+def local_writable(path: Path | str) -> str | None:
+    """Create the folder and write a small probe file; the problem text when that fails."""
+    import os
+    import uuid
+
+    folder = Path(path)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        probe = folder / f".crfs-write-check-{uuid.uuid4().hex[:8]}.tmp"
+        with open(probe, "wb") as fh:
+            fh.write(b"ok")
+        os.replace(probe, probe)  # rename in place: the same call finalize_download makes
+        probe.unlink()
+    except OSError as exc:
+        return exc.strerror or str(exc) or exc.__class__.__name__
+    return None
+
+
 def pre_run_checks(
     *,
     sensor_info: Any,
@@ -601,8 +801,23 @@ def pre_run_checks(
     previous_identity: dict[str, str] | None = None,
     gnss_status: str | None = None,
     now: datetime | None = None,
+    expected_identity: dict[str, str] | None = None,
+    clock_offset_s: float | None = None,
+    clock_source: str = "",
+    workbook_path: str | Path | None = None,
+    workbook_sheet: str = "",
+    workbook_state: str | None = None,
+    protocol_loaded: bool = False,
+    check_writable: bool = True,
 ) -> list[Check]:
-    """Readiness report shown before a session starts. Nothing here starts a capture."""
+    """Readiness report before a pass starts. Nothing here starts a capture.
+
+    ``expected_identity`` is the sensor the collection was planned for; a
+    different model or serial blocks the pass. ``workbook_state`` is
+    'open' / 'closed' / 'busy' / 'missing'; an unavailable workbook is a
+    warning when the protocol is already loaded (results queue and wait),
+    an error only when the plan itself cannot be read.
+    """
     checks: list[Check] = []
     now = now or datetime.now(timezone.utc)
 
@@ -619,6 +834,16 @@ def pre_run_checks(
             checks.append(Check("identity", LEVEL_OK, f"Sensor {model or 'unknown model'} · serial {serial or 'unknown'} · firmware {firmware or 'unknown'}."))
         else:
             checks.append(Check("identity", LEVEL_WARNING, "Sensor connected but model and serial could not be read; manifests will say unknown."))
+    if expected_identity and connected:
+        mismatch = []
+        for key, value in (("model", model), ("serial", serial)):
+            wanted = str(expected_identity.get(key) or "").strip()
+            if wanted and value and wanted != value and wanted != "—" and value != "—":
+                mismatch.append(f"{key} {wanted} expected, {value} answered")
+        if mismatch:
+            checks.append(Check("identity_match", LEVEL_ERROR, "This is not the sensor the collection was planned for: " + "; ".join(mismatch) + "."))
+        else:
+            checks.append(Check("identity_match", LEVEL_OK, "The sensor is the one the collection was planned for."))
     if previous_identity:
         changed = []
         for key, value in (("model", model), ("serial", serial)):
@@ -634,42 +859,78 @@ def pre_run_checks(
         checks.append(Check("computer_clock", LEVEL_ERROR, f"Computer clock {computer_problem}."))
     else:
         checks.append(Check("computer_clock", LEVEL_OK, f"Computer clock {now.astimezone().isoformat(timespec='seconds')}."))
-    if sensor_time is None:
-        checks.append(Check("sensor_clock", LEVEL_INFO, "Sensor clock: unknown (not reported by the sensor API used here). It is compared with the computer after the first capture, from the recording timestamps."))
+    if clock_offset_s is None and sensor_time is not None and sensor_time.tzinfo:
+        clock_offset_s = (sensor_time.astimezone(timezone.utc) - now).total_seconds()
+    if sensor_time is None and clock_offset_s is None:
+        checks.append(Check("sensor_clock", LEVEL_INFO, "Sensor clock: unknown (the sensor's status page could not be read). Recording times come from the files' own timestamps; the difference to the computer is not known."))
     else:
-        problem = plausible_time(sensor_time, now=now)
-        offset = (sensor_time.astimezone(timezone.utc) - now).total_seconds() if sensor_time.tzinfo else None
+        problem = plausible_time(sensor_time, now=now) if sensor_time is not None else None
+        source = f" ({clock_source})" if clock_source else ""
+        direction = ""
+        if clock_offset_s is not None:
+            direction = "ahead of" if clock_offset_s > 0 else "behind"
         if problem:
-            checks.append(Check("sensor_clock", LEVEL_ERROR, f"Sensor clock {problem}."))
-        elif offset is not None and abs(offset) > 5:
-            checks.append(Check("sensor_clock", LEVEL_WARNING, f"Sensor clock differs from the computer by {offset:+.0f} s."))
+            checks.append(Check("sensor_clock", LEVEL_ERROR, f"Sensor clock {problem}{source}."))
+        elif clock_offset_s is not None and abs(clock_offset_s) > CLOCK_DRIFT_ERROR_S:
+            # Reported, not blocking: recording times follow the sensor's own timestamps either way.
+            checks.append(Check("sensor_clock", LEVEL_ERROR, f"Sensor clock is {abs(clock_offset_s):.1f} s {direction} the computer{source}. Recording times in Excel follow the sensor's clock; check its time source."))
+        elif clock_offset_s is not None and abs(clock_offset_s) > CLOCK_DRIFT_WARN_S:
+            checks.append(Check("sensor_clock", LEVEL_WARNING, f"Sensor clock is {abs(clock_offset_s):.1f} s {direction} the computer{source}."))
+        elif clock_offset_s is not None:
+            checks.append(Check("sensor_clock", LEVEL_OK, f"Sensor clock agrees with the computer ({clock_offset_s:+.1f} s{source})."))
         else:
-            checks.append(Check("sensor_clock", LEVEL_OK, "Sensor clock agrees with the computer (within 5 s)."))
-    checks.append(Check("gnss", LEVEL_INFO, f"GNSS status: {gnss_status or 'unknown (not exposed by the sensor API used here)'}."))
+            checks.append(Check("sensor_clock", LEVEL_OK, f"Sensor clock read{source}; offset not measured."))
+    checks.append(Check("gnss", LEVEL_INFO, f"GNSS status: {gnss_status or 'unknown (not reported by the sensor API used here)'}."))
 
     # Storage.
     estimate = plan.estimated_bytes if plan is not None else 0
     if sensor_storage is None or not sensor_storage.ok or sensor_storage.total_bytes <= 0:
-        checks.append(Check("sensor_storage", LEVEL_WARNING, "Sensor storage unavailable; captures are refused individually if space runs out."))
+        checks.append(Check("sensor_storage", LEVEL_WARNING, "Sensor storage: unknown (could not be read); captures are refused individually if space runs out."))
     else:
         needed = needed_bytes_with_margin(estimate)
-        line = f"{format_storage_bytes(sensor_storage.free_bytes)} free on the sensor; one round needs about {format_storage_bytes(needed)} (estimate with margin)."
+        line = f"{format_storage_bytes(sensor_storage.free_bytes)} free on the sensor; one pass needs about {format_storage_bytes(needed)} (estimate with margin)."
         if sensor_storage.free_bytes < needed:
-            checks.append(Check("sensor_storage", LEVEL_ERROR, "Not enough sensor storage for a complete round. " + line + " Existing recordings are never deleted automatically."))
+            checks.append(Check("sensor_storage", LEVEL_ERROR, "Not enough sensor storage for a complete pass. " + line + " Existing recordings are never deleted automatically."))
         elif sensor_storage.free_bytes < needed * 2:
-            checks.append(Check("sensor_storage", LEVEL_WARNING, "Sensor storage is tight for repeated rounds. " + line))
+            checks.append(Check("sensor_storage", LEVEL_WARNING, "Sensor storage is tight for repeated passes. " + line))
         else:
             checks.append(Check("sensor_storage", LEVEL_OK, line))
     free_local = local_free_bytes(local_dir)
     if free_local is None:
-        checks.append(Check("local_storage", LEVEL_WARNING, f"Local destination {local_dir} could not be checked."))
+        checks.append(Check("local_storage", LEVEL_WARNING, f"Local destination {local_dir}: free space unknown (could not be checked)."))
     else:
         needed_local = estimate + int(local_reserve_bytes)
-        line = f"{format_bytes(free_local)} free at {local_dir}; one round downloads about {format_bytes(estimate)} plus a {format_bytes(int(local_reserve_bytes))} reserve."
+        line = (
+            f"{format_bytes(free_local)} free at {local_dir}; one pass downloads about {format_bytes(estimate)} (estimate) "
+            f"plus a {format_bytes(int(local_reserve_bytes))} reserve. Temporary .part files are written in the same folder."
+        )
         if free_local < needed_local:
-            checks.append(Check("local_storage", LEVEL_ERROR, "Not enough local space for a complete round. " + line))
+            checks.append(Check("local_storage", LEVEL_ERROR, "Not enough local space for a complete pass. " + line + " Nothing is deleted automatically."))
         else:
             checks.append(Check("local_storage", LEVEL_OK, line))
+    if check_writable:
+        problem = local_writable(local_dir)
+        if problem:
+            checks.append(Check("destination", LEVEL_ERROR, f"Local destination {local_dir} is not writable: {problem}."))
+        else:
+            checks.append(Check("destination", LEVEL_OK, f"Local destination {local_dir} is writable."))
+
+    # Protocol workbook (results). Its absence never blocks a loaded plan: results queue.
+    if workbook_path:
+        name = Path(str(workbook_path)).name
+        sheet = f", worksheet {workbook_sheet!r}" if workbook_sheet else ""
+        state = "missing" if not Path(str(workbook_path)).is_file() else (workbook_state or "closed")
+        if state == "missing":
+            level = LEVEL_WARNING if protocol_loaded else LEVEL_ERROR
+            text = f"Protocol workbook {name} not found{sheet}."
+            text += " The plan is loaded; Excel updates wait in the queue until the file is back." if protocol_loaded else " Load it first."
+            checks.append(Check("workbook", level, text))
+        elif state == "busy":
+            checks.append(Check("workbook", LEVEL_WARNING, f"Excel is busy (a cell being edited or a dialog open); updates to {name}{sheet} are queued and written when Excel is free."))
+        elif state == "open":
+            checks.append(Check("workbook", LEVEL_OK, f"{name}{sheet} is open in Excel; results are written into the open workbook."))
+        else:
+            checks.append(Check("workbook", LEVEL_OK, f"{name}{sheet} is available (closed; written directly)."))
 
     # Plan.
     if plan is None:
@@ -677,9 +938,29 @@ def pre_run_checks(
     elif not plan.ready:
         checks.append(Check("plan", LEVEL_ERROR, f"The plan has {len(plan.errors)} error(s); fix the workbook or settings first."))
     else:
-        checks.append(Check("plan", LEVEL_OK, f"{len(plan.tasks)} capture(s) per round, {plan.capture_seconds:g} s of IQ, about {format_bytes(plan.estimated_bytes)} (estimate)."))
-    checks.append(Check("test_capture", LEVEL_INFO, "Optional: run a short test capture of the first task before starting the schedule."))
+        bad = []
+        for task in plan.tasks:
+            try:
+                start = float(getattr(task, "window_start_hz", 0) or 0)
+                stop = float(getattr(task, "window_stop_hz", 0) or 0)
+                seconds = float(getattr(task, "duration_s", 0) or 0)
+            except (TypeError, ValueError):
+                bad.append(f"{task.label()}: unreadable numbers")
+                continue
+            if not (0 < start < stop):
+                bad.append(f"{task.label()}: start {start / 1e6:g} MHz must be below stop {stop / 1e6:g} MHz")
+            if seconds <= 0:
+                bad.append(f"{task.label()}: duration {seconds:g} s")
+        if bad:
+            checks.append(Check("plan", LEVEL_ERROR, "Rows with invalid values (not sent as they are): " + "; ".join(bad[:5]) + ("…" if len(bad) > 5 else "")))
+        else:
+            checks.append(Check("plan", LEVEL_OK, f"{len(plan.tasks)} capture(s) per pass, {plan.capture_seconds:g} s of IQ, about {format_bytes(plan.estimated_bytes)} (estimate). Ranges and durations are sent exactly as listed."))
     return checks
+
+
+def blocking_checks(checks: list[Check]) -> list[Check]:
+    """The errors that stop a pass (Excel being unavailable never does)."""
+    return [c for c in checks if c.level == LEVEL_ERROR and c.name in BLOCKING_CHECKS]
 
 
 def worst_level(checks: list[Check]) -> str:

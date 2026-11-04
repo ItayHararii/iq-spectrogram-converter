@@ -18,11 +18,12 @@ class _PreviewJob(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, path: Path, center_hz: int | None, bandwidth_hz: int | None) -> None:
+    def __init__(self, path: Path, center_hz: int | None, bandwidth_hz: int | None, requested: tuple | None = None) -> None:
         super().__init__()
         self._path = path
         self._center_hz = center_hz
         self._bandwidth_hz = bandwidth_hz
+        self._requested = requested or (None, None)
 
     @Slot()
     def run(self) -> None:
@@ -33,6 +34,8 @@ class _PreviewJob(QObject):
                 cache_id=cache_key(str(self._path), stat.st_size, stat.st_mtime),
                 center_hz=self._center_hz,
                 bandwidth_hz=self._bandwidth_hz,
+                requested_start_hz=self._requested[0],
+                requested_stop_hz=self._requested[1],
             )
             self.finished.emit(result)
         except (OSError, PreviewError) as exc:
@@ -47,7 +50,7 @@ class _PreviewJob(QObject):
 
 
 class WaterfallDialog(QDialog):
-    def __init__(self, path: Path | str, *, center_hz=None, bandwidth_hz=None, parent=None) -> None:
+    def __init__(self, path: Path | str, *, center_hz=None, bandwidth_hz=None, requested_start_hz=None, requested_stop_hz=None, parent=None) -> None:
         super().__init__(parent)
         self.path = Path(path)
         self.setWindowTitle(f"Waterfall - {self.path.name}")
@@ -78,6 +81,7 @@ class WaterfallDialog(QDialog):
             self.path,
             int(center_hz) if center_hz else None,
             int(bandwidth_hz) if bandwidth_hz else None,
+            (requested_start_hz, requested_stop_hz),
         )
         self._job.moveToThread(self._thread)
         queued = Qt.ConnectionType.QueuedConnection

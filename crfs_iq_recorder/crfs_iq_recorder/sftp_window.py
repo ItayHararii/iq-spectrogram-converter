@@ -423,6 +423,8 @@ class FileDownloadWorker(QObject):
     waiting = Signal(str, float, str)
     connected = Signal(str)
     unreachable = Signal(str, str)
+    # name, sha256 computed on the sensor ('' when unavailable), note
+    remote_checksum = Signal(str, str, str)
 
     def __init__(
         self,
@@ -434,6 +436,7 @@ class FileDownloadWorker(QObject):
         expected_size: int = 0,
         cancel: threading.Event | None = None,
         patience_s: float | None = None,
+        want_remote_checksum: bool = False,
     ) -> None:
         super().__init__()
         self._state = state
@@ -445,6 +448,7 @@ class FileDownloadWorker(QObject):
         self._stop_waiting = threading.Event()
         self._patience_s = float(CONNECT_PATIENCE_S if patience_s is None else patience_s)
         self._browser: SftpBrowser | None = None
+        self._want_remote_checksum = bool(want_remote_checksum)
 
     def stop_waiting(self) -> None:
         """Give up if no connection has been made yet; a transfer already running continues."""
@@ -514,6 +518,13 @@ class FileDownloadWorker(QObject):
                 expected_size=self._expected_size,
             )
             self._record_reading()
+            if self._want_remote_checksum and not self._cancel.is_set():
+                # Same SSH session as the transfer: no extra handshake slot on the sensor.
+                try:
+                    digest, note = self._browser.remote_sha256(self._remote)
+                except Exception as exc:  # noqa: BLE001 - one of three verifications; the file is already here
+                    digest, note = "", f"remote checksum not computed: {exc}"
+                self.remote_checksum.emit(self._name, digest, note)
             self.finished.emit(self._name, self._local)
         except SftpError as exc:
             self.failed.emit(self._name, str(exc))

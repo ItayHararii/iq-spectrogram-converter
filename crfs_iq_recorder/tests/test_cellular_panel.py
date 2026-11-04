@@ -423,7 +423,7 @@ def test_a_workbook_that_cannot_be_read_keeps_the_stored_import_and_queues_resul
         assert _pump_until(qapp, lambda: window._cellular.status()["workbook_status"] == "busy", timeout=8.0), window._cellular.status()
         status = window._cellular.status()
         assert status["workbook_pending"] == 2 and "another program" in status["workbook_note"]
-        assert "pending" in panel.detail_label.text().casefold(), panel.detail_label.text()
+        assert "waiting for excel" in panel.detail_label.text().casefold(), panel.detail_label.text()
         # The file is free again: the next retry writes both rows.
         monkeypatch.setattr(cw, "write_results_openpyxl", _original_write_results)
         assert _pump_until(qapp, lambda: window._cellular.workbook_pending() == 0 and not window._cellular._workbook_flushing, timeout=10.0), window._cellular.status()

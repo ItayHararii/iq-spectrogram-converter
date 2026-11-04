@@ -2114,7 +2114,14 @@ class MainWindow(QMainWindow):
         view = self.manual_result.view
         if view is None or not view.local_paths:
             return
-        self._waterfall = WaterfallDialog(view.local_paths[0], center_hz=view.centre_hz, bandwidth_hz=view.bandwidth_hz, parent=self)
+        self._waterfall = WaterfallDialog(
+            view.local_paths[0],
+            center_hz=view.centre_hz,
+            bandwidth_hz=view.bandwidth_hz,
+            requested_start_hz=view.requested_start_hz,
+            requested_stop_hz=view.requested_stop_hz,
+            parent=self,
+        )
         self._waterfall.show()
 
     def _client(self) -> EmpClient:
@@ -3121,6 +3128,11 @@ class MainWindow(QMainWindow):
             return
         if not hasattr(self, "excel_check") or not self.excel_check.isChecked():
             return
+        from .xdat_header import is_xdat_sidecar
+
+        if is_xdat_sidecar(entry.name):
+            # The .xhdr/.xmrk stay beside the .xdat; the row names the sample file.
+            return
         sensor_id = record.sensor_id or self._sensor_info.serial
         if self._excel_store.is_logged(sensor_id, entry.path):
             return
@@ -3204,7 +3216,7 @@ class MainWindow(QMainWindow):
                 for _ in range(HEADER_RETRIES):
                     # A header the sensor has not finished yet is read again; an
                     # unreadable format is not (its duration stays unknown).
-                    if not any(part.readable and not part.final for part in measurement.parts):
+                    if not any(part.header_pending for part in measurement.parts):
                         break
                     if cancel.wait(HEADER_RETRY_S):
                         break

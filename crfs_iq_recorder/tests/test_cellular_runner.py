@@ -861,10 +861,15 @@ def test_locked_workbook_defers_excel_rows_and_retries_later(qapp, tmp_path, mon
     assert state.status == T_CONFIRMED, "a locked workbook never changes the capture result"
     assert state.excel_status == "deferred" and any("Excel deferred" in n for n in state.notes)
     assert queued == []
+    # Retries are paced (EXCEL_RETRY_S) and silent: the next tick does not try again yet.
+    runner._tick()
+    assert state.excel_status == "deferred" and attempts["n"] == 1
+    monkeypatch.setattr(cr, "EXCEL_RETRY_S", 0.0)
     runner._tick()
     assert state.excel_status == "queued" and len(queued) == 1
     assert queued[0]["collection_event"].startswith("Camp / Site A")
     assert attempts["n"] == 2
+    assert sum(1 for n in state.notes if "Excel deferred" in n) == 1, "said once, not on every retry"
 
 
 def test_connection_loss_during_a_capture_is_uncertain_and_never_resent(qapp, tmp_path):
@@ -993,6 +998,13 @@ def test_demo_main_window_runs_a_round_with_downloads_quality_excel_and_blocks_m
         assert window.start_btn.text() == "Start Recording"
         assert window.manual_reason.text() == "Excel Collection is running."
         assert not window.manual_reason.isHidden()
+        # The pass starts with the background pre-collection check; the first request
+        # goes out once it has passed (a manual Start during the check would only be
+        # refused with a dialog, so the test waits for the request instead).
+        assert _pump_until(qapp, lambda: runner.current_tasks()[0].status == T_SUBMITTING, timeout=8.0), runner.status()
+        preflight = runner.last_preflight()
+        assert preflight is not None and not preflight.blocking(), preflight.problems()
+        assert {c.name for c in preflight.checks} >= {"identity", "sensor_storage", "local_storage", "destination", "plan"}
         window._on_start()
         assert window._external_owner == OWNER
         assert runner.current_tasks()[0].status == T_SUBMITTING
@@ -1410,7 +1422,7 @@ def test_pending_workbook_results_survive_a_restart_and_a_locked_file(qapp, tmp_
     assert runner.workbook_pending() == 1
     status = runner.status()
     assert status["workbook_pending"] == 1 and status["workbook_status"] == "busy"
-    assert "Excel is busy. Update queued." in logs
+    assert "Waiting for Excel: protocol.xlsx is open in another program. Results stay queued." in logs
     assert load_workbook(workbook)["Cellular Protocol"]["G2"].value is None
     runner.shutdown()
     # Restart with the workbook free: the queued result is written, once.
@@ -1530,10 +1542,14 @@ def test_with_no_connection_for_the_whole_wait_files_stay_on_the_sensor_until_re
     monkeypatch.setattr("crfs_iq_recorder.sftp_window.CONNECT_PATIENCE_S", 0.3)
     sensor = _Sensor(_wave(), refuse=10**6)
     host, runner, logs = download_runner(sensor)
+    round_id = runner.session.current_round_id
     for index in range(3):
         host.finish(host.requests[index])
         _pump(qapp)
-    files = [task.files[0] for task in runner.current_tasks()]
+    # The pass closes as soon as the last task is confirmed (wait_s=0), so the tasks are taken
+    # from the session by round id, not from current_tasks().
+    files = [task.files[0] for task in runner.session.tasks[round_id]]
+    assert len(files) == 3
     assert _pump_until(qapp, lambda: all(f["download_status"] == DL_FAILED for f in files) and not runner._downloads_active, timeout=10.0)
     assert sensor.transfers == [] and all(f["attempts"] == 0 for f in files)
     assert all(f["note"].endswith("The file stays on the sensor.") for f in files)
