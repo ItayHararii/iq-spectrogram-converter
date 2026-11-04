@@ -725,6 +725,7 @@ class CellularRunner(QObject):
         settings: CampaignSettings,
         *,
         protocol_snapshot: str = "",
+        trigger: str = "",
     ) -> str | None:
         """Begin a new session. Returns an error text when it cannot start."""
         if self.active():
@@ -795,6 +796,7 @@ class CellularRunner(QObject):
             repeat=schedule.repeat,
             schedule=schedule.describe(),
             sensor=session.sensor,
+            trigger=trigger or "direct call",
         )
         self._log(f"Collection started: {summary_line(plan, wait_s=settings.wait_s, passes=schedule.repeat)}.")
         self._save()
@@ -989,6 +991,8 @@ class CellularRunner(QObject):
         index = self.session.rounds.index(record) + 1 if record in self.session.rounds else len(self.session.rounds)
         rows = self.session.plan.row_count
         text = f"Pass {index} started: {rows} row" + ("" if rows == 1 else "s")
+        if self.session.schedule.mode == MODE_TIMES:
+            text = f"Scheduled pass {index} started (set for {record.scheduled_local:%H:%M}): {rows} row" + ("" if rows == 1 else "s")
         if delayed:
             text += f", {format_seconds(late)} late (the previous pass was still running)"
         self._log(text + ".")

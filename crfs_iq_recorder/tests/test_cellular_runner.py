@@ -469,6 +469,31 @@ def test_run_missed_round_on_request(qapp, tmp_path):
     assert "operator's request" in runner.session.rounds[0].note
 
 
+def test_a_collection_start_names_its_trigger_in_the_log(qapp, tmp_path):
+    from crfs_iq_recorder.diagnostic_log import recent
+
+    runner = _runner(tmp_path, FakeHost())
+    assert runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(), trigger="Start button (mouse)") is None
+    started = [line for line in recent(60) if "[collection_started]" in line]
+    assert started and '"trigger": "Start button (mouse)"' in started[-1]
+    runner.stop()
+
+
+def test_a_scheduled_pass_says_in_the_log_that_the_schedule_started_it(qapp, tmp_path):
+    host = FakeHost()
+    clock = {"now": datetime(2026, 11, 3, 8, 40, tzinfo=timezone.utc)}
+    runner = _timed_session(tmp_path, host, clock, [(8, 50)])
+    logged: list[str] = []
+    runner.log.connect(lambda text, level: logged.append(text))
+    runner._tick()
+    assert host.requests == [] and not any("started" in line for line in logged)
+    clock["now"] = datetime(2026, 11, 3, 8, 50, 2, tzinfo=timezone.utc)
+    runner._tick()
+    assert len(host.requests) == 1
+    set_for = f"{runner.session.rounds[0].scheduled_local:%H:%M}"
+    assert any(line.startswith(f"Scheduled pass 1 started (set for {set_for}): ") for line in logged), logged
+
+
 def _timed_session(tmp_path, host, clock, times):
     runner = _runner(tmp_path, host, clock=lambda: clock["now"])
     schedule = Schedule(

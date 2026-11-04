@@ -178,6 +178,7 @@ from .size_estimate import (
 from .merge_controller import MergeController
 from .sftp_window import SftpWindow, _normalise_dir, _open_browser
 from .cellular_panel import FieldLabel
+from .start_button import StartButton
 from .theme import (
     CONTROL_H,
     DARK_MODE,
@@ -286,6 +287,9 @@ class MainWindow(QMainWindow):
         # manual Start button and the repeat series stay out of its way.
         self._external_capture: CaptureRequest | None = None
         self._external_owner: str = ""
+        # What asked for the next manual recording (diagnostic log of every request).
+        self._start_trigger = ""
+        self._phase_shown: tuple[str, str] = (PHASE_LABELS[IDLE], "muted")
         self._summary_emitted = False
         self._sent_recording_format = ""
         self._jobs: list[tuple[QThread, Worker]] = []
@@ -643,8 +647,8 @@ class MainWindow(QMainWindow):
         return wrap, field, unit
 
     @staticmethod
-    def _ghost_button(text: str, tooltip: str = "") -> QPushButton:
-        button = QPushButton(text)
+    def _ghost_button(text: str, tooltip: str = "", *, starts: bool = False) -> QPushButton:
+        button = StartButton(text) if starts else QPushButton(text)
         button.setObjectName("ghost")
         button.setAutoDefault(False)
         button.setFixedHeight(CONTROL_H)
@@ -848,16 +852,15 @@ class MainWindow(QMainWindow):
         texts.addWidget(self.phase_label)
         texts.addWidget(self.manual_reason)
         row.addLayout(texts, 1)
-        self.start_btn = QPushButton("Start Recording")
+        self.start_btn = StartButton("Start Recording")
         self.start_btn.setObjectName("primary")
-        self.start_btn.setDefault(True)
         self.start_btn.setFixedHeight(PRIMARY_H)
         self.start_btn.setMinimumWidth(170)
-        self.start_btn.clicked.connect(self._on_start)
+        self.start_btn.clicked.connect(self._on_start_clicked)
         self.pause_btn = self._ghost_button("Pause", "Pauses after the current recording")
         self.pause_btn.setEnabled(False)
         self.pause_btn.clicked.connect(self._on_pause_series)
-        self.resume_btn = self._ghost_button("Resume", "Continue the series with the next recording")
+        self.resume_btn = self._ghost_button("Resume", "Continue the series with the next recording", starts=True)
         self.resume_btn.setVisible(False)
         self.resume_btn.clicked.connect(self._on_resume_series)
         self.stop_btn = self._ghost_button("Stop", "Stops after the current recording")
@@ -1984,6 +1987,8 @@ class MainWindow(QMainWindow):
         return capability_for(model).max_sample_rate_hz
 
     def _set_msg(self, text: str, *, error: bool = False) -> None:
+        if self._external_holds_sensor():
+            text = ""
         self.msg.setText(text)
         self.msg.setVisible(bool(text))
         self.msg.setObjectName("error" if error and text else "muted")
@@ -2126,19 +2131,32 @@ class MainWindow(QMainWindow):
             timeout_text=cfg.timeout,
         )
 
+    def _external_holds_sensor(self) -> bool:
+        return bool(self._external_owner) or self._external_capture is not None
+
     def _set_phase(self, phase: str, message: str | None = None) -> None:
         self._record_phase = phase
         text = message if message is not None else PHASE_LABELS.get(phase, phase)
-        if hasattr(self, "phase_label"):
-            self.phase_label.setText(text)
-            if phase in {SUBMITTING, RECORDING, FINALIZING, WAITING}:
-                name = "phaseBusy"
-            elif phase == CONFIRMED:
-                name = "phaseOk"
-            elif phase in {UNKNOWN, FAILED, PARTIAL}:
-                name = "phaseBad"
-            else:
-                name = "muted"
+        if self._external_holds_sensor():
+            # The Excel row's states belong to its own tab; the reason line says who records.
+            text, name = PHASE_LABELS[IDLE], "muted"
+        elif phase in {SUBMITTING, RECORDING, FINALIZING, WAITING}:
+            name = "phaseBusy"
+        elif phase == CONFIRMED:
+            name = "phaseOk"
+        elif phase in {UNKNOWN, FAILED, PARTIAL}:
+            name = "phaseBad"
+        else:
+            name = "muted"
+        self._phase_shown = (text, name)
+        self._show_phase()
+
+    def _show_phase(self) -> None:
+        if not hasattr(self, "phase_label"):
+            return
+        text, name = (PHASE_LABELS[IDLE], "muted") if self._external_holds_sensor() else self._phase_shown
+        self.phase_label.setText(text)
+        if self.phase_label.objectName() != name:
             self.phase_label.setObjectName(name)
             restyle(self.phase_label)
 
@@ -2363,6 +2381,8 @@ class MainWindow(QMainWindow):
             return reason
         self._external_owner = name
         self._set_recording_ui(self._recording_active)
+        self._set_msg("")
+        self._show_phase()
         return None
 
     def release_external_owner(self, name: str | None = None) -> None:
@@ -2371,6 +2391,7 @@ class MainWindow(QMainWindow):
         self._external_owner = ""
         if not self._recording_active:
             self._set_recording_ui(False)
+        self._show_phase()
 
     def start_capture(self, request: CaptureRequest) -> str | None:
         """Start one recording for another feature. Returns an error text or None.
@@ -2591,7 +2612,12 @@ class MainWindow(QMainWindow):
             diag("listener_failed", "capture_finished", traceback=traceback.format_exc(limit=8))
             self.log("Internal error after the recording. See details.", level="error")
 
+    def _on_start_clicked(self) -> None:
+        self._start_trigger = f"Start button ({self.start_btn.take_trigger()})"
+        self._on_start()
+
     def _on_start(self) -> None:
+        trigger, self._start_trigger = self._start_trigger or "direct call", ""
         if self._recording_active or self._submit_lock:
             return
         if self._external_owner:
@@ -2680,6 +2706,7 @@ class MainWindow(QMainWindow):
         seconds = float(scan["duration"])
         self._capture_session_into_conn()
         save_settings(self._conn.persistable())
+        self._start_trigger = trigger
         self._launch_capture(self._plan, seconds, target=target, mapping=mapping, request=None)
 
     def _launch_capture(
@@ -2762,10 +2789,13 @@ class MainWindow(QMainWindow):
         cancel = self._record_cancel
         self._record_gen += 1
         gen = self._record_gen
+        trigger = (request.label or request.owner) if request is not None else (self._start_trigger or "direct call")
+        self._start_trigger = ""
         diag(
             "request",
             "POST /emp/ remote_recording_scans",
             owner=request.owner if request is not None else "manual",
+            trigger=trigger,
             label=request.label if request is not None else "",
             start_hz=plan.start_hz,
             stop_hz=plan.end_hz,
@@ -3382,10 +3412,16 @@ class MainWindow(QMainWindow):
             self._end_series()
             return
         if self._series_remaining is None:
+            self._start_trigger = "repeat series (until stopped)"
+            self.log("Repeat until stopped: next recording.")
             QTimer.singleShot(0, self._on_start)
             return
         if self._series_remaining > 0:
             self._series_remaining -= 1
+            total = int(self.repeat_spin.value())
+            number = max(total - self._series_remaining, 1)
+            self._start_trigger = f"repeat series ({number} of {total})"
+            self.log(f"Repeat: recording {number} of {total}.")
             QTimer.singleShot(0, self._on_start)
             return
         self.log("Series complete.")
@@ -3718,7 +3754,7 @@ class MainWindow(QMainWindow):
         try:
             if self._sftp_win is not None:
                 self._sftp_win.close()
-            self._sftp_win = SftpWindow(self._conn, None)
+            self._sftp_win = SftpWindow(self._conn, None, screen=self.screen())
             self._sftp_win.activity.connect(self.log)
             self._sftp_win.remote_changed.connect(self._refresh_storage)
             self._sftp_win.set_merge_controller(self._merge)

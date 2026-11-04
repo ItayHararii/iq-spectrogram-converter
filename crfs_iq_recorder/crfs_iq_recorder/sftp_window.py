@@ -20,7 +20,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPixmap, QScreen, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .cellular_pickers import format_datetime
 from .connection_state import ConnectionState
 from .constants import DEFAULT_SFTP_PORT
 from .diagnostic_log import diag
@@ -79,7 +80,7 @@ from .spectrogram_preview import (
     cache_key,
     preview_dependencies,
 )
-from .theme import current_palette, fit_window_to_screen, format_bytes, format_display_datetime
+from .theme import current_palette, fit_window_to_screen, format_bytes
 from .validation import ValidationError, parse_optional_port
 from .worker_threads import track as track_worker_thread
 
@@ -549,8 +550,10 @@ class SftpWindow(QWidget):
     _cmd_remove = Signal(object)
     _cmd_close = Signal()
 
-    def __init__(self, state: ConnectionState, parent=None) -> None:
+    def __init__(self, state: ConnectionState, parent=None, *, screen: QScreen | None = None) -> None:
         super().__init__(parent)
+        if screen is not None:
+            self.setScreen(screen)
         self.setObjectName("sftpRoot")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setWindowTitle("Sensor files (SFTP)")
@@ -691,6 +694,7 @@ class SftpWindow(QWidget):
         header.setMinimumSectionSize(72)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionsClickable(True)
         header.setHighlightSections(False)
         header.setSortIndicatorShown(False)
@@ -1630,7 +1634,7 @@ class SftpWindow(QWidget):
         rec,
         is_new: bool,
     ) -> list[str]:
-        mtime = format_display_datetime(modified) if modified else ""
+        mtime = format_datetime(modified) if modified else ""
         values = ["NEW" if is_new else "", name, size_text, mtime, "", "", "", "", ""]
         if rec is not None:
             start, end, center_hz, bw, duration = format_columns(rec)
@@ -1697,7 +1701,7 @@ class SftpWindow(QWidget):
                 parent.setToolTip(1, f"{len(node.entries)} parts")
                 parent.setToolTip(2, f"Combined size: {combined:,} B")
                 if newest:
-                    parent.setToolTip(3, format_display_datetime(newest))
+                    parent.setToolTip(3, format_datetime(newest))
                 if rec is not None:
                     parent.setToolTip(8, "Total recording time for this capture.")
                 for entry in node.entries:
@@ -1719,7 +1723,7 @@ class SftpWindow(QWidget):
                     child.setToolTip(1, entry.name)
                     child.setToolTip(2, f"{entry.size:,} B")
                     if entry.modified:
-                        child.setToolTip(3, format_display_datetime(entry.modified))
+                        child.setToolTip(3, format_datetime(entry.modified))
                     if child_rec is not None:
                         child.setToolTip(8, "Total recording time, not this part.")
                     parent.addChild(child)
@@ -1757,7 +1761,7 @@ class SftpWindow(QWidget):
                 else:
                     item.setToolTip(2, f"{entry.size:,} B")
             if entry.modified:
-                item.setToolTip(3, format_display_datetime(entry.modified))
+                item.setToolTip(3, format_datetime(entry.modified))
             if rec is not None:
                 item.setToolTip(8, "Total recording time, not this part.")
             self.table.addTopLevelItem(item)

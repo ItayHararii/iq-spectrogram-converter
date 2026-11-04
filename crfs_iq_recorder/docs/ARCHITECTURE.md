@@ -1,6 +1,6 @@
 # CRFS IQ Recorder - architecture
 
-**Version documented:** 1.13.0
+**Version documented:** 1.13.1
 **Code:** `crfs_iq_recorder/` as of this file (3 November 2026). The Excel Collection rows below (called Cellular Collection before 1.13.0) describe the 1.13.0 design; `docs/CELLULAR_COLLECTION.md` has the detail.
 **Related app:** IQ Spectrogram Converter (`iq_gui.py`, `iq_data.py`) at the repository root
 
@@ -98,7 +98,7 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | Component | Responsibility | Source |
 | --- | --- | --- |
 | App entry | Runtime cache for the EXE; start Qt | `crfs_iq_recorder/__main__.py`, `run.py`, `paths.prepare_runtime` |
-| Main window / recording controller | Shared sensor header, **Manual Recording** and **Excel Collection** tabs with one controller of the sensor at a time and a reason line on the other tab's Start (1.13.0); band and time, Start, series with Pause/Resume/Stop, status, activity log, Excel toggle, Sensor Files; restores the last tab and form, never starts on its own | `gui.py` (`MainWindow`) |
+| Main window / recording controller | Shared sensor header, **Manual Recording** and **Excel Collection** tabs with one controller of the sensor at a time and a reason line on the other tab's Start (1.13.0); band and time, Start, series with Pause/Resume/Stop, status, activity log, Excel toggle, Sensor Files; restores the last tab and form, never starts on its own; buttons that start recordings are never default, take no focus on a click and react to Space only after Tab, and every request and every Excel Collection start or resume logs what triggered it (1.13.1) | `gui.py` (`MainWindow`), `start_button.py` |
 | Result card | "Last recording" card for both tabs: tag (Complete / Partial / Uncertain / Failed / Other range), Requested / Received / Recorded, separate recording / transfer / Excel states, Download / Open folder / View waterfall (1.13.0) | `result_view.py`, `result_card.py`, `desktop_open.py`, `waterfall_dialog.py`, `recording_download.py` |
 | Measured result | Duration, sample rate, centre and bandwidth read from the WAVE header and the CRFS `meta` trailer; result classes with a 2 % partial tolerance; nothing inferred from sizes or elapsed time (1.13.0) | `capture_measure.py` |
 | Diagnostics | Short operator sentences in the activity log; rotating diagnostic log (2 MB x 5) with payloads, replies and counted sensor messages; **Copy details** report with addresses, user folder, sensor position and stored secrets masked (1.13.0) | `diagnostic_log.py`, `diagnostic_report.py`, `operator_text.py` |

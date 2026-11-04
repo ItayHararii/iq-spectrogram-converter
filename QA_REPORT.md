@@ -1,10 +1,104 @@
-# QA report - CRFS IQ Recorder 1.13.0 / 1.12.0 / 1.11.0 / 1.10.0 / 1.9.1 / 1.9.0 / 1.8.10 / 1.8.9 and IQ Spectrogram Converter 1.5.1
+# QA report - CRFS IQ Recorder 1.13.1 / 1.13.0 / 1.12.0 / 1.11.0 / 1.10.0 / 1.9.1 / 1.9.0 / 1.8.10 / 1.8.9 and IQ Spectrogram Converter 1.5.1
 
-Eight passes plus a follow-up. Part G (3 November 2026, evening) sends every protocol row as one request, reads every result from the files, splits the window into the Manual Recording and Excel Collection tabs, and ran one hardware campaign through the final application; it found and fixed six defects (the most important one: downloads of a finished collection were lost when the next collection started or the app was closed) and produced Recorder 1.13.0. Part F (3 November 2026, late morning) is the complete end-to-end pass on the Node 100-18 after the 1.11.0 polish: manual recordings in both frequency modes, the SFTP browser, the Cellular Collection with the workbook open in Excel, locked, closed and restarted, connection faults, the executables, and the four presentation observations made on 1.11.0; it found and fixed five defects (the most important one: a scheduled pass whose time went by while the app was closed was started late on its own by *Continue*) and produced Recorder 1.12.0. Part E (3 November 2026, morning) polished the GUI - the Cellular Collection panel above all - and removed the measured window-construction and theme-switch slowness; it produced Recorder 1.11.0 with no change to recording, Excel or scheduling behaviour. Part D (2 November 2026, night) simplified the Cellular Collection to the operator's workflow (the protocol rows are the plan and the result rows, nine columns, compact panel, local-time pickers), fixed the four reliability faults found in the review of the 18:44 run and three more found on the sensor during this pass, and ran the complete path from capture to Excel on the Node 100-18; it produced Recorder 1.10.0. Part C.1 (2 November 2026, evening) ran the Cellular Collection against the operator's own protocol workbook, fixed the import defects that surfaced and added the results sheets in the protocol workbook; it produced Recorder 1.9.1. Part C (2 November 2026) added the Cellular Collection feature and produced Recorder 1.9.0. Part 0 (1 November 2026) fixed the "Time elapsed - file not confirmed" status, investigated why the Node splits recordings, and added the optional merge of recording parts; it produced Recorder 1.8.10 (the Converter did not need a change). Part 1 (31 October 2026) ran against the same RFeye Node and produced Recorder 1.8.9 and Converter 1.5.1. Part 2 (30 October 2026) is the earlier simulation-only pass that produced 1.8.8 / 1.5.0; all are kept unchanged below except where a later result supersedes a statement.
+Nine passes plus a follow-up. Part H (4 November 2026, morning) is an on-screen check of 1.13.0 on the operator's desktop, the investigation of the unexplained series start of 3 November with a guard on every way a recording can start, and a neutral Manual tab while an Excel run records; it fixed nine defects and produced Recorder 1.13.1. Part G (3 November 2026, evening) sends every protocol row as one request, reads every result from the files, splits the window into the Manual Recording and Excel Collection tabs, and ran one hardware campaign through the final application; it found and fixed six defects (the most important one: downloads of a finished collection were lost when the next collection started or the app was closed) and produced Recorder 1.13.0. Part F (3 November 2026, late morning) is the complete end-to-end pass on the Node 100-18 after the 1.11.0 polish: manual recordings in both frequency modes, the SFTP browser, the Cellular Collection with the workbook open in Excel, locked, closed and restarted, connection faults, the executables, and the four presentation observations made on 1.11.0; it found and fixed five defects (the most important one: a scheduled pass whose time went by while the app was closed was started late on its own by *Continue*) and produced Recorder 1.12.0. Part E (3 November 2026, morning) polished the GUI - the Cellular Collection panel above all - and removed the measured window-construction and theme-switch slowness; it produced Recorder 1.11.0 with no change to recording, Excel or scheduling behaviour. Part D (2 November 2026, night) simplified the Cellular Collection to the operator's workflow (the protocol rows are the plan and the result rows, nine columns, compact panel, local-time pickers), fixed the four reliability faults found in the review of the 18:44 run and three more found on the sensor during this pass, and ran the complete path from capture to Excel on the Node 100-18; it produced Recorder 1.10.0. Part C.1 (2 November 2026, evening) ran the Cellular Collection against the operator's own protocol workbook, fixed the import defects that surfaced and added the results sheets in the protocol workbook; it produced Recorder 1.9.1. Part C (2 November 2026) added the Cellular Collection feature and produced Recorder 1.9.0. Part 0 (1 November 2026) fixed the "Time elapsed - file not confirmed" status, investigated why the Node splits recordings, and added the optional merge of recording parts; it produced Recorder 1.8.10 (the Converter did not need a change). Part 1 (31 October 2026) ran against the same RFeye Node and produced Recorder 1.8.9 and Converter 1.5.1. Part 2 (30 October 2026) is the earlier simulation-only pass that produced 1.8.8 / 1.5.0; all are kept unchanged below except where a later result supersedes a statement.
 
-Releases: Recorder 1.13.0 (tag `v1.13.0`), Converter 1.5.1 (tag `converter-v1.5.1`). Previous: 1.12.0 (`v1.12.0`), 1.11.0 (`v1.11.0`), 1.10.0 (`v1.10.0`), 1.9.1 (`v1.9.1`), 1.9.0 (`v1.9.0`), 1.8.10 (`v1.8.10`), 1.8.9 (`v1.8.9`), 1.8.8 (`v1.8.8`), 1.5.0 (`converter-v1.5.0`), 1.8.7 (`v1.8.7`), 1.4.0 (`converter-v1.4.0`). All earlier releases stay on GitHub.
+Releases: Recorder 1.13.1 (tag `v1.13.1`), Converter 1.5.1 (tag `converter-v1.5.1`). Previous: 1.13.0 (`v1.13.0`), 1.12.0 (`v1.12.0`), 1.11.0 (`v1.11.0`), 1.10.0 (`v1.10.0`), 1.9.1 (`v1.9.1`), 1.9.0 (`v1.9.0`), 1.8.10 (`v1.8.10`), 1.8.9 (`v1.8.9`), 1.8.8 (`v1.8.8`), 1.5.0 (`converter-v1.5.0`), 1.8.7 (`v1.8.7`), 1.4.0 (`converter-v1.4.0`). All earlier releases stay on GitHub.
 
 Legend used throughout: **Hardware** = executed against the real sensor in this pass; **Simulated** = executed against the demo transport, a local proxy or synthetic files; **Untested** = not executed.
+
+---
+
+# Part H - On-screen check, the start guard and a neutral Manual tab (4 November 2026, Recorder 1.13.1)
+
+## Scope
+
+- **On-screen check of 1.13.0** on the operator's desktop. The released EXE ran as a separate, titled test instance with an isolated copy of the operator's settings: both tabs, light and dark, `QT_SCALE_FACTOR` 1.25 and 1.5, popups, the Last recording card, Sensor Files and the minimum window size. It used real mouse input on the test instance only, with a screenshot before every action. One short real recording was made.
+- **The unexplained series start of 3 November (21:44)** and the reload / Sensor Files events of 22:32-22:35: cause, and a guard on every way a recording can start.
+- **The Manual tab during an Excel run** must not show the Excel row's recording states.
+- **EXE check of 1.13.1.** The operator was working at the PC by then, so it was done through Windows UI Automation and `PrintWindow` on the second monitor, with no real mouse or keyboard input.
+
+## Findings
+
+| Id | Severity | Finding | Fix |
+| --- | --- | --- | --- |
+| H1 | **High** | **Code review and tests.** Start Recording was a default button, and a mouse click left the keyboard focus on it, so a later Enter or Space started another recording. In the Excel preview, Start was the dialog's default button, so Enter started the collection. Nothing else in the app starts a Manual series (see the investigation below). | The buttons that start recordings or collections are never default. A click leaves no focus on them, Enter is ignored, and Space works only after the operator moved there with Tab from an enabled control. Focus that lands on them because another control was disabled or hidden, or comes back on activation, does not arm them. Also: the preview dialog's Start is not default (Close is); Stop's question defaults to *No*; every request logs its trigger (`Start button (mouse)`, `(keyboard)`, `(program)`, `repeat series (n of N)`, the Excel row); a series logs *Repeat: recording n of N.*; a scheduled pass logs *Scheduled pass N started (set for HH:MM)*. Tests in `test_start_guard.py`. |
+| H2 | Medium | **Visible (1.13.0).** *Schedule* without a start time read *Ready to start* with Start enabled; the error came only after the click. The state badge said *Ready*. | Start is disabled with *Add at least one start time.*, the status reads *Schedule not set · N rows*, and the badge is neutral. Test `test_schedule_uses_the_pickers_and_the_local_clock`. |
+| H3 | Medium | **Visible (1.13.0).** The calendar opened below its field and reached the taskbar; in a lower window position it was cut off. The placement did not count the title bar or the dialog's minimum size. | Both are counted, and the popup flips above the field when the screen ends. Test `test_popups_count_the_title_bar_so_they_never_end_behind_the_taskbar`. |
+| H4 | Medium | **UI Automation (1.13.1 EXE).** Sensor Files was always fitted to the primary monitor. Opened from a main window on a 1920×1200 monitor at 150 %, it ran about 250 px below the work area. | Fitted to the main window's monitor, with room for the title bar (this applies to every window fitted to the screen). Test `test_sensor_files_fit_the_main_windows_screen_with_room_for_the_title_bar`. |
+| H5 | Medium | **Hardware (1.13.1 EXE).** While an Excel row recorded, the Manual tab's status line showed the Excel row's states (Part G, Info row). | The Manual tab shows *Idle* (muted) with *Excel Collection is running.* while another feature holds the sensor; its own states are unchanged. Test `test_manual_status_line_is_neutral_while_the_excel_collection_records`. |
+| H6 | Low | **Visible (1.13.0).** The Units list showed a scrollbar, and the Format list cut off *HDF5*. The list's own 1 px border was not counted in its height. | The inner border was removed (the popup frame already has one). Test `test_dropdown_lists_show_every_choice_without_a_scrollbar`. |
+| H7 | Low | **Visible (1.13.0).** The size estimate showed six decimals (*≈ 251.500692 MB*). | One decimal, or *< 0.1 MB*. Tests in `test_size_estimate.py`. |
+| H8 | Low | **Visible (1.13.0).** Sensor Files cut the file name (*iq_202611…_0001.wav*) despite free space, and showed *Modified* day-first while the regional format is month-first. | The Name column fits its contents, and dates follow the regional short format. Test `test_sftp_names_are_not_cut_and_dates_follow_the_regional_format`. |
+| H9 | Low | **Code review.** An Excel collection start, resume, continue, missed pass or retry did not say what triggered it. | `collection_started` carries the trigger (*Start button (…), then preview Start (…)*), and the other four log their button. Tests `test_an_excel_collection_logs_which_buttons_started_it`, `test_a_collection_start_names_its_trigger_in_the_log`. |
+
+Seen and **listed, not changed** in 1.13.1:
+- A stray *Storage unavailable* caption under the sensor card while disconnected, and *Sensor reconnecting…* before the first connection.
+- A manual-tab scrollbar with almost no range at 100 %.
+- The minimum window size (about 1065×723) is large for a small screen.
+- **See details** opens the Windows *Open with* chooser when no app is set for `.log`.
+- In dark, the disabled ghost buttons (Pause, Stop) look almost enabled and have no reason tooltip. Changing the style touches every outlined button.
+- Sensor Files: **Download** looks enabled before a file is selected, and the window opens over the main window.
+- Duplicate *Sensor connected.* / *Connected to CRFS 100-18.* lines.
+- The preview table is cramped.
+- *1 pass(es)* wording.
+- The *Missed pass* activity text gives its date day-first.
+- **Copy details** includes one about 4 KB event-stream line.
+- The slow first tab switch seen once was not reproduced; it followed a workbook load.
+
+## The unexplained series start (3 November) - investigation
+
+- **21:44:44.** Windows logs show the session locked and in Modern Standby from 21:26:38 to 21:57:51 (Kernel-Power 506/507, Winlogon 811/812), so no person pressed anything.
+- **What the app can do on its own.** The code paths and the tests show the app cannot start a Manual series by itself:
+  - a series begins only from Start's `clicked` signal;
+  - restore, the timers and the missed-pass logic never arm one.
+- **Most likely cause:** the previous pass's in-process test driver (a programmatic click, or a queued action run after a context reset). **Not proven.**
+- **22:32-22:35.** The session was unlocked (22:01:39-22:41:14) and in use. Most likely a person used the visible test window. **Not proven.**
+- **The real hazard found** is H1: a click left the focus on Start, so a later Space or Enter could start again.
+- **Tests** (`test_start_guard.py`, offscreen, with real key events through the window):
+  - Enter and Return in every Manual field (Repeat set to Count) and every Excel field start nothing;
+  - Enter on the Start buttons does nothing;
+  - a click leaves no focus;
+  - Space starts only after Tab from an enabled control, not after the focused control was disabled or hidden;
+  - restore never arms a series or a schedule;
+  - unlock- and standby-like sequences start nothing, on both tabs, with Start focused when the PC locks: another window activated, deactivate events, minimise, the link dropped, then restore, activate and screen-change events, the link back, and late Enter / Space;
+  - each request names its trigger.
+- **Mutation checks.** The guard, status-line, placement, date, schedule, Sensor Files and Excel-trigger tests were run against copies with their fix reverted (the old button, loose arming, the old phase line, the old placement, the old date text, no schedule check, the old badge, no screen argument, no title-bar room, the trigger dropped or not logged), and each failed there. The dropdown fix was checked by measurement (scroll range 1 → 0).
+
+## On-screen and EXE checks
+
+| Check | How | Result |
+| --- | --- | --- |
+| 1.13.0 EXE, both tabs, light and dark, `QT_SCALE_FACTOR` 1 / 1.25 / 1.5 | **Visible**, real mouse input on the test instance | Layouts fit. Findings H2, H3, H6-H8 and the listed items. A real Return key in the test window's *Recording time* field started nothing. |
+| 1.13.0 recording, 10 MHz × 1 s | **Visible**, real sensor | Live states and card shown; the file was downloaded to the isolated folder and later deleted from the Node. |
+| 1.13.1 EXE (09:19 build), Excel tab | **UI Automation**, no real input | *Schedule* without a time: *Schedule not set · 1 row*, *Add at least one start time.*, Start disabled. The badge still read *Ready*; fixed afterwards (H2) and rebuilt. *Run now*: *Ready to start · 1 row*, Start enabled. |
+| 1.13.1 EXE, pickers and lists | **UI Automation** | The time picker opened above its button, inside the work area. Units (kHz / MHz / GHz) and Format (WAVE / XDAT / NCP / HDF5) showed every choice with no scrollbar. The calendar did not open from its button under UI Automation (no error logged). |
+| 1.13.1 EXE, Excel run (1 row, 1 s) | **UI Automation, real sensor** | Identity checked by the app, then Start and the preview's Start. Meanwhile the Manual tab read *Idle* / *Excel Collection is running.*, with Start Recording disabled. *Completed 1 · Partial 0 · Failed 0 · Uncertain 0*; download verified by SHA-256. |
+| 1.13.1 EXE, Sensor Files, close | **UI Automation** | Full file name; *Modified* in the regional format. H4 found. The EXE closed normally. |
+| Rebuilt 1.13.1 (final artefacts) | Static | Both the portable EXE and the installer's payload were **blocked by Smart App Control** (WinError 4551; Code Integrity events 3033, 3077, 3089, 3118). No security setting was changed. Both EXEs' archives contain the final code (version, H2, H4 and H9 strings). Not run. |
+| Calendar and Sensor Files from source | **Real Windows platform**, demo, isolated settings | Under UI Automation the calendar opened and stayed inside the work area, flipped above the field. Sensor Files opened on the main window's monitor (1280×752 work area) with its whole frame inside. |
+
+Sensor files created by this pass (Node 100-18 `rfeye100400`, folder `20261104`): `iq_20261104_063851_0001.wav` (1.13.0 visible check) and `iq_20261104_074252_0001.wav` (1.13.1 Excel run). Both were deleted by exact name and size after an identity and idle check, and the folder was empty afterwards. Local copies stayed in the isolated test folder, which was deleted.
+
+## Incident notes
+
+- **Developer settings.** From a source checkout the app keeps its settings next to the code. The helper scripts of this pass loaded the connection settings from there, read only, until this was noticed. Through them, identity, mission-list and folder-listing calls reached the other sensor configured there (an R40-8); nothing was recorded or deleted on it. Source-run check windows also rewrote those settings (the last time at 09:38): most likely the last tab and the Excel schedule date. The previous values cannot be recovered, because the backup copy is rewritten with each save. Afterwards the helpers used only the isolated copy.
+- **One stray click (1.13.0 check).** The calendar closed between a screenshot and the next click, and that click landed on an empty spot of the window behind it (another application); it had no effect. The calendar also closed by itself once in that check.
+- **Suite output.** One full run printed a fragment of a fault-handler stack dump in its first part, while every test passed. The two later full runs did not show it. Likely a handled COM exception from the open-workbook check while Excel was open on the desktop. Not proven.
+
+## Not done / still to verify
+
+- The final 1.13.1 artefacts could not be run on this PC (Smart App Control, above). Their changes since the 09:19 build (H2 badge, H4, H9, the preview Start) are covered by the tests, the real-platform source check and the static check. The installer was not installed.
+- The calendar opened from its button in the EXE is not verified: it did not open under UI Automation, and it once closed by itself in the visible check. From source it opens and stays open.
+- A Manual recording through the 1.13.1 EXE was not made; its trigger logging is covered offscreen.
+
+## Test and release status
+
+| Item | Result |
+| --- | --- |
+| Recorder unit + GUI suite (offscreen Qt) | 490 collected: **488 pass, 2 skip** (no local copy of the protocol workbook), 0 fail, 84 s, on the final code before the build, not overlapping it. |
+| Build | `build_exe.bat` with `CRFS_BUILD_INSTALLER=1`, exit 0, 213 s: `dist\CRFS_IQ_Recorder.exe` 57,360,232 B (SHA-256 `623BDC52…25B870`), `dist\CRFS_IQ_Recorder_Setup.exe` 43,513,941 B (SHA-256 `70D0886C…25A6CA`), version resources 1.13.1. Not Authenticode-signed (unchanged). |
+| EXE test | The 09:19 build ran as the installer's payload (the portable EXE was blocked by Smart App Control), on the second monitor, driven by UI Automation with no real input, against the real Node; see above. The final rebuild: static check only. |
+| Git | Branch `cursor/polish-gui-easy-launch`, annotated tag `v1.13.1`, pushed to `personal`; GitHub Release `v1.13.1` with both files. 1.13.0 and older releases kept. |
 
 ---
 

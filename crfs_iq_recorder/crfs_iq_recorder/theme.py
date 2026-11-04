@@ -18,7 +18,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QImage, QPainter, QPainterPath, QPalette, QPen, QPixmap
-from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QStyle, QWidget
 
 LIGHT_MODE = "light"
 DARK_MODE = "dark"
@@ -727,7 +727,7 @@ QComboBox QAbstractItemView {{
     color: {p.text};
     selection-background-color: {p.accent};
     selection-color: #FFFFFF;
-    border: 1px solid {p.border};
+    border: none;
     outline: 0;
     padding: 0;
     margin: 0;
@@ -1243,10 +1243,6 @@ def format_display_date(value: datetime) -> str:
     return value.strftime("%d/%m/%Y")
 
 
-def format_display_datetime(value: datetime) -> str:
-    return value.strftime("%d/%m/%Y %H:%M:%S")
-
-
 def restyle(widget: QWidget) -> None:
     widget.style().unpolish(widget)
     widget.style().polish(widget)
@@ -1282,10 +1278,14 @@ def fit_window_to_screen(
     min_height: int = 360,
     margin: int = 24,
 ) -> None:
-    """Open inside the usable desktop, still resizable."""
+    """Open inside the usable desktop, still resizable.
+
+    The size is the inside of the window; its title bar comes on top, so room is
+    kept for it too."""
     geo = available_screen_rect(widget)
+    title = widget.style().pixelMetric(QStyle.PixelMetric.PM_TitleBarHeight) if widget.isWindow() else 0
     max_w = max(320, geo.width() - margin)
-    max_h = max(280, geo.height() - margin)
+    max_h = max(280, geo.height() - margin - title)
     min_w = min(min_width, max_w)
     min_h = min(min_height, max_h)
     widget.setMinimumSize(min_w, min_h)
@@ -1294,5 +1294,5 @@ def fit_window_to_screen(
     h = min(max(height, min_h), max_h)
     widget.resize(w, h)
     x = geo.x() + max(0, (geo.width() - w) // 2)
-    y = geo.y() + max(0, (geo.height() - h) // 2)
+    y = geo.y() + max(0, (geo.height() - h - title) // 2)
     widget.move(x, y)

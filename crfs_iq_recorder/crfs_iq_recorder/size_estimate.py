@@ -12,7 +12,7 @@ comparison; it was 17-46 % off whenever the bandwidth was not 5, 10, 20 or
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 
 from .constants import (
     DATASHEET_BYTES_PER_COMPLEX_SAMPLE,
@@ -141,7 +141,7 @@ def format_mb(value: Decimal) -> str:
 
 
 def format_estimate(mb: Decimal | float | int | str) -> str:
-    """Display MB until 1,000 MB, then GB, then TB. Calculation stays in MB."""
+    """Display MB (one decimal) until 1,000 MB, then GB, then TB. Calculation stays in MB."""
     value = mb if isinstance(mb, Decimal) else Decimal(str(mb))
     if value >= Decimal(1_000_000):
         tb = (value / Decimal(1_000_000)).quantize(Decimal("0.01"))
@@ -149,7 +149,10 @@ def format_estimate(mb: Decimal | float | int | str) -> str:
     if value >= Decimal(1000):
         gb = (value / Decimal(1000)).quantize(Decimal("0.01"))
         return f"{format(gb, 'f')} GB"
-    return f"{format_mb(value)} MB"
+    shown = value.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    if value > 0 and shown == 0:
+        return "< 0.1 MB"
+    return f"{format(shown, 'f')} MB"
 
 
 @dataclass(frozen=True)

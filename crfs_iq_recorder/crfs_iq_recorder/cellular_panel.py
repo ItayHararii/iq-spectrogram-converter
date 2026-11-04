@@ -80,6 +80,7 @@ from .diagnostic_log import diag
 from .json_store import read_json, write_json
 from .operator_text import clip
 from .result_card import ResultCard
+from .start_button import StartButton
 from .theme import CONTROL_H, LABEL_W, restyle
 from .waterfall_dialog import WaterfallDialog
 
@@ -226,8 +227,8 @@ class FieldLabel(QLabel):
         self.setFixedHeight(CONTROL_H)
 
 
-def _ghost(text: str, *, tooltip: str = "") -> QPushButton:
-    button = QPushButton(text)
+def _ghost(text: str, *, tooltip: str = "", starts: bool = False) -> QPushButton:
+    button = StartButton(text) if starts else QPushButton(text)
     button.setObjectName("ghost")
     button.setAutoDefault(False)
     button.setFixedHeight(CONTROL_H)
@@ -296,11 +297,15 @@ class PlanPreviewDialog(QDialog):
             box.setPlainText("\n".join(i.message for i in problems))
             layout.addWidget(box)
         buttons = QDialogButtonBox()
+        self.start_button: StartButton | None = None
         if start_label:
-            ok = buttons.addButton(start_label, QDialogButtonBox.ButtonRole.AcceptRole)
+            ok = StartButton(start_label)
             ok.setObjectName("primary")
             ok.setEnabled(plan.ready)
-        buttons.addButton(QDialogButtonBox.StandardButton.Close)
+            buttons.addButton(ok, QDialogButtonBox.ButtonRole.AcceptRole)
+            self.start_button = ok
+        close = buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        close.setDefault(True)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -342,6 +347,7 @@ class CellularPanel(QFrame):
         self._import_token = 0
         self._importing = False
         self._identity_pending = False
+        self._start_trigger = ""
         self._host_paused = False
         self._built = False
         self._details_open = False
@@ -397,17 +403,16 @@ class CellularPanel(QFrame):
         row.addLayout(texts, 1)
         self.preview_btn = _ghost("Preview", tooltip="The rows that will be recorded, in order, with the requested range of each")
         self.preview_btn.clicked.connect(lambda: self._show_preview(start=False))
-        self.start_btn = QPushButton("Start")
+        self.start_btn = StartButton("Start")
         self.start_btn.setObjectName("primary")
-        self.start_btn.setAutoDefault(False)
         self.start_btn.setMinimumWidth(96)
         self.start_btn.setAccessibleName("Start Excel Collection")
         self.start_btn.setToolTip("Check the connected sensor, show the preview, then record the rows")
         self.start_btn.clicked.connect(self._start_clicked)
         self.pause_btn = _ghost("Pause", tooltip="Pauses after the current recording")
         self.pause_btn.clicked.connect(self.runner.pause)
-        self.resume_btn = _ghost("Resume", tooltip="Continue with the next recording")
-        self.resume_btn.clicked.connect(self.runner.resume)
+        self.resume_btn = _ghost("Resume", tooltip="Continue with the next recording", starts=True)
+        self.resume_btn.clicked.connect(self._resume_clicked)
         self.stop_btn = _ghost("Stop", tooltip=STOP_TOOLTIP)
         self.stop_btn.clicked.connect(self._stop)
         for button in (self.preview_btn, self.start_btn, self.pause_btn, self.resume_btn, self.stop_btn):
@@ -461,11 +466,11 @@ class CellularPanel(QFrame):
         rec_buttons.setSpacing(8)
         self.reconcile_btn = _ghost("Check with the sensor")
         self.reconcile_btn.clicked.connect(self._reconcile)
-        self.resume_session_btn = _ghost("Continue")
+        self.resume_session_btn = _ghost("Continue", starts=True)
         self.resume_session_btn.clicked.connect(self._resume_after_restart)
         self.skip_uncertain_btn = _ghost("Skip uncertain")
         self.skip_uncertain_btn.clicked.connect(self._skip_uncertain)
-        self.run_missed_btn = _ghost("Run the missed pass now")
+        self.run_missed_btn = _ghost("Run the missed pass now", starts=True)
         self.run_missed_btn.clicked.connect(self._run_missed)
         self.skip_missed_btn = _ghost("Skip it")
         self.skip_missed_btn.clicked.connect(self._skip_missed)
@@ -495,6 +500,7 @@ class CellularPanel(QFrame):
         self.retry_btn = _ghost(
             "Retry failed rows",
             tooltip="Checks uncertain rows with the sensor first, then sends the failed rows again. Completed and partial rows are kept.",
+            starts=True,
         )
         self.retry_btn.clicked.connect(self._retry_failed)
         self.pass_hint = QLabel("")
@@ -720,6 +726,10 @@ class CellularPanel(QFrame):
         body.addLayout(grid)
         self._on_schedule_mode(self.run_times.isChecked())
         self._on_daily(self.daily_check.isChecked())
+        self.run_times.toggled.connect(self._schedule_edited)
+        self.daily_check.toggled.connect(self._schedule_edited)
+        self.date_field.changed.connect(self._schedule_edited)
+        self.times_field.changed.connect(self._schedule_edited)
 
     # ------------------------------------------------------------------ small helpers
     def _apply_wait_range(self, minutes: bool) -> None:
@@ -1124,15 +1134,18 @@ class CellularPanel(QFrame):
         )
         try:
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            confirmed = dialog.start_button.take_trigger() if dialog.start_button is not None else "program"
         finally:
             dialog.deleteLater()
         if not accepted or not start:
             return
+        self._start_trigger = f"{self._start_trigger or 'direct call'}, then preview Start ({confirmed})"
         self._start(schedule)
 
     # ------------------------------------------------------------------ start / stop
     def _start_clicked(self) -> None:
         """Verify the sensor's identity first, then preview (which explains any subdivision) and start."""
+        self._start_trigger = f"Start button ({self.start_btn.take_trigger()})"
         if self.plan is None:
             QMessageBox.information(self, "Excel Collection", "Load a protocol workbook first.")
             return
@@ -1178,7 +1191,8 @@ class CellularPanel(QFrame):
         settings = self._campaign_settings()
         self.settings.last_sensor = {"model": settings.sensor_model, "serial": settings.sensor_serial}
         save_panel_settings(self._config_dir, self.settings)
-        error = self.runner.start_session(self.plan, schedule, settings, protocol_snapshot=self._snapshot_path)
+        trigger, self._start_trigger = self._start_trigger or "direct call", ""
+        error = self.runner.start_session(self.plan, schedule, settings, protocol_snapshot=self._snapshot_path, trigger=trigger)
         if error:
             QMessageBox.warning(self, "Excel Collection", error)
         else:
@@ -1192,6 +1206,7 @@ class CellularPanel(QFrame):
                 "Stop collection",
                 "The current recording finishes and is written to Excel; nothing else is recorded. Stop?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
@@ -1214,7 +1229,7 @@ class CellularPanel(QFrame):
             elif state == S_DONE and text.startswith("Finished with problems"):
                 chip_style = "badgeWait"
             self._set_chip(chip_text, chip_style)
-        elif self.plan is not None and self.plan.ready and not self._importing:
+        elif self.plan is not None and self.plan.ready and not self._importing and not self._schedule_problem():
             self._set_chip("Ready", "badgeOk")
         else:
             self._set_chip("Idle", "badgeIdle")
@@ -1275,7 +1290,8 @@ class CellularPanel(QFrame):
                 self.status_label.setText("Load a protocol workbook")
             elif self.plan.ready:
                 # Short enough for the pinned bar; the full summary line is in the form.
-                self.status_label.setText(f"Ready to start · {_plural(len(self.plan.tasks), 'row')}")
+                lead = "Schedule not set" if self._schedule_problem() else "Ready to start"
+                self.status_label.setText(f"{lead} · {_plural(len(self.plan.tasks), 'row')}")
             else:
                 self.status_label.setText("Fix the problems listed in Preview before starting")
         details = self._background_details(status)
@@ -1318,6 +1334,7 @@ class CellularPanel(QFrame):
         self.pass_box.setVisible(True)
 
     def _retry_failed(self) -> None:
+        self._log_trigger("retry failed rows", self.retry_btn)
         round_id = str(self.runner.status().get("last_round_id") or "")
         self.retry_btn.setEnabled(False)
         self.pass_hint.setText("Checking with the sensor…")
@@ -1369,7 +1386,15 @@ class CellularPanel(QFrame):
             return NO_WORKBOOK
         if not ready:
             return "Fix the problems listed in Preview first."
-        return ""
+        return self._schedule_problem()
+
+    def _schedule_problem(self) -> str:
+        if not self._built:
+            return ""
+        return self._schedule()[1] or ""
+
+    def _schedule_edited(self, *_args) -> None:
+        self._on_status(self.runner.status())
 
     def _sync_buttons(self, status: dict) -> None:
         state = status.get("state", S_IDLE)
@@ -1472,7 +1497,15 @@ class CellularPanel(QFrame):
 
         self.runner.reconcile(done)
 
+    def _log_trigger(self, action: str, button: StartButton) -> None:
+        diag("excel_request", action, trigger=f"{button.text()} button ({button.take_trigger()})")
+
+    def _resume_clicked(self) -> None:
+        self._log_trigger("resume", self.resume_btn)
+        self.runner.resume()
+
     def _resume_after_restart(self) -> None:
+        self._log_trigger("continue after restart", self.resume_session_btn)
         error = self.runner.resume_after_restart()
         if error:
             QMessageBox.warning(self, "Continue", error)
@@ -1488,6 +1521,7 @@ class CellularPanel(QFrame):
         missed = self.runner.status().get("missed_rounds") or []
         if not missed:
             return
+        self._log_trigger("run missed pass", self.run_missed_btn)
         error = self.runner.run_missed_round(missed[0])
         if error:
             QMessageBox.warning(self, "Missed pass", error)

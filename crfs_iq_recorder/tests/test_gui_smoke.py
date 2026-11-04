@@ -106,7 +106,7 @@ def test_gui_default_payload(qapp):
         assert scan["duration"] == scan["rate"] == scan["capture_length"] == 0.1
         assert scan["recording_format"] == "WAVE"
         # 12.5 MHz is recorded at 15.625 MS/s: 0.1 s -> about 6.29 MB (measured 6.285 MB per 0.1 s).
-        assert "6.288192" in window.size_label.text()
+        assert window.size_label.text() == "Estimate ≈ 6.3 MB"
         assert "Estimate" in window.size_label.text()
         assert window._conn.demo is True
         assert window.model_value.text() == "R100-18"
@@ -221,6 +221,86 @@ def test_sftp_window_fills_demo_listing_without_crashing(qapp):
             time.sleep(0.05)
         qapp.processEvents()
         assert window.table.topLevelItemCount() >= 1
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_sftp_names_are_not_cut_and_dates_follow_the_regional_format(qapp, monkeypatch):
+    import re
+
+    from PySide6.QtCore import QLocale
+
+    from crfs_iq_recorder import cellular_pickers
+    from crfs_iq_recorder.connection_state import ConnectionState
+    from crfs_iq_recorder.sftp_window import SftpWindow
+
+    us = QLocale(QLocale.Language.English, QLocale.Country.UnitedStates)
+    monkeypatch.setattr(cellular_pickers, "system_locale", lambda: us)
+    window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
+    try:
+        window.resize(1100, 700)
+        window.show()
+        _wait_listing(window, qapp)
+        qapp.processEvents()
+        names = [name for name in _top_texts(window) if name]
+        assert names
+        widest = max(window.table.fontMetrics().horizontalAdvance(name) for name in names)
+        assert window.table.columnWidth(1) >= widest
+        dates = [text for text in _top_texts(window, 3) if text]
+        assert dates and all(re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2} \d{1,2}:\d{2} [AP]M", text) for text in dates), dates
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_sensor_files_fit_the_main_windows_screen_with_room_for_the_title_bar(qapp, monkeypatch):
+    """1.13.1: on a 1280 x 752 work area (1920 x 1200 at 150 %) the window ran 250 px under the taskbar."""
+    from PySide6.QtCore import QRect
+    from PySide6.QtWidgets import QStyle
+
+    from crfs_iq_recorder import gui, theme
+    from crfs_iq_recorder.gui import MainWindow
+
+    small = QRect(3840, 1259, 1280, 752)
+    monkeypatch.setattr(theme, "available_screen_rect", lambda _widget=None: small)
+    screens = []
+    real = gui.SftpWindow
+
+    def make(*args, **kwargs):
+        screens.append(kwargs.get("screen"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(gui, "SftpWindow", make)
+    window = MainWindow(demo=True)
+    try:
+        window._open_sftp()
+        files = window._sftp_win
+        assert files is not None and screens == [window.screen()]
+        title = files.style().pixelMetric(QStyle.PixelMetric.PM_TitleBarHeight)
+        margin = 24
+        assert title > 0 and files.height() + title + margin <= small.height()
+        assert files.y() >= small.top() and files.y() + files.height() + title <= small.bottom() + 1
+    finally:
+        if window._sftp_win is not None:
+            window._sftp_win.close()
+        window.close()
+        qapp.processEvents()
+
+
+def test_dropdown_lists_show_every_choice_without_a_scrollbar(qapp):
+    from crfs_iq_recorder.gui import MainWindow
+
+    window = MainWindow(demo=True)
+    try:
+        window.show()
+        qapp.processEvents()
+        for combo in (window.unit_combo, window.format_combo, window.wait_unit):
+            combo.showPopup()
+            qapp.processEvents()
+            assert combo.view().verticalScrollBar().maximum() == 0, [combo.itemText(i) for i in range(combo.count())]
+            combo.hidePopup()
+            qapp.processEvents()
     finally:
         window.close()
         qapp.processEvents()

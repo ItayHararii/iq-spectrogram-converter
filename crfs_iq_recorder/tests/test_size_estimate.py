@@ -80,7 +80,9 @@ def test_empirical_format_keeps_expected_digits():
 
 
 def test_estimate_switches_to_gb_and_tb():
-    assert format_estimate(Decimal("7.631375")) == "7.631375 MB"
+    assert format_estimate(Decimal("7.631375")) == "7.6 MB"
+    assert format_estimate(Decimal("62.875692")) == "62.9 MB"
+    assert format_estimate(Decimal("0.04")) == "< 0.1 MB"
     assert format_estimate(Decimal("2442.04")) == "2.44 GB"
     assert format_estimate(Decimal("1000")) == "1.00 GB"
     assert format_estimate(Decimal("1000000")) == "1.00 TB"

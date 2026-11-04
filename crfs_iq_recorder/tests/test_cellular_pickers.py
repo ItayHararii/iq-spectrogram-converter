@@ -319,6 +319,33 @@ def test_times_field_does_not_reserve_a_row_per_chip_when_they_fit_on_one(qapp, 
         host.close()
 
 
+def test_popups_count_the_title_bar_so_they_never_end_behind_the_taskbar(qapp, monkeypatch):
+    from PySide6.QtCore import QMargins, QPoint, QRect
+    from PySide6.QtWidgets import QDialog, QWidget
+
+    work_area = QRect(0, 0, 1920, 1040)  # above a 40 px taskbar
+    monkeypatch.setattr(pickers, "available_screen_rect", lambda _widget=None: work_area)
+    monkeypatch.setattr(pickers, "_frame_margins", lambda _dialog: QMargins(8, 31, 8, 8))
+    anchor = QWidget()
+    anchor.resize(200, 30)
+    dialog = QDialog()
+    dialog.resize(300, 400)
+    try:
+        # 410 px below the field: room for the contents (400) but not with the title bar (439).
+        anchor.move(100, 1040 - 410 - 4 - 30)
+        pickers._place_under(dialog, anchor)
+        assert dialog.y() + 439 <= anchor.mapToGlobal(QPoint(0, 0)).y(), "flipped above the field"
+        anchor.move(100, 100)
+        pickers._place_under(dialog, anchor)
+        assert dialog.y() == anchor.mapToGlobal(QPoint(0, 34)).y(), "just below the field when it fits"
+        anchor.move(1900, 100)
+        pickers._place_under(dialog, anchor)
+        assert dialog.x() + 316 <= 1920, "the whole frame stays on the screen"
+    finally:
+        dialog.close()
+        anchor.close()
+
+
 def test_date_field_takes_the_date_chosen_in_the_popup(qapp, us_locale):
     field = DateField(date(2026, 11, 2))
     spy = _Spy(field.changed)

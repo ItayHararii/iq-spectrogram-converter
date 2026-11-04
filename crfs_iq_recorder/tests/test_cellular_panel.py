@@ -253,9 +253,17 @@ def test_schedule_uses_the_pickers_and_the_local_clock(qapp, tmp_path):
         assert panel.schedule_box.isVisibleTo(panel.body) and not panel.repeat_spin.isVisibleTo(panel.body)
         schedule, error = panel._schedule()
         assert schedule is None and "start time" in error
+        # Schedule without a start time is not "Ready": Start waits and says why.
+        assert not panel.start_btn.isEnabled()
+        assert panel.reason_label.text() == "Add at least one start time." and not panel.reason_label.isHidden()
+        assert panel.status_label.text().startswith("Schedule not set · ")
+        assert panel.chip.text() == "Idle", "the badge agrees with the status line"
         panel.times_field.set_times([dtime(20, 0), dtime(8, 0)])
         panel.daily_check.setChecked(False)
         panel.date_field.set_date(date.today())
+        assert panel.start_btn.isEnabled() and panel.reason_label.isHidden()
+        assert panel.status_label.text().startswith("Ready to start · ")
+        assert panel.chip.text() == "Ready"
         schedule, error = panel._schedule()
         assert error is None and schedule.mode == MODE_TIMES
         assert schedule.times == [dtime(8, 0), dtime(20, 0)] and schedule.dates == [date.today()] and schedule.daily is False

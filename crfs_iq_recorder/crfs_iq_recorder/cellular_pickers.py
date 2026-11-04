@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 
-from PySide6.QtCore import QDate, QEvent, QLocale, QPoint, QRect, QSize, Qt, QTime, Signal
+from PySide6.QtCore import QDate, QEvent, QLocale, QMargins, QPoint, QRect, QSize, Qt, QTime, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -148,15 +148,29 @@ def _flat(button: QPushButton, name: str, size: int | None = None) -> QPushButto
     return button
 
 
+def _frame_margins(dialog: QDialog) -> QMargins:
+    dialog.winId()
+    handle = dialog.windowHandle()
+    return handle.frameMargins() if handle is not None else QMargins()
+
+
 def _place_under(dialog: QDialog, anchor: QWidget) -> None:
-    """Drop the dialog just below the field, flipped above it when the screen ends."""
-    width, height = dialog.width(), dialog.height()
+    """Drop the dialog just below the field, flipped above it when the screen ends.
+
+    The title bar and the layout's minimum size only apply once the window
+    exists, so both are counted here; otherwise the window can end up behind
+    the taskbar."""
+    size = dialog.size().expandedTo(dialog.minimumSizeHint())
+    frame = _frame_margins(dialog)
+    width = size.width() + frame.left() + frame.right()
+    height = size.height() + frame.top() + frame.bottom()
+    gap = 4 if frame.top() else 40
     screen = available_screen_rect(anchor)
     below = anchor.mapToGlobal(QPoint(0, anchor.height() + 4))
-    x = min(max(below.x(), screen.left()), max(screen.left(), screen.right() - width))
+    x = min(max(below.x(), screen.left()), max(screen.left(), screen.right() + 1 - width))
     y = below.y()
-    if y + height > screen.bottom():
-        y = max(screen.top(), anchor.mapToGlobal(QPoint(0, 0)).y() - height - 40)
+    if y + height > screen.bottom() + 1:
+        y = max(screen.top(), anchor.mapToGlobal(QPoint(0, 0)).y() - height - gap)
     dialog.move(x, y)
 
 
