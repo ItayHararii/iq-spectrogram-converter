@@ -899,6 +899,43 @@ def test_link_indicators_follow_failures_and_restore(qapp):
         window.close()
 
 
+def test_one_shot_sensor_checks_close_their_http_session(qapp):
+    """Node 40-8, 5 Nov: a window left open for 50 minutes held about 300 established
+    sockets to the sensor, one per 10 s link check, because each check built its own
+    client and never closed the keep-alive session."""
+    from crfs_iq_recorder.api_client import EmpClient, RawResponse
+    from crfs_iq_recorder.gui import MainWindow
+
+    closed: list[str] = []
+
+    class Transport:
+        def __init__(self, label):
+            self.label = label
+
+        def request(self, method, url, **kwargs):
+            return RawResponse(status_code=200, text='{"name": "demo"}', headers={}, elapsed_s=0.0, url=url)
+
+        def close(self):
+            closed.append(self.label)
+
+    window = MainWindow(demo=True)
+    try:
+        window._link_timer.stop()
+        window._storage_timer.stop()
+        labels = iter(("link", "info"))
+        window._client = lambda: EmpClient(transport=Transport(next(labels)), demo=True, tcp_probe_fn=lambda *a: (True, ""))  # type: ignore[method-assign]
+        window._conn.demo = False
+        window._conn.host = "203.0.113.5"
+        window._start_link_check(force=True)
+        assert _pump_until(qapp, lambda: "link" in closed, timeout=5.0), closed
+        window._refresh_sensor_info()
+        assert _pump_until(qapp, lambda: "info" in closed, timeout=5.0), closed
+    finally:
+        window._conn.demo = True
+        window.close()
+        qapp.processEvents()
+
+
 def test_storage_failure_does_not_change_api_link(qapp):
     from crfs_iq_recorder.gui import MainWindow
     from crfs_iq_recorder.sensor_storage import StorageSnapshot

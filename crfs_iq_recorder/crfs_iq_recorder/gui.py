@@ -205,6 +205,14 @@ TAB_EXCEL = "Excel Collection"
 _SEE_DETAILS = re.compile(r"\s*See (the )?(diagnostic log|details)\.\s*$")
 
 
+def _close_client(client: Any) -> None:
+    """Release a one-shot client's HTTP session (and its keep-alive socket) on the worker thread."""
+    try:
+        client.close()
+    except Exception:  # noqa: BLE001 - the result matters, the cleanup must not
+        pass
+
+
 def configure_appearance(app: QApplication, mode: str | None = None) -> None:
     apply_theme(app, mode)
 
@@ -1665,6 +1673,10 @@ class MainWindow(QMainWindow):
                 return token, ok, detail
             except Exception as exc:
                 return token, False, str(exc) or "Sensor check failed"
+            finally:
+                # One client per check: without this the keep-alive socket of every
+                # 10 s poll stayed open (about 300 after 50 minutes on the Node 40-8).
+                _close_client(client)
 
         self._start_job(work, self._show_link_result, link=True, link_token=token)
 
@@ -1833,7 +1845,10 @@ class MainWindow(QMainWindow):
         host_at_start = host
 
         def work() -> tuple[int, str, SensorInfo]:
-            return token, host_at_start, client.fetch_sensor_info(target, password)
+            try:
+                return token, host_at_start, client.fetch_sensor_info(target, password)
+            finally:
+                _close_client(client)
 
         self._start_job(work, self._show_sensor_info_result, info=True, info_token=token)
 
@@ -2479,7 +2494,10 @@ class MainWindow(QMainWindow):
         password = self._conn.http_password
 
         def work() -> SensorInfo:
-            return client.fetch_sensor_info(target, password)
+            try:
+                return client.fetch_sensor_info(target, password)
+            finally:
+                _close_client(client)
 
         def apply(result: Any) -> None:
             info = result if isinstance(result, SensorInfo) else blank_info(host=host, status="Unavailable")
@@ -2528,10 +2546,7 @@ class MainWindow(QMainWindow):
                     _time.sleep(max(float(poll_s), 0.5))
                     waited += max(float(poll_s), 0.5)
             finally:
-                try:
-                    client.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                _close_client(client)
             return {"available": last.available, "recording": list(last.recording), "error": last.error, "waited_s": waited}
 
         def apply(result) -> None:

@@ -112,7 +112,7 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | HTTP client | Identity GETs, `POST /emp/`, connection test `GET /`, link probe | `api_client.py`, `sensor_info.py` |
 | Demo HTTP | In-process fake Node; no sockets | `demo.py` |
 | Size estimate | `61.051 * (BW / 10 MHz) * seconds` MB; used for the label and storage gate | `size_estimate.py`, `sensor_storage.py` |
-| Link monitor | HTTP reachability every 10 s; SFTP errors stay in Sensor Files | `connection_monitor.py` |
+| Link monitor | HTTP reachability every 10 s; SFTP errors stay in Sensor Files. Each check, sensor-info refresh and mission-list read uses a one-shot client that closes its HTTP session on the worker thread (1.16.0: a window left open held one keep-alive socket per check, about 300 after 50 minutes) | `connection_monitor.py`, `gui.py` |
 | IQ storage | SFTP `statvfs` on `/mnt/1/remdata/`; block Start if the estimate plus margin would not fit | `sensor_storage.py` |
 | Recording history | Save requested Hz/time; match remote files to that Start | `recording_history.py` |
 | File watch | Stable SFTP size for every recording's parts, including the parts the sensor named in its EMP stream (1.8.10: always on, not only with Excel or Repeat) | `file_watch.py` |
