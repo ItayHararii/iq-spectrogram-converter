@@ -148,7 +148,11 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         _load(panel, qapp, book)
         assert panel.imported is not None and panel.plan is not None
         assert panel.import_label.text() == "2 rows · 5 s per request · 10 s between recordings · 1 pass", panel.import_label.text()
-        assert "Estimate only" in panel.details_label.text() and panel.details_btn.isVisibleTo(panel.body)
+        # No Details button or explanatory paragraph in the form: the estimate is a tooltip and a diagnostic entry.
+        assert not hasattr(panel, "details_btn") and not hasattr(panel, "details_label")
+        assert "Estimate only" in panel.import_label.toolTip()
+        assert not panel.open_written_btn.isEnabled() and panel.open_written_btn.toolTip() == "No results have been saved to a workbook yet."
+        assert panel.readiness_btn.isEnabled() and panel.readiness_label.isHidden()
         assert panel.plan.ready and panel.start_btn.isEnabled()
         assert [t.direction for t in panel.plan.tasks] == ["UL", "DL"], "worksheet order"
         panel.duration_spin.setValue(1.0)
@@ -192,9 +196,13 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         assert panel.retry_btn.isHidden(), "nothing failed, nothing to retry"
         card = panel.result_card
         assert not card.isHidden() and card.title.text().startswith("Row 2 of 2: ")
-        assert card.requested.text() == "Requested: 10 MHz for 1 s" and card.received.text().startswith("Received (read from the files): 1 file, ")
-        assert card.tag.text() == "Complete" and "Saved locally" in card.states.text()
-        assert card.open_btn.isEnabled() and card.waterfall_btn.isEnabled()
+        assert card.facts.text().startswith("1 file · "), card.facts.text()
+        assert card.tag.text() == "Complete" and card.states.text().startswith("Recording complete · Download saved")
+        assert card.open_btn.isEnabled() and not hasattr(card, "waterfall_btn")
+        # The files went into the sensor's dated folder under the download root.
+        local = Path(card.view.local_paths[0])
+        remote = card.view.remote_paths[0]
+        assert local.parent.name == remote.replace("\\", "/").rsplit("/", 2)[-2] and local.is_file()
         assert window._external_owner == ""
         panel._discard()
         qapp.processEvents()
@@ -591,6 +599,10 @@ def test_chip_says_stopped_when_the_operator_stopped_the_collection(qapp, tmp_pa
         assert (panel.chip.text(), panel.chip.objectName()) == ("Finished", "badgeWait")
         panel._on_status({"state": S_DONE, "text": "Finished", "active": False})
         assert (panel.chip.text(), panel.chip.objectName()) == ("Finished", "badgeOk")
+        # 1.16.0 EXE check: the bar read "Finished  Finished" (chip plus status line).
+        assert panel.status_label.text() == ""
+        panel._on_status({"state": S_DONE, "text": "Finished with problems", "active": False})
+        assert panel.status_label.text() == "Finished with problems"
     finally:
         window.close()
         qapp.processEvents()

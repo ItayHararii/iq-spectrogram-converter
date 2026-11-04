@@ -129,10 +129,11 @@ def test_auto_merge_runs_once_after_all_parts_are_downloaded(qapp, tmp_path):
     from crfs_iq_recorder.gui import MainWindow
     from crfs_iq_recorder.iq_merge import inspect_part, read_sidecar
 
-    names, blobs, _directory = publish_node_parts(tmp_path)
+    names, blobs, directory = publish_node_parts(tmp_path)
     window = MainWindow(demo=True)
-    downloads = tmp_path / "downloads"
-    window._conn.download_dir = str(downloads)
+    root = tmp_path / "downloads"
+    window._conn.download_dir = str(root)
+    downloads = root / directory.rstrip("/").rsplit("/", 1)[-1]  # the sensor's dated folder, mirrored
     window.merge_check.setChecked(True)
     merged: list = []
     window._merge.merged.connect(lambda stem, result: merged.append((stem, result)))
@@ -176,7 +177,7 @@ def test_auto_merge_runs_once_after_all_parts_are_downloaded(qapp, tmp_path):
 
     # A fresh application instance remembers the merge as well (registry on disk).
     again = MainWindow(demo=True)
-    again._conn.download_dir = str(downloads)
+    again._conn.download_dir = str(root)
     again.merge_check.setChecked(True)
     merged_again: list = []
     again._merge.merged.connect(lambda stem, result: merged_again.append(stem))
@@ -197,10 +198,11 @@ def test_toggle_off_leaves_downloads_alone_and_manual_merge_fetches_missing_part
     from crfs_iq_recorder import sftp_window as sftp_module
     from crfs_iq_recorder.gui import MainWindow
 
-    names, blobs, _directory = publish_node_parts(tmp_path)
+    names, blobs, directory = publish_node_parts(tmp_path)
     window = MainWindow(demo=True)
-    downloads = tmp_path / "downloads"
-    window._conn.download_dir = str(downloads)
+    root = tmp_path / "downloads"
+    window._conn.download_dir = str(root)
+    downloads = root / directory.rstrip("/").rsplit("/", 1)[-1]  # the sensor's dated folder, mirrored
     assert window.merge_check.isChecked() is False
     merged: list = []
     window._merge.merged.connect(lambda stem, result: merged.append(result))

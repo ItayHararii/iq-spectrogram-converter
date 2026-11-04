@@ -16,21 +16,30 @@ class RecordingDownload(QObject):
     finished = Signal(list)  # local paths, in the sensor's order
     failed = Signal(str)
 
-    def __init__(self, conn, remote_paths: list[str], sizes: dict[str, int], folder: Path, parent=None) -> None:
+    def __init__(self, conn, remote_paths: list[str], sizes: dict[str, int], folder: Path, parent=None, *, sensor: str = "") -> None:
         super().__init__(parent)
         self._conn = conn
         self._remote = list(remote_paths)
         self._sizes = dict(sizes)
         self._folder = Path(folder)
+        self._sensor = str(sensor or "")
         self._index = 0
         self._local: list[str] = []
         self._cancel = threading.Event()
         self._thread: QThread | None = None
         self._worker = None
+        # Destinations mirror the sensor's dated folder; all parts of the recording share one folder.
+        self._destinations: dict[str, Path] = {}
 
     def start(self) -> None:
+        from .download_paths import plan_destinations
+
         try:
             self._folder.mkdir(parents=True, exist_ok=True)
+            self._destinations = plan_destinations(self._folder, self._remote, lambda p: int(self._sizes.get(p, 0) or 0), sensor=self._sensor)
+            folders = {path.parent for path in self._destinations.values()}
+            for sub in folders:
+                sub.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             diag("download_failed", "download folder unavailable", error=str(exc))
             self.failed.emit("The download folder cannot be used. Check Settings.")
@@ -52,7 +61,7 @@ class RecordingDownload(QObject):
         while self._index < len(self._remote):
             remote = self._remote[self._index]
             name = remote.replace("\\", "/").rsplit("/", 1)[-1]
-            local = self._folder / name
+            local = self._destinations.get(remote) or (self._folder / name)
             size = int(self._sizes.get(remote, 0) or 0)
             if local.is_file() and size > 0 and local.stat().st_size == size:
                 diag("download_present", name, size=size)

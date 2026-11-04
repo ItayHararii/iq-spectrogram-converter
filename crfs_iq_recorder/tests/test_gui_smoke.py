@@ -577,9 +577,9 @@ def test_sftp_table_shows_saved_recording_parameters(qapp, tmp_path):
     window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
     try:
         _wait_listing(window, qapp)
-        assert window.table.columnCount() == 12
+        assert window.table.columnCount() == 13
         assert _header_text(window, 4) == "Req. start (MHz)" and _header_text(window, 8) == "Req. duration (s)"
-        assert [_header_text(window, c) for c in (9, 10, 11)] == ["Recorded (MHz)", "Recorded (s)", "Rate (MS/s)"]
+        assert [_header_text(window, c) for c in (9, 10, 11, 12)] == ["Recorded (MHz)", "Recorded (s)", "Rate (MS/s)", "Local copy"]
 
         def rows():
             items = (window.table.topLevelItem(i) for i in range(window.table.topLevelItemCount()))
@@ -657,22 +657,26 @@ def test_sftp_begin_downloads_uses_fixed_folder_without_dialogs(qapp, tmp_path, 
         files = [entry for entry in window._entries if not entry.is_dir]
         assert len(files) >= 2
         window._begin_downloads(files[:2])
+        # Saved under the sensor's dated folder (from the remote path, not the computer's date).
+        dated = dest / files[0].path.replace("\\", "/").rsplit("/", 2)[-2]
         deadline = time.time() + 4
         while time.time() < deadline:
             qapp.processEvents()
             if (
-                (dest / files[0].name).is_file()
-                and (dest / files[1].name).is_file()
+                (dated / files[0].name).is_file()
+                and (dated / files[1].name).is_file()
                 and not window._dl_active
                 and not window._busy
             ):
                 break
             time.sleep(0.05)
-        assert dest.is_dir()
-        assert (dest / files[0].name).is_file()
-        assert (dest / files[1].name).is_file()
-        existing = dest / files[0].name
-        renamed = dest / f"{Path(files[0].name).stem} (2){Path(files[0].name).suffix}"
+        assert dest.is_dir() and dated.is_dir() and dated.parent == dest
+        assert (dated / files[0].name).is_file()
+        assert (dated / files[1].name).is_file()
+        # The table says so in place, without a refresh.
+        assert window._items_by_path[files[0].path].text(12) == "Verified"
+        existing = dated / files[0].name
+        renamed = dated / f"{Path(files[0].name).stem} (2){Path(files[0].name).suffix}"
         # Hardware, 4 Nov: downloading a file that is already saved made "… (2).wav", a second
         # 251 MB copy. A complete copy (same name, the sensor's size) is not downloaded again.
         window._begin_downloads(files[:1])
@@ -680,17 +684,20 @@ def test_sftp_begin_downloads_uses_fixed_folder_without_dialogs(qapp, tmp_path, 
         assert not window._dl_active and not window._busy
         assert not renamed.exists()
         assert window.status.text().startswith("Already saved: 1 file(s)")
-        # A different file under that name is never overwritten: the download gets its own name.
+        # A different file under that name is never overwritten: the download goes to the
+        # sensor's own sub-folder (its serial, else its address), never to "name (2)" in the shared folder.
         existing.write_bytes(b"not the sensor's file")
         window._begin_downloads(files[:1])
+        separate = dated / "192.0.2.10" / files[0].name
         deadline = time.time() + 4
         while time.time() < deadline:
             qapp.processEvents()
-            if renamed.is_file() and not window._dl_active and not window._busy:
+            if separate.is_file() and not window._dl_active and not window._busy:
                 break
             time.sleep(0.05)
         assert existing.read_bytes() == b"not the sensor's file"
-        assert renamed.is_file() and renamed.stat().st_size == files[0].size
+        assert not renamed.exists()
+        assert separate.is_file() and separate.stat().st_size == files[0].size
     finally:
         window.close()
         qapp.processEvents()
@@ -1523,8 +1530,16 @@ def test_excel_section_collapses_without_losing_values(qapp, tmp_path):
         qapp.processEvents()
         assert window.excel_check.isHidden() is False
         assert window.excel_details.isHidden()
+        assert window.collection_status.isHidden(), "nothing pending: the status line collapses with the settings"
         assert window.excel_section.height() < expanded
         assert window.start_btn.mapTo(window, QPoint(0, 0)).y() == start_y, "the action bar is pinned below the form"
+        # Rows waiting for Excel stay visible even with logging switched off.
+        window._excel_store.pending_count = lambda: 2  # type: ignore[method-assign]
+        window._update_collection_status()
+        assert not window.collection_status.isHidden() and "Pending Excel updates: 2" in window.collection_status.text()
+        del window._excel_store.pending_count
+        window._update_collection_status()
+        assert window.collection_status.isHidden()
         assert window.wait_spin.isVisibleTo(window), "the wait between recordings is shown while repeating"
         window.repeat_off.setChecked(True)
         qapp.processEvents()

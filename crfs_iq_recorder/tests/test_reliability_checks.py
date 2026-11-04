@@ -377,8 +377,11 @@ def test_interrupted_part_is_replaced_and_the_download_is_verified_in_three_stag
     host = FakeHost()
     runner = _runner(tmp_path, host)
     runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, verify_checksums=True, quality_checks=False, previews=False))
-    local = tmp_path / "downloads" / "file_000001_0001.wav"
-    leftover = part_path(local)
+    # The download mirrors the sensor's dated folder; the .part of an older version sat in the flat root.
+    local = tmp_path / "downloads" / "20261103" / "file_000001_0001.wav"
+    legacy = tmp_path / "downloads" / "file_000001_0001.wav"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    leftover = part_path(legacy)
     leftover.write_bytes(b"half a file")
     host.finish(host.requests[0], names=["file_000001_0001.wav"])
     _pump(qapp)
@@ -386,14 +389,16 @@ def test_interrupted_part_is_replaced_and_the_download_is_verified_in_three_stag
     assert state.status == T_CONFIRMED
     assert _pump_until(qapp, lambda: state.files[0].get("download_status") == DL_VERIFIED, timeout=15.0), state.files
     item = state.files[0]
-    assert not leftover.exists() and local.is_file()
+    assert not leftover.exists() and local.is_file() and item["local_path"] == str(local)
     assert item["size"] == entries[0].size == local.stat().st_size and item["remote_size_stable"] is True
     assert item["verification"] == {V_SIZE: V_OK, V_STRUCTURE: V_OK, V_CHECKSUM: V_OK}, item
     assert item["verified_text"] == "size verified, structure verified, checksum verified"
     assert item["sha256"] == hashlib.sha256(local.read_bytes()).hexdigest() == item["remote_sha256"]
     assert "unfinished download" in item["note"] and ".part" in item["note"]
-    assert list((tmp_path / "downloads").glob("*.part")) == []
-    assert [p.name for p in (tmp_path / "downloads").glob("file_000001*.wav")] == ["file_000001_0001.wav"], "one copy, no duplicate"
+    assert list((tmp_path / "downloads").rglob("*.part")) == []
+    assert [p.name for p in (tmp_path / "downloads").rglob("file_000001*.wav")] == ["file_000001_0001.wav"], "one copy, no duplicate"
+    # The record file of the recording sits beside its files.
+    assert Path(state.manifest_path).parent == local.parent, state.manifest_path
 
 
 def test_download_without_a_sensor_checksum_is_verified_by_size_and_structure_only(qapp, tmp_path: Path, monkeypatch):
@@ -426,7 +431,7 @@ def test_checksum_mismatch_is_not_a_verified_copy_and_is_downloaded_again(qapp, 
     host = FakeHost()
     runner = _runner(tmp_path, host)
     runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, verify_checksums=True, quality_checks=False, previews=False))
-    local = tmp_path / "downloads" / "file_000001_0001.wav"
+    local = tmp_path / "downloads" / "20261103" / "file_000001_0001.wav"
     # Simulated corruption in transit: the sensor's digest differs from the bytes that arrived, once.
     from crfs_iq_recorder.sftp_client import DemoSftpBrowser
 
@@ -447,7 +452,7 @@ def test_checksum_mismatch_is_not_a_verified_copy_and_is_downloaded_again(qapp, 
     assert item["attempts"] >= 2, "the mismatching copy was downloaded again, not kept"
     assert _pump_until(qapp, lambda: item.get("download_status") == DL_VERIFIED, timeout=15.0), item
     assert item["verification"][V_CHECKSUM] == V_OK and item["sha256"] == hashlib.sha256(local.read_bytes()).hexdigest() == item["remote_sha256"]
-    assert [p.name for p in (tmp_path / "downloads").glob("file_000001*.wav")] == ["file_000001_0001.wav"]
+    assert [p.name for p in (tmp_path / "downloads").rglob("file_000001*.wav")] == ["file_000001_0001.wav"]
     assert local.with_name(local.name + ".unverified").is_file(), "the mismatching bytes were set aside, not deleted"
     assert item["set_aside"].endswith(".unverified")
 
@@ -489,7 +494,8 @@ def test_restart_shows_pending_work_and_resumes_downloads_without_duplicates(qap
     host.finish(host.requests[0], names=["file_000001_0001.wav"])
     _pump(qapp)
     assert len(host.requests) == 2 and runner.current_tasks()[1].status == T_SUBMITTING
-    local = tmp_path / "downloads" / "file_000001_0001.wav"
+    local = tmp_path / "downloads" / "20261103" / "file_000001_0001.wav"  # the sensor's dated folder
+    local.parent.mkdir(parents=True, exist_ok=True)
     part_path(local).write_bytes(b"interrupted")
     runner.shutdown()
 
@@ -510,7 +516,7 @@ def test_restart_shows_pending_work_and_resumes_downloads_without_duplicates(qap
     assert _pump_until(qapp, lambda: first.files[0].get("download_status") == DL_VERIFIED, timeout=15.0), first.files
     assert not part_path(local).exists() and local.is_file()
     assert first.files[0]["verification"][V_CHECKSUM] == V_OK
-    assert [p.name for p in (tmp_path / "downloads").glob("file_000001*.wav")] == ["file_000001_0001.wav"]
+    assert [p.name for p in (tmp_path / "downloads").rglob("file_000001*.wav")] == ["file_000001_0001.wav"]
     assert runner2.leftover_parts() == [] and runner2.pending_work()["downloads"] == 0
     # The third row was sent once after the restart; the first was never recorded again.
     assert len(host2.requests) == 1 and host2.requests[0].label.startswith("1800 MHz DL")

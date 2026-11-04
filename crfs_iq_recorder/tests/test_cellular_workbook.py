@@ -349,6 +349,28 @@ def test_queue_flushes_after_a_restart_without_duplicates(tmp_path: Path):
     assert len(list(tmp_path.glob("*.crfs-backup-*"))) == 2
 
 
+def test_queue_remembers_the_workbook_that_received_the_rows(tmp_path: Path):
+    """'Open written Excel file' opens the file the rows went into, even after another workbook is chosen."""
+    first = make_workbook(tmp_path / "first.xlsx")
+    second = make_workbook(tmp_path / "second.xlsx")
+    imported = _import(first)
+    layout, plan = layout_from_import(imported), plan_rows_from_import(imported)
+    queue_file = tmp_path / "state" / "workbook_queue.json"
+    queue = WorkbookQueue(queue_file)
+    assert queue.written_workbook() == "", "nothing written yet"
+    queue.enqueue(first, layout, plan, _result("r1", 0, ["a0.wav"], 2.0, datetime(2026, 11, 2, 10, 0, 0)))
+    assert queue.written_workbook() == "", "queued is not written"
+    report = flush_queue(queue, excel_open=lambda p: False)
+    assert report.written == 1 and report.workbooks == [str(first)]
+    assert queue.written_workbook() == str(first)
+    # The operator picks another protocol workbook; results of a later collection go there.
+    queue.enqueue(second, layout_from_import(_import(second)), plan, _result("r2", 0, ["b0.wav"], 2.0, datetime(2026, 11, 3, 10, 0, 0)))
+    flush_queue(queue, excel_open=lambda p: False)
+    assert queue.written_workbook() == str(second) and queue.written_workbooks() == [str(second), str(first)]
+    # Survives a restart (read from the persistent queue).
+    assert WorkbookQueue(queue_file).written_workbook() == str(second)
+
+
 def test_failed_backup_keeps_the_results_queued(tmp_path: Path, monkeypatch):
     path = make_workbook(tmp_path / "p.xlsx")
     imported = _import(path)

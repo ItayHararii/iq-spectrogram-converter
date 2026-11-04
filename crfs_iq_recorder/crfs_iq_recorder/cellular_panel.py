@@ -33,7 +33,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QRadioButton,
     QSizePolicy,
@@ -47,7 +46,7 @@ from PySide6.QtWidgets import (
 from . import desktop_open
 from .cellular_capabilities import capability_for, readable_sensor_name
 from .cellular_pickers import DateField, TimesField, format_datetime
-from .cellular_plan import REQUEST_SENTENCE, CellularPlan, build_plan, format_bytes, format_seconds, summary_line
+from .cellular_plan import CellularPlan, build_plan, format_bytes, format_seconds, summary_line
 from .cellular_protocol import (
     LEVEL_WARNING,
     ProtocolError,
@@ -82,7 +81,6 @@ from .operator_text import clip
 from .result_card import ResultCard
 from .start_button import StartButton
 from .theme import CONTROL_H, LABEL_W, restyle
-from .waterfall_dialog import WaterfallDialog
 
 SETTINGS_NAME = "settings.json"
 DEFAULT_WAIT_S = 10.0
@@ -241,7 +239,18 @@ def _ghost(text: str, *, tooltip: str = "", starts: bool = False) -> QPushButton
 class PlanPreviewDialog(QDialog):
     """What will be requested, row by row, before Start: one request per protocol row."""
 
-    def __init__(self, plan: CellularPlan, *, wait_s: float, rows_total: int, notes: list[str] | None = None, start_label: str | None = None, passes: int = 1, parent=None) -> None:
+    def __init__(
+        self,
+        plan: CellularPlan,
+        *,
+        wait_s: float,
+        rows_total: int,
+        notes: list[str] | None = None,
+        start_label: str | None = None,
+        passes: int = 1,
+        row_problems: list | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Excel Collection")
         self.resize(760, 500)
@@ -252,50 +261,66 @@ class PlanPreviewDialog(QDialog):
         summary.setObjectName("summary")
         summary.setWordWrap(True)
         layout.addWidget(summary)
-        rule = QLabel(REQUEST_SENTENCE)
-        rule.setWordWrap(True)
-        layout.addWidget(rule)
-        estimate = QLabel(
-            f"Estimate only: about {format_bytes(plan.estimated_bytes)} and "
-            f"{format_seconds(plan.estimated_round_seconds(wait_s))} per pass. "
-            "What CRFS records is read from its files afterwards."
-        )
-        estimate.setObjectName("muted")
-        estimate.setWordWrap(True)
-        layout.addWidget(estimate)
-        for text in notes or []:
-            if text:
-                note = QLabel(text)
-                note.setWordWrap(True)
-                note.setObjectName("muted")
-                layout.addWidget(note)
         tree = QTreeWidget()
-        tree.setColumnCount(5)
-        tree.setHeaderLabels(["Row", "Band", "Direction", "Requested range", "Duration"])
+        tree.setColumnCount(6)
+        tree.setHeaderLabels(["Row", "Band", "Direction", "Requested range", "Duration", "Note"])
         tree.setRootIsDecorated(False)
         tree.setAlternatingRowColors(True)
         tree.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
         tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         tree.setEditTriggers(QTreeWidget.EditTrigger.NoEditTriggers)
+        tree.setToolTip("One request per worksheet row, in worksheet order; the range and duration are sent exactly as shown")
+        # A row's own problem (an out-of-range frequency, a missing value) sits beside the row, not in a box below.
+        by_row: dict[int, list[str]] = {}
+        general: list[str] = []
+        for issue in [*plan.issues, *(row_problems or [])]:
+            if issue.level not in {"error", LEVEL_WARNING}:
+                continue
+            row = getattr(issue, "row", None)
+            message = str(issue.message)
+            if isinstance(row, int) and row > 0:
+                if message not in by_row.setdefault(row, []):
+                    by_row[row].append(message)
+            elif message not in general:
+                general.append(message)
         for task in plan.tasks:
             requested = task.range_text
             if task.repetitions > 1:
                 requested += f" (repeat {task.repetition} of {task.repetitions})"
-            item = QTreeWidgetItem([str(task.row), task.band_label, task.direction, requested, f"{task.duration_s:g} s"])
+            note = "; ".join(by_row.pop(task.row, []))
+            item = QTreeWidgetItem([str(task.row), task.band_label, task.direction, requested, f"{task.duration_s:g} s", clip(note, 90)])
+            if note:
+                item.setToolTip(5, note)
+            tree.addTopLevelItem(item)
+        for row, messages in sorted(by_row.items()):
+            # Rows that could not become a request at all.
+            note = "; ".join(messages)
+            item = QTreeWidgetItem([str(row), "", "", "not recorded", "", clip(note, 90)])
+            item.setToolTip(5, note)
             tree.addTopLevelItem(item)
         header = tree.header()
         header.setStretchLastSection(False)
         for column in (0, 1, 2, 4):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(5, 220)
+        header.setSectionHidden(5, not any(tree.topLevelItem(i).text(5) for i in range(tree.topLevelItemCount())))
         layout.addWidget(tree, 1)
-        problems = [i for i in plan.issues if i.level in {"error", LEVEL_WARNING, "info"}]
-        if problems:
-            box = QPlainTextEdit()
-            box.setReadOnly(True)
-            box.setMaximumHeight(110)
-            box.setPlainText("\n".join(i.message for i in problems))
-            layout.addWidget(box)
+        estimate = QLabel(
+            f"About {format_bytes(plan.estimated_bytes)} and {format_seconds(plan.estimated_round_seconds(wait_s))} per pass (estimate)."
+        )
+        estimate.setObjectName("muted")
+        estimate.setWordWrap(True)
+        layout.addWidget(estimate)
+        # Short, actionable lines only: what blocks Start, a tight schedule, the workbook being open in Excel.
+        for text in [*general, *(notes or [])]:
+            if text:
+                note = QLabel(clip(text, 160))
+                note.setWordWrap(True)
+                note.setObjectName("warn" if text in general else "muted")
+                note.setToolTip(text)
+                layout.addWidget(note)
         buttons = QDialogButtonBox()
         self.start_button: StartButton | None = None
         if start_label:
@@ -350,9 +375,7 @@ class CellularPanel(QFrame):
         self._start_trigger = ""
         self._host_paused = False
         self._built = False
-        self._details_open = False
         self._pass_dismissed = ""
-        self._waterfall = None
         self._build_frame()
         self._build_action_bar()
         self.runner.status_changed.connect(self._on_status)
@@ -525,7 +548,6 @@ class CellularPanel(QFrame):
 
         self.result_card = ResultCard("Last recording")
         self.result_card.open_folder_clicked.connect(self._open_result_folder)
-        self.result_card.waterfall_clicked.connect(self._show_result_waterfall)
         body.addWidget(self.result_card)
 
         grid = QGridLayout()
@@ -569,29 +591,39 @@ class CellularPanel(QFrame):
         grid.addLayout(sheet_row, row, 1)
         row += 1
 
-        summary_row = QHBoxLayout()
-        summary_row.setSpacing(8)
         self.import_label = QLabel("Load the protocol workbook.")
         self.import_label.setObjectName("muted")
         self.import_label.setWordWrap(True)
         self.import_label.setMinimumHeight(24)
-        self.details_btn = QPushButton("Details")
-        self.details_btn.setObjectName("linkBtn")
-        self.details_btn.setAutoDefault(False)
-        self.details_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.details_btn.setToolTip("Capture window of the sensor, sequential windows and other notes about this plan")
-        self.details_btn.setVisible(False)
-        self.details_btn.clicked.connect(lambda: self._show_details(not self._details_open))
-        summary_row.addWidget(self.import_label, 1)
-        summary_row.addWidget(self.details_btn, 0, Qt.AlignmentFlag.AlignTop)
-        grid.addLayout(summary_row, row, 1)
+        grid.addWidget(self.import_label, row, 1)
         row += 1
-        self.details_label = QLabel("")
-        self.details_label.setObjectName("muted")
-        self.details_label.setWordWrap(True)
-        self.details_label.setVisible(False)
-        grid.addWidget(self.details_label, row, 1)
+
+        # Results: the workbook the rows actually went into, and a check of everything Start needs.
+        grid.addWidget(FieldLabel("Results"), row, 0)
+        results_row = QHBoxLayout()
+        results_row.setSpacing(8)
+        self.open_written_btn = _ghost("Open written Excel file")
+        self.open_written_btn.clicked.connect(self._open_written_workbook)
+        self.readiness_btn = _ghost(
+            "Check readiness",
+            tooltip="Checks the sensor, its clock and storage, the local disk and the workbook. Nothing is recorded.",
+        )
+        self.readiness_btn.clicked.connect(self._check_readiness)
+        self.readiness_label = QLabel("")
+        self.readiness_label.setObjectName("muted")
+        self.readiness_label.setWordWrap(True)
+        self.readiness_label.setVisible(False)
+        results_row.addWidget(self.open_written_btn)
+        results_row.addWidget(self.readiness_btn)
+        results_row.addStretch(1)
+        results_col = QVBoxLayout()
+        results_col.setContentsMargins(0, 0, 0, 0)
+        results_col.setSpacing(6)
+        results_col.addLayout(results_row)
+        results_col.addWidget(self.readiness_label)
+        grid.addLayout(results_col, row, 1)
         row += 1
+        self._sync_written_button("")
 
         # 2. Duration and wait
         grid.addWidget(FieldLabel("Recording duration"), row, 0)
@@ -776,10 +808,75 @@ class CellularPanel(QFrame):
             self.chip.setObjectName(style)
             restyle(self.chip)
 
-    def _show_details(self, on: bool) -> None:
-        self._details_open = bool(on)
-        self.details_label.setVisible(self._details_open and bool(self.details_label.text()))
-        self.details_btn.setText("Hide details" if self._details_open else "Details")
+    def _sync_written_button(self, path: str) -> None:
+        """'Open written Excel file' follows the workbook that received results, not the one selected."""
+        if not self._built:
+            return
+        path = str(path or "")
+        if path and Path(path).is_file():
+            self.open_written_btn.setEnabled(True)
+            self.open_written_btn.setToolTip(path)
+        elif path:
+            self.open_written_btn.setEnabled(False)
+            self.open_written_btn.setToolTip(f"The workbook that received results is not where it was saved:\n{path}")
+        else:
+            self.open_written_btn.setEnabled(False)
+            self.open_written_btn.setToolTip("No results have been saved to a workbook yet.")
+
+    def _open_written_workbook(self) -> None:
+        path = str(self.runner.written_workbook() or "")
+        if not path or not Path(path).is_file():
+            self._sync_written_button(path)
+            return
+        diag("open_written_workbook", path)
+        try:
+            from .excel_com import activate_workbook
+
+            if activate_workbook(Path(path)):
+                return  # already open in Excel: brought to the front, not opened twice
+        except Exception as exc:  # noqa: BLE001 - fall back to the shell
+            diag("open_written_workbook_activate_failed", error=f"{type(exc).__name__}: {exc}")
+        if not desktop_open.open_path(path):
+            self._host_log(f"Could not open {Path(path).name}.", "error")
+
+    def _check_readiness(self) -> None:
+        """Run the pre-collection checks on a worker and show one short line; never starts anything."""
+        if self.runner.active():
+            self.readiness_label.setText("The collection is running; its checks run before each pass.")
+            self.readiness_label.setVisible(True)
+            return
+        self.readiness_btn.setEnabled(False)
+        self.readiness_label.setText("Checking the sensor, clock, storage and workbook…")
+        self.readiness_label.setObjectName("muted")
+        restyle(self.readiness_label)
+        self.readiness_label.setVisible(True)
+        diag("readiness_check_requested")
+        work, apply = self.runner.readiness_check(self.plan, self._campaign_settings())
+
+        def done(result) -> None:
+            self.readiness_btn.setEnabled(True)
+            level = "muted"
+            try:
+                text, blocking, temporary = apply(result)
+            except Exception as exc:  # noqa: BLE001 - reported, never raised into Qt
+                diag("readiness_check_failed", error=f"{type(exc).__name__}: {exc}")
+                text, blocking, temporary = "The check could not be completed. Try again.", True, False
+            if blocking:
+                level = "warn"
+            elif temporary:
+                level = "warn"
+            self.readiness_label.setText(text)
+            if self.readiness_label.objectName() != level:
+                self.readiness_label.setObjectName(level)
+                restyle(self.readiness_label)
+            self.readiness_label.setVisible(True)
+            self._host_log(text, "error" if blocking else "info")
+
+        runner = getattr(self.host, "_start_job", None)
+        if runner is None:
+            done(work())
+        else:
+            runner(work, done)
 
     def _save_settings(self) -> None:
         if self._built:
@@ -934,15 +1031,17 @@ class CellularPanel(QFrame):
         )
 
     def _set_import_text(self, text: str, *, warn: bool = False, details: str = "") -> None:
-        """The compact summary under the worksheet; long explanations go to Details."""
+        """The compact summary under the worksheet; the longer explanation goes to the diagnostic log."""
         self.import_label.setText(text)
         name = "warn" if warn else ("summary" if self.plan is not None else "muted")
         if self.import_label.objectName() != name:
             self.import_label.setObjectName(name)
             restyle(self.import_label)
-        self.details_label.setText(details)
-        self.details_btn.setVisible(bool(details))
-        self.details_label.setVisible(self._details_open and bool(details))
+        if details:
+            self.import_label.setToolTip(details)
+            diag("plan_details", details)
+        else:
+            self.import_label.setToolTip("")
 
     def _import(self, *, force: bool, quiet: bool = False) -> None:
         """Read the worksheet (off the UI thread when the host offers a job helper)."""
@@ -1137,6 +1236,7 @@ class CellularPanel(QFrame):
             notes=self._notes_before_start(schedule),
             start_label="Start" if start else None,
             passes=self.passes(),
+            row_problems=[*self.imported.errors, *self.imported.warnings] if self.imported is not None else None,
             parent=self.window(),
         )
         try:
@@ -1256,7 +1356,8 @@ class CellularPanel(QFrame):
                 except ValueError:
                     pass
             if not self._identity_pending:
-                self.status_label.setText(text)
+                # The chip already reads "Finished" or "Paused"; do not print it twice in the bar.
+                self.status_label.setText("" if text.strip().casefold() == self.chip.text().casefold() else text)
             details: list[str] = []
             if status.get("rounds_total", 0) > 1 and status.get("round_index"):
                 details.append(f"pass {status['round_index']} of {status['rounds_total']}")
@@ -1271,6 +1372,7 @@ class CellularPanel(QFrame):
             self._sync_bar_texts(status)
         self._sync_buttons(status)
         self._update_results(status)
+        self._sync_written_button(str(status.get("written_workbook") or ""))
         if state in {S_INTERRUPTED, S_WAITING_SCHEDULE, S_DONE} or status.get("missed_rounds"):
             self._refresh_recovery()
 
@@ -1384,20 +1486,6 @@ class CellularPanel(QFrame):
         view = self.result_card.view
         if view is not None and view.local_paths and not desktop_open.reveal(view.local_paths[0]):
             self._host_log("Could not open the folder.", "error")
-
-    def _show_result_waterfall(self) -> None:
-        view = self.result_card.view
-        if view is None or not view.local_paths:
-            return
-        self._waterfall = WaterfallDialog(
-            view.local_paths[0],
-            center_hz=view.centre_hz,
-            bandwidth_hz=view.bandwidth_hz,
-            requested_start_hz=view.requested_start_hz,
-            requested_stop_hz=view.requested_stop_hz,
-            parent=self.window(),
-        )
-        self._waterfall.show()
 
     def _host_busy_reason(self) -> str:
         """Why Start waits for the other tab ('Manual recording is running.'), or ''."""

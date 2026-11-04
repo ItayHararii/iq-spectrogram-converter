@@ -37,16 +37,19 @@ TAGS = {
 OTHER_RANGE_TAG = ("Other range", "badgeWait")
 OTHER_RANGE = ", not the requested range"
 RECORDING_STATES = {
-    RESULT_COMPLETED: "Files ready",
-    RESULT_PARTIAL: "Files ready",
-    RESULT_UNCONFIRMED: "Not confirmed",
+    RESULT_COMPLETED: "Recording complete",
+    RESULT_PARTIAL: "Partial recording",
+    RESULT_UNCONFIRMED: "Recording not confirmed",
     RESULT_FAILED: "Not recorded",
 }
 
 ON_SENSOR = "On the sensor"
+DOWNLOAD_QUEUED = "Download queued"
 DOWNLOADING = "Downloading"
-SAVED_LOCALLY = "Saved locally"
+SAVED_LOCALLY = "Download saved"
 DOWNLOAD_FAILED = "Download failed"
+LOCAL_MISSING = "Local copy missing"
+# Kept for callers; the card itself no longer shows it (the states line says what the download is doing).
 DOWNLOAD_REQUIRED = "Download required."
 
 EXCEL_UPDATED = "Excel updated"
@@ -74,6 +77,10 @@ class ResultView:
     # The range the operator asked for, exactly as sent (markers on the waterfall).
     requested_start_hz: float | None = None
     requested_stop_hz: float | None = None
+    # Compact facts for the card: '1 file · 0.503 s · 251.4 MB' (measured values only).
+    facts_text: str = ""
+    # 'Sensor reported 3690-3790 MHz' when the file's own range differs from the requested one; '' otherwise.
+    coverage_note: str = ""
 
     @property
     def local_ready(self) -> bool:
@@ -82,24 +89,61 @@ class ResultView:
 
     @property
     def states_text(self) -> str:
-        """'Files ready · Saved locally · Excel updated'."""
+        """'Recording complete · Download saved · Excel updated'."""
         return " · ".join(item for item in (self.recording_state, self.transfer_state, self.excel_state) if item)
 
 
 def local_copies(remote_paths: Iterable[str], local_dir: Path | str | None) -> list[str]:
-    """The recording's files found in the download folder, in the sensor's order."""
+    """The recording's files found in the download folder, in the sensor's order.
+
+    Looks in the sensor's dated sub-folder first, then in the flat root used by
+    earlier versions, so older downloads are still recognised where they are.
+    """
     if not local_dir:
         return []
+    from .download_paths import candidate_paths
+
     folder = Path(local_dir)
     out: list[str] = []
     for path in remote_paths:
-        candidate = folder / str(path).replace("\\", "/").rsplit("/", 1)[-1]
-        try:
-            if candidate.is_file() and candidate.stat().st_size > 0:
-                out.append(str(candidate))
-        except OSError:
-            continue
+        for candidate in candidate_paths(folder, str(path)):
+            try:
+                if candidate.is_file() and candidate.stat().st_size > 0:
+                    out.append(str(candidate))
+                    break
+            except OSError:
+                continue
     return out
+
+
+def _facts(measurement: CaptureMeasurement | None, files: int) -> str:
+    """'1 file · 0.503 s · 251.4 MB'; 'duration unknown' when the files could not be read."""
+    if files <= 0:
+        return "No files"
+    parts = [files_text(files)]
+    seconds = measurement.duration_s if measurement is not None else None
+    parts.append(f"{seconds:.3f} s" if seconds is not None else "duration unknown")
+    total = sum(int(part.size or 0) for part in measurement.parts) if measurement is not None else 0
+    if total:
+        parts.append(size_text(total))
+    return " · ".join(parts)
+
+
+def _coverage_note(measurement: CaptureMeasurement | None, centre_hz: Any, bandwidth_hz: Any) -> str:
+    """The sensor-reported range, only when it is known and differs from the requested one."""
+    if measurement is None:
+        return ""
+    text = coverage_text(measurement)
+    if text == "unknown":
+        return ""
+    try:
+        start = int(float(centre_hz) - float(bandwidth_hz) / 2)
+        stop = int(float(centre_hz) + float(bandwidth_hz) / 2)
+    except (TypeError, ValueError):
+        return ""
+    if coverage_differs(measurement, start, stop):
+        return f"Sensor reported {text}, not the requested range"
+    return ""
 
 
 def _requested(bandwidth_hz: Any, seconds: float) -> str:
@@ -194,11 +238,13 @@ def view_from_summary(
         bandwidth_hz=measurement.bandwidth_hz,
         requested_start_hz=req_start,
         requested_stop_hz=req_stop,
+        facts_text=_facts(measurement if paths else None, len(paths)),
+        coverage_note=_coverage_note(measurement if paths else None, centre, bandwidth),
     )
 
 
 def transfer_state(files: list[dict[str, Any]]) -> str:
-    """'Downloading 1 of 2' / 'Saved locally' / 'Download failed' / 'On the sensor' from a task's files."""
+    """'Downloading 1 of 2' / 'Download saved' / 'Download failed' / 'Download queued' / 'On the sensor'."""
     if not files:
         return ""
     statuses = [str(item.get("download_status") or "") for item in files]
@@ -207,8 +253,10 @@ def transfer_state(files: list[dict[str, Any]]) -> str:
         return SAVED_LOCALLY
     if any(s == "failed" for s in statuses):
         return DOWNLOAD_FAILED
-    if any(s in {"pending", "downloading", "present"} for s in statuses):
+    if any(s in {"downloading", "present"} for s in statuses):
         return f"{DOWNLOADING} {saved} of {len(files)}" if len(files) > 1 else DOWNLOADING
+    if any(s == "pending" for s in statuses):
+        return DOWNLOAD_QUEUED
     return ON_SENSOR
 
 
@@ -244,11 +292,16 @@ def view_from_task(
         # Rejected or not sent: there is no capture summary, only the task's own outcome.
         view.received = "Received: no files"
         view.recorded = f"{RECORDED}: unknown"
+        view.facts_text = "No files"
     if files:
         view.transfer_state = transfer_state(files)
         recorded_local = [str(item.get("local_path")) for item in files if item.get("local_path") and Path(str(item.get("local_path"))).is_file()]
         if len(recorded_local) == len(files):
             view.local_paths = recorded_local
+        elif view.transfer_state == SAVED_LOCALLY:
+            # Verified once, but a file is gone from the download folder: say so, never "saved" next to "required".
+            view.transfer_state = LOCAL_MISSING
+            view.local_paths = []
     view.excel_state = excel_state
     view.attempt = max(int(getattr(state, "attempts", 1) or 1), 1)
     return view
@@ -257,10 +310,12 @@ def view_from_task(
 __all__ = [
     "DOWNLOADING",
     "DOWNLOAD_FAILED",
+    "DOWNLOAD_QUEUED",
     "DOWNLOAD_REQUIRED",
     "EXCEL_FAILED",
     "EXCEL_PENDING",
     "EXCEL_UPDATED",
+    "LOCAL_MISSING",
     "ON_SENSOR",
     "SAVED_LOCALLY",
     "ResultView",

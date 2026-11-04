@@ -29,6 +29,7 @@ from .collection_catalog import (
     HEADER_START,
     HEADER_STOP,
 )
+from .download_paths import existing_copy, local_destination
 from .excel_log import ExcelLogStore, pending_from_row
 from .excel_writer import ExcelBusyError, ExcelRow
 from .frequency import FreqTextStyle
@@ -165,7 +166,11 @@ def queue_capture_rows(
     for name in names:
         entry = by_name[name]
         remote_path = str(entry.get("remote_path") or "")
-        local = Path(entry.get("local_path") or (local_dir / name))
+        local = Path(entry["local_path"]) if entry.get("local_path") else None
+        if local is None or not local.is_file():
+            # Not downloaded by the runner (or moved): look where the sensor's dated folder puts it, then the root.
+            found = existing_copy(local_dir, remote_path or name, int(entry.get("size") or 0))
+            local = found if found is not None else local_destination(local_dir, remote_path or name)
         row = ExcelRow(
             worksheet=worksheet,
             collection_event=collection_event,

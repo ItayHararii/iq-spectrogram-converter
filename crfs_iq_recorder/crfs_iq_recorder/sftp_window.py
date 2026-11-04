@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -49,7 +50,8 @@ from .cellular_pickers import format_datetime
 from .connection_state import ConnectionState
 from .constants import DEFAULT_SFTP_PORT
 from .diagnostic_log import diag
-from .download_util import DownloadError, already_saved, unique_destination
+from .download_paths import LocalCopies, candidate_paths, existing_copy, plan_destinations
+from .download_util import DownloadError, already_saved
 from .file_measurements import load_measurements, reading_from_local_copy, record_parts, recorded_columns
 from .file_measurements import lookup as lookup_measurement
 from .operator_text import size_detail
@@ -109,10 +111,20 @@ _TABLE_HEADERS = [
     "Recorded (MHz)",
     "Recorded (s)",
     "Rate (MS/s)",
+    "Local copy",
 ]
 COL_RECORDED_RANGE = 9
 COL_RECORDED_S = 10
 COL_RATE = 11
+COL_LOCAL = 12
+# Per-file download states shown in the "Local copy" column.
+LOCAL_NONE = ""
+LOCAL_SAVED = "Saved"
+LOCAL_QUEUED = "Queued"
+LOCAL_DOWNLOADING = "Downloading"
+LOCAL_WAITING = "Waiting to retry"
+LOCAL_VERIFIED = "Verified"
+LOCAL_FAILED = "Failed"
 _HEADER_TIPS = {
     2: "Decimal units (1 MB = 1,000,000 bytes). Hover a size for the exact bytes. Combined size for a split recording.",
     4: "Requested by the application (recording history), not read from the file.",
@@ -123,6 +135,7 @@ _HEADER_TIPS = {
     COL_RECORDED_RANGE: "Centre ± half the bandwidth CRFS stored in the file. \"unknown\" until the file has been read.",
     COL_RECORDED_S: "Samples in the file divided by its sample rate (WAVE header). \"unknown\" until the file has been read.",
     COL_RATE: "Sample rate in the file's WAVE header. \"unknown\" until the file has been read.",
+    COL_LOCAL: "Whether a copy of the same size is in the download folder, and the state of a download in progress.",
 }
 ROLE_PATH = int(Qt.ItemDataRole.UserRole)
 ROLE_KIND = ROLE_PATH + 1
@@ -694,6 +707,11 @@ class SftpWindow(QWidget):
         self._sort_descending = True
         self._user_sort = False
         self._expanded_groups: set[str] = set()
+        # Per-file local state: remote path -> (state, detail, local path); and the live row of each file.
+        self._local_states: dict[str, tuple[str, str, str]] = {}
+        self._items_by_path: dict[str, QTreeWidgetItem] = {}
+        self._dl_names: dict[str, str] = {}  # remote name -> remote path, this batch
+        self._dl_started_at: dict[str, float] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -806,9 +824,15 @@ class SftpWindow(QWidget):
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.table.itemExpanded.connect(self._on_item_expanded)
         self.table.itemCollapsed.connect(self._on_item_collapsed)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
+        # Shortcuts act only while the table has the focus (WidgetShortcut), never in the path box or preview.
         delete_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.table)
         delete_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
         delete_shortcut.activated.connect(self._delete_selected_remote)
+        copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.table)
+        copy_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        copy_shortcut.activated.connect(lambda: QApplication.clipboard().setText("\n".join(f.name for f in self._selected_files())))
 
         self.empty_page = QLabel("Connecting…")
         self.empty_page.setObjectName("emptyState")
@@ -1023,7 +1047,8 @@ class SftpWindow(QWidget):
         for entry in parts:
             written = (saved or {}).get(entry.name)
             candidates = [Path(written)] if written else []
-            candidates.append(folder / entry.name)
+            # The sensor's dated folder under the root, the sensor's own sub-folder, then the flat root.
+            candidates.extend(candidate_paths(folder, entry.path, sensor=self._sensor_key()))
             found = None
             for candidate in candidates:
                 try:
@@ -1092,6 +1117,7 @@ class SftpWindow(QWidget):
             if not plan.ok:
                 QMessageBox.warning(self, "Merge parts", f"{stem} cannot be merged:\n\n" + "\n".join(plan.errors))
                 return
+            folder = have[0].parent  # the merged file sits beside its parts (the sensor's dated folder)
             output = merged_output_path(stem, folder)
             continuity = {
                 "verified": "Each part starts where the previous one ends (verified from the sensor's time stamps).",
@@ -1144,7 +1170,7 @@ class SftpWindow(QWidget):
         if self._merge is None or (not saved and manual is None):
             return
         try:
-            folder = self._dl_folder or ensure_download_dir(self._state.download_dir)
+            root = ensure_download_dir(self._state.download_dir)
         except OSError:
             return
         stems: dict[str, str] = {}
@@ -1165,7 +1191,7 @@ class SftpWindow(QWidget):
             parts = self._group_parts(stem, directory)
             if len(parts) < 2:
                 continue
-            have, missing = self._local_part_paths(parts, folder, saved)
+            have, missing = self._local_part_paths(parts, root, saved)
             key = self._merge_group_key(stem, directory)
             is_manual = manual is not None and manual[0] == key
             if missing:
@@ -1175,7 +1201,7 @@ class SftpWindow(QWidget):
                         f"({', '.join(e.name for e in missing[:3])}{'…' if len(missing) > 3 else ''})."
                     )
                 continue
-            reason = self._merge.request(key, stem, have, folder, auto=not is_manual)
+            reason = self._merge.request(key, stem, have, have[0].parent, auto=not is_manual)
             if is_manual and reason:
                 self.status.setText(f"Merge not started: {reason}.")
 
@@ -1447,7 +1473,7 @@ class SftpWindow(QWidget):
                 self.status.setText(f"{files[0].name}.{extra}")
         elif len(files) > 1:
             total = sum(item.size for item in files)
-            self.status.setText(f"{len(files)} selected, {total:,} B.")
+            self.status.setText(f"{len(files)} files selected · {format_bytes(total)} ({total:,} B).")
         self._update_download_button()
         self._update_merge_button()
 
@@ -1470,7 +1496,8 @@ class SftpWindow(QWidget):
             self.download_btn.setText("Download this recording")
             return
         if len(files) > 1:
-            self.download_btn.setText(f"Download Selected ({len(files)})")
+            total = sum(int(item.size or 0) for item in files)
+            self.download_btn.setText(f"Download {len(files)} files ({format_bytes(total)})")
             return
         self.download_btn.setText("Download")
 
@@ -1503,14 +1530,21 @@ class SftpWindow(QWidget):
         jobs: list[tuple[RemoteEntry, str]] = []
         present: dict[str, str] = {}
         try:
+            # Saved under the sensor's dated folder; parts of one recording share a folder and a
+            # different file of the same name is never overwritten (download_paths).
+            sizes = {entry.path: int(entry.size or 0) for entry in files}
+            planned = plan_destinations(folder, [entry.path for entry in files], lambda p: sizes.get(p, 0), sensor=self._sensor_key())
             for entry in files:
-                local = folder / entry.name
+                local = planned.get(entry.path) or (folder / entry.name)
                 if already_saved(local, entry.size):
                     # A second "(2)" copy of a file that is already complete would only fill the disk.
                     present[entry.name] = str(local)
+                    self._set_local_state(entry.path, LOCAL_SAVED, local_path=str(local))
                     continue
-                jobs.append((entry, str(unique_destination(local))))
-        except DownloadError as exc:
+                local.parent.mkdir(parents=True, exist_ok=True)
+                jobs.append((entry, str(local)))
+                self._set_local_state(entry.path, LOCAL_QUEUED)
+        except (DownloadError, OSError) as exc:
             QMessageBox.warning(self, "Download", str(exc))
             return
         if present:
@@ -1537,11 +1571,14 @@ class SftpWindow(QWidget):
         self._dl_total = len(jobs)
         self._dl_bytes = {}
         self._dl_saved = dict(present or {})
+        self._dl_names = {entry.name: entry.path for entry, _dest in jobs}
+        self._dl_started_at = {}
         self._dl_folder = Path(jobs[0][1]).parent
         self.progress.setVisible(True)
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.status.setText(f"Downloading {self._dl_total} file(s) to {self._dl_folder}…")
+        total = sum(int(entry.size or 0) for entry, _dest in jobs)
+        self.status.setText(f"Downloading {self._dl_total} file(s), {format_bytes(total)}, to {self._dl_folder}…")
         self._set_busy(True)
         self._pump_downloads()
 
@@ -1584,7 +1621,12 @@ class SftpWindow(QWidget):
             thread.started.connect(worker.run)
             self._dl_active.append((thread, worker))
             track_worker_thread(thread, worker)
+            self._dl_started_at[entry.name] = time.monotonic()
+            self._set_local_state(entry.path, LOCAL_DOWNLOADING)
             thread.start()
+
+    def _remote_path_of(self, name: str) -> str:
+        return self._dl_names.get(name, "")
 
     @Slot(str, str)
     def _on_file_downloaded(self, name: str, path: str) -> None:
@@ -1594,6 +1636,7 @@ class SftpWindow(QWidget):
         self._dl_saved[name] = path
         done = self._dl_ok + self._dl_fail + self._dl_cancel_count
         self.status.setText(f"Saved {name} ({done}/{self._dl_total})")
+        self._set_local_state(self._remote_path_of(name), LOCAL_VERIFIED, local_path=path)
 
     @Slot(str, str)
     def _on_file_download_failed(self, name: str, text: str) -> None:
@@ -1603,9 +1646,14 @@ class SftpWindow(QWidget):
         if "cancel" in message.casefold():
             self._dl_cancel_count += 1
             self.status.setText(f"Cancelled {name}")
+            self._set_local_state(self._remote_path_of(name), LOCAL_NONE)
             return
         self._dl_fail += 1
         self.status.setText(f"Failed {name} ({self._dl_ok + self._dl_fail}/{self._dl_total})")
+        self._set_local_state(self._remote_path_of(name), LOCAL_FAILED, detail="")
+        item = self._items_by_path.get(self._remote_path_of(name))
+        if item is not None:
+            item.setToolTip(COL_LOCAL, f"Download failed: {message.splitlines()[-1]}\nRight-click for Retry download.")
         QMessageBox.warning(self, "Download", f"{name}: {message.splitlines()[-1]}")
 
     @Slot(str, float, str)
@@ -1617,6 +1665,7 @@ class SftpWindow(QWidget):
             f"Waiting for the sensor to accept a connection; trying again in {int(delay_s + 0.999)} s "
             f"({self._dl_ok}/{self._dl_total} saved)."
         )
+        self._set_local_state(self._remote_path_of(name), LOCAL_WAITING)
 
     @Slot(str, str)
     def _on_file_unreachable(self, name: str, detail: str) -> None:
@@ -1627,6 +1676,7 @@ class SftpWindow(QWidget):
         self._dl_fail += 1
         self._dl_unreachable += 1
         self.status.setText(f"Not downloaded: {name} ({self._dl_ok + self._dl_fail}/{self._dl_total})")
+        self._set_local_state(self._remote_path_of(name), LOCAL_FAILED)
 
     @Slot(str, int, int)
     def _on_file_progress(self, name: str, done: int, total: int) -> None:
@@ -1641,6 +1691,17 @@ class SftpWindow(QWidget):
             self.progress.setValue(min(100, int(sum_done * 100 / sum_total)))
         else:
             self.progress.setRange(0, 0)
+        # Per-file percentage; speed and time remaining only once measured over at least 2 s.
+        detail = f"{min(100, int(done * 100 / total))}%" if total > 0 else ""
+        started = self._dl_started_at.get(name)
+        elapsed = time.monotonic() - started if started else 0.0
+        if total > 0 and elapsed >= 2.0 and done > 0:
+            rate = done / elapsed
+            remaining = (total - done) / rate if rate > 0 else None
+            detail += f" · {format_bytes(int(rate))}/s"
+            if remaining is not None:
+                detail += f" · {int(remaining + 0.5)} s left"
+        self._set_local_state(self._remote_path_of(name), LOCAL_DOWNLOADING, detail=detail)
 
     @Slot()
     def _on_download_thread_finished(self) -> None:
@@ -1790,7 +1851,103 @@ class SftpWindow(QWidget):
             start, end, center_hz, bw, duration = format_columns(rec)
             values[4:9] = [start, end, center_hz, bw, duration]
         values.extend(recorded or ["", "", ""])
+        values.append("")  # local copy state, filled by _set_local_state
         return values
+
+    # ------------------------------------------------------------------ local copy column
+    def _local_root(self) -> Path | None:
+        try:
+            return resolved_download_dir(self._state.download_dir)
+        except Exception:  # noqa: BLE001 - advisory column only
+            return None
+
+    def _local_copy_of(self, entry: RemoteEntry) -> Path | None:
+        """A local file of the same size as the sensor's (the dated folder first, then the flat root)."""
+        root = self._local_root()
+        if root is None or entry.is_dir:
+            return None
+        try:
+            return existing_copy(root, entry.path, int(entry.size or 0), sensor=self._sensor_key())
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _sensor_key(self) -> str:
+        return str(getattr(self._state, "sensor_serial", "") or getattr(self._state, "host", "") or "")
+
+    def _set_local_state(self, path: str, state: str, *, detail: str = "", local_path: str = "") -> None:
+        """Update one file's cell in place (no refill, so selection, scroll and expansion stay)."""
+        self._local_states[path] = (state, detail, local_path)
+        item = self._items_by_path.get(path)
+        if item is not None:
+            text = state if not detail else f"{state} {detail}"
+            item.setText(COL_LOCAL, text)
+            item.setToolTip(COL_LOCAL, local_path or text)
+            parent = item.parent()
+            if parent is not None:
+                self._sync_group_local_state(parent)
+
+    def _sync_group_local_state(self, parent: QTreeWidgetItem) -> None:
+        """A group shows the state of its parts: all saved, n of m, or the busiest part's state."""
+        states = [parent.child(i).text(COL_LOCAL) for i in range(parent.childCount())]
+        if not states:
+            return
+        if all(s.startswith((LOCAL_SAVED, LOCAL_VERIFIED)) for s in states):
+            parent.setText(COL_LOCAL, LOCAL_SAVED)
+        elif any(s.startswith(LOCAL_FAILED) for s in states):
+            parent.setText(COL_LOCAL, LOCAL_FAILED)
+        elif any(s.startswith(LOCAL_WAITING) for s in states):
+            parent.setText(COL_LOCAL, LOCAL_WAITING)
+        elif any(s.startswith(LOCAL_DOWNLOADING) for s in states):
+            parent.setText(COL_LOCAL, LOCAL_DOWNLOADING)
+        elif any(s.startswith(LOCAL_QUEUED) for s in states):
+            parent.setText(COL_LOCAL, LOCAL_QUEUED)
+        else:
+            saved = sum(1 for s in states if s.startswith((LOCAL_SAVED, LOCAL_VERIFIED)))
+            parent.setText(COL_LOCAL, f"{saved} of {len(states)} saved" if saved else "")
+
+    def _initial_local_state(self, entry: RemoteEntry, copies: LocalCopies | None = None) -> tuple[str, str, str]:
+        known = self._local_states.get(entry.path)
+        if known is not None and known[0] in {LOCAL_QUEUED, LOCAL_DOWNLOADING, LOCAL_WAITING, LOCAL_FAILED}:
+            return known
+        if copies is not None and not entry.is_dir:
+            try:
+                local = copies.find(entry.path, int(entry.size or 0))
+            except Exception:  # noqa: BLE001 - advisory column only
+                local = None
+        else:
+            local = self._local_copy_of(entry)
+        if local is not None:
+            return (LOCAL_SAVED, "", str(local))
+        return (LOCAL_NONE, "", "")
+
+    def _show_context_menu(self, pos) -> None:
+        item = self.table.itemAt(pos)
+        if item is None:
+            return
+        if not item.isSelected():
+            self.table.setCurrentItem(item)
+        files = self._selected_files()
+        menu = QMenu(self.table)
+        saved_paths = [self._local_states.get(f.path, ("", "", ""))[2] for f in files]
+        saved_paths = [p for p in saved_paths if p]
+        can_download = bool(files) and not self._busy and not self._dl_active and not self._closing
+        failed = any(self._local_states.get(f.path, ("", "", ""))[0] == LOCAL_FAILED for f in files)
+        retry = menu.addAction("Retry download" if failed else "Download")
+        retry.setEnabled(can_download)
+        retry.triggered.connect(lambda: self._begin_downloads(files))
+        open_folder = menu.addAction("Open folder")
+        open_folder.setEnabled(bool(saved_paths))
+        open_folder.triggered.connect(lambda: self._reveal_local(saved_paths[0]) if saved_paths else None)
+        copy_name = menu.addAction("Copy filename" if len(files) == 1 else "Copy filenames")
+        copy_name.setEnabled(bool(files))
+        copy_name.triggered.connect(lambda: QApplication.clipboard().setText("\n".join(f.name for f in files)))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _reveal_local(self, path: str) -> None:
+        from . import desktop_open
+
+        if not desktop_open.reveal(path):
+            self._open_recordings_folder(Path(path).parent)
 
     def _is_new_entry(self, entry: RemoteEntry, rec, new_paths: set[str]) -> bool:
         if entry.is_dir:
@@ -1801,6 +1958,10 @@ class SftpWindow(QWidget):
 
     def _fill(self, entries: list[RemoteEntry]) -> None:
         selected = self._selected_identities()
+        scroll = self.table.verticalScrollBar().value()
+        current_item = self.table.currentItem()
+        current_identity = self._item_identity(current_item) if current_item is not None else ""
+        self._items_by_path = {}
         current_paths = {entry.path for entry in entries if not entry.is_dir}
         new_paths, seen = discovered_new_paths(self._seen_by_dir.get(self._path), current_paths)
         self._seen_by_dir[self._path] = seen
@@ -1828,6 +1989,8 @@ class SftpWindow(QWidget):
         )
         totals = group_total_bytes(entries)
         counts = group_part_counts(entries)
+        root = self._local_root()
+        copies = LocalCopies(root, sensor=self._sensor_key()) if root is not None else None  # one folder read per refresh
         self.table.blockSignals(True)
         while self.table.topLevelItemCount():
             self.table.takeTopLevelItem(0)
@@ -1886,7 +2049,12 @@ class SftpWindow(QWidget):
                         child.setToolTip(3, format_datetime(entry.modified))
                     if child_rec is not None:
                         child.setToolTip(8, "Requested recording time of the whole capture, not this part.")
+                    state, detail, local_path = self._initial_local_state(entry, copies)
+                    child.setText(COL_LOCAL, state if not detail else f"{state} {detail}")
+                    child.setToolTip(COL_LOCAL, local_path or state)
+                    self._items_by_path[entry.path] = child
                     parent.addChild(child)
+                self._sync_group_local_state(parent)
                 self.table.addTopLevelItem(parent)
                 parent.setExpanded(node.group_key in self._expanded_groups)
                 continue
@@ -1925,9 +2093,21 @@ class SftpWindow(QWidget):
                 item.setToolTip(3, format_datetime(entry.modified))
             if rec is not None:
                 item.setToolTip(8, "Requested recording time, not read from this file.")
+            if not entry.is_dir:
+                state, detail, local_path = self._initial_local_state(entry, copies)
+                item.setText(COL_LOCAL, state if not detail else f"{state} {detail}")
+                item.setToolTip(COL_LOCAL, local_path or state)
+                self._items_by_path[entry.path] = item
             self.table.addTopLevelItem(item)
         self._sync_sort_headers()
         self._restore_selected_identities(selected)
+        if not selected and current_identity:
+            # Nothing was selected, but keep the keyboard focus on the same row.
+            for item in self._iter_tree_items():
+                if self._item_identity(item) == current_identity:
+                    self.table.setCurrentItem(item)
+                    break
+        self.table.verticalScrollBar().setValue(scroll)
         self.table.blockSignals(False)
         self._on_selection_changed()
 

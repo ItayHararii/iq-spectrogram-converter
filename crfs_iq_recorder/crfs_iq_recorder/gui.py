@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
@@ -45,7 +46,6 @@ from PySide6.QtWidgets import (
 from . import APP_NAME, __version__
 from .api_client import EmpClient, HttpOutcome
 from .cellular_panel import CellularPanel
-from .cellular_plan import REQUEST_SENTENCE
 from .cellular_runner import OWNER, S_INTERRUPTED, CellularRunner
 from .capture_api import (
     OUTCOME_BUSY,
@@ -98,6 +98,7 @@ from .capture_measure import (
 from . import desktop_open, diagnostic_log
 from .diagnostic_log import diag, register_secret, scrub_operator
 from .diagnostic_report import RECENT_LINES, build_report
+from .download_paths import existing_copy, local_destination
 from .operator_text import files_text, measured_text, range_text, seconds_text, sensor_notice
 from .excel_log import ExcelLogStore, flush_excel_queue, pending_from_row
 from .excel_writer import ExcelRow
@@ -141,7 +142,6 @@ from .recording_download import RecordingDownload
 from .result_card import ResultCard
 from .file_measurements import record_parts
 from .result_view import ResultView, view_from_summary
-from .waterfall_dialog import WaterfallDialog
 from .recording_status import (
     CONFIRMED,
     FAILED,
@@ -202,6 +202,7 @@ from .worker_threads import track as track_worker_thread
 
 TAB_MANUAL = "Manual Recording"
 TAB_EXCEL = "Excel Collection"
+_SEE_DETAILS = re.compile(r"\s*See (the )?(diagnostic log|details)\.\s*$")
 
 
 def configure_appearance(app: QApplication, mode: str | None = None) -> None:
@@ -358,7 +359,6 @@ class MainWindow(QMainWindow):
         self._last_manual_summary: CaptureSummary | None = None
         self._manual_download: RecordingDownload | None = None
         self._manual_download_text = ""
-        self._waterfall: WaterfallDialog | None = None
         self._watching = False
         self._waiting = False
         self._wait_deadline = 0.0
@@ -499,10 +499,14 @@ class MainWindow(QMainWindow):
             # to paint and settle before the first queue flush.
             QTimer.singleShot(1500, self._flush_excel)
 
+    # Set by main() when the saved download folder could not be prepared at start-up;
+    # that line is already in the log, so the location check does not repeat it.
+    _download_dir_unusable = False
+
     def _report_missing_locations(self) -> None:
         """Restored settings that point nowhere: one actionable line each, nothing else changes."""
         stored = str(self._conn.download_dir or "").strip()
-        if stored and not self._conn.demo:
+        if stored and not self._conn.demo and not self._download_dir_unusable:
             folder = resolved_download_dir(stored)
             if not folder.exists():
                 drive = Path(folder.anchor) if folder.anchor else None
@@ -792,7 +796,6 @@ class MainWindow(QMainWindow):
         self.manual_result = ResultCard("Last recording", downloadable=True)
         self.manual_result.download_clicked.connect(self._download_last_recording)
         self.manual_result.open_folder_clicked.connect(self._open_last_recording_folder)
-        self.manual_result.waterfall_clicked.connect(self._show_last_recording_waterfall)
         layout.addWidget(self.manual_result)
 
         merge_row = QHBoxLayout()
@@ -878,10 +881,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(18, 14, 18, 14)
         layout.setSpacing(10)
         layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
-        intro = QLabel(REQUEST_SENTENCE)
-        intro.setObjectName("muted")
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
         self.cellular_panel = CellularPanel(self._cellular, host=self, config_dir=user_config_dir())
         layout.addWidget(self.cellular_panel)
         layout.addStretch(1)
@@ -1020,11 +1019,18 @@ class MainWindow(QMainWindow):
         grid.addWidget(FieldLabel("Worksheet"), 3, 0)
         grid.addWidget(self.sheet_combo, 3, 1)
 
+        layout.addWidget(details)
+        # Outside the collapsible block: a pending Excel update stays visible when logging is switched off.
         self.collection_status = QLabel("Recordings completed: 0  ·  Files found: 0  ·  Excel: Idle")
         self.collection_status.setObjectName("muted")
         self.collection_status.setWordWrap(True)
-        grid.addWidget(self.collection_status, 4, 1)
-        layout.addWidget(details)
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(12)
+        status_row.addSpacing(LABEL_W + 12)
+        status_row.addWidget(self.collection_status, 1)
+        self._collection_status_row = status_row
+        layout.addLayout(status_row)
         self._sync_excel_details()
         return box
 
@@ -1040,17 +1046,8 @@ class MainWindow(QMainWindow):
         title.setObjectName("sectionTitle")
         self.clear_btn = self._ghost_button("Clear", "Empty the activity log")
         self.clear_btn.clicked.connect(self._clear_log)
-        self.details_btn = self._ghost_button("See details", "Open the diagnostic log: sensor replies, exact requests and errors")
-        self.details_btn.clicked.connect(self._open_diagnostic_log)
-        self.copy_details_btn = self._ghost_button(
-            "Copy details",
-            "Copy diagnostic details of the last recording for support (no passwords or sensor address)",
-        )
-        self.copy_details_btn.clicked.connect(self._copy_diagnostic_details)
         head.addWidget(title)
         head.addStretch()
-        head.addWidget(self.details_btn)
-        head.addWidget(self.copy_details_btn)
         head.addWidget(self.clear_btn)
         layout.addLayout(head)
         self.log_edit = QPlainTextEdit()
@@ -1059,8 +1056,23 @@ class MainWindow(QMainWindow):
         self.log_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.log_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.log_edit.setMinimumWidth(160)
+        # Support actions live in the right-click menu, out of the everyday view.
+        self.log_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.log_edit.customContextMenuRequested.connect(self._show_log_menu)
         layout.addWidget(self.log_edit, 1)
         return self.log_panel
+
+    def _log_menu(self):
+        menu = self.log_edit.createStandardContextMenu()
+        menu.addSeparator()
+        menu.addAction("Copy diagnostic details", self._copy_diagnostic_details)
+        menu.addAction("Open diagnostic log", self._open_diagnostic_log)
+        return menu
+
+    def _show_log_menu(self, pos) -> None:
+        menu = self._log_menu()
+        menu.exec(self.log_edit.mapToGlobal(pos))
+        menu.deleteLater()
 
     def _toggle_log(self) -> None:
         if self._log_collapsed:
@@ -1260,6 +1272,9 @@ class MainWindow(QMainWindow):
             return
         visible = bool(self.excel_check.isChecked())
         self.excel_details.setVisible(visible)
+        # The status line stays while rows wait for Excel, even with logging switched off.
+        pending = self._excel_store.pending_count() if getattr(self, "_excel_store", None) is not None else 0
+        self.collection_status.setVisible(visible or pending > 0)
         section = getattr(self, "excel_section", None)
         if section is None:
             return
@@ -1431,6 +1446,8 @@ class MainWindow(QMainWindow):
             f"Recordings completed: {self._recordings_completed}  ·  "
             f"Files found: {self._files_found}  ·  {excel}"
         )
+        # Visible whenever logging is on, and while rows still wait for Excel after it was switched off.
+        self.collection_status.setVisible(bool(pending) or (hasattr(self, "excel_check") and self.excel_check.isChecked()))
         self._refresh_manual_card()
 
     def _flush_excel(self) -> None:
@@ -1465,9 +1482,11 @@ class MainWindow(QMainWindow):
             return
         saved, pending = result if isinstance(result, tuple) and len(result) == 2 else (0, 0)
         if saved:
-            self.log(f"Excel updated: {saved} row" + ("" if saved == 1 else "s") + ".")
+            # Named, because the Excel Collection reports its protocol workbook rows in the same words.
+            book = Path(str(self._conn.excel_workbook or "")).name or "the Excel log"
+            self.log(f"Excel log updated: {saved} row" + ("" if saved == 1 else "s") + f" in {book}.")
         if pending:
-            self.log(f"Excel update pending: {pending} row" + ("" if pending == 1 else "s") + ".")
+            self.log(f"Excel log update pending: {pending} row" + ("" if pending == 1 else "s") + ".")
         self._update_collection_status()
         if self._excel_flush_again:
             self._excel_flush_again = False
@@ -1997,7 +2016,8 @@ class MainWindow(QMainWindow):
 
     def log(self, message: str, *, level: str = "info") -> None:
         """One short operator message in the Activity panel (also kept in the diagnostic log)."""
-        text = scrub_operator(message)
+        # The detail is in the diagnostic log (right-click the Activity panel); no button to point at.
+        text = _SEE_DETAILS.sub("", scrub_operator(message))
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_edit.appendPlainText(f"[{stamp}] {text}")
         self.log_edit.moveCursor(QTextCursor.MoveOperation.End)
@@ -2072,7 +2092,8 @@ class MainWindow(QMainWindow):
         except OSError:
             self.log("The download folder cannot be used. Check Settings.", level="error")
             return
-        job = RecordingDownload(self._conn, view.remote_paths, dict(summary.sizes), folder, parent=self)
+        serial = str(getattr(self._sensor_info, "serial", "") or "").replace("—", "").strip()
+        job = RecordingDownload(self._conn, view.remote_paths, dict(summary.sizes), folder, parent=self, sensor=serial or str(self._conn.host or ""))
         job.progress.connect(self._on_manual_download_progress)
         job.finished.connect(self._on_manual_download_done)
         job.failed.connect(self._on_manual_download_failed)
@@ -2109,20 +2130,6 @@ class MainWindow(QMainWindow):
         view = self.manual_result.view
         if view is not None and view.local_paths and not desktop_open.reveal(view.local_paths[0]):
             self.log("Could not open the folder.", level="error")
-
-    def _show_last_recording_waterfall(self) -> None:
-        view = self.manual_result.view
-        if view is None or not view.local_paths:
-            return
-        self._waterfall = WaterfallDialog(
-            view.local_paths[0],
-            center_hz=view.centre_hz,
-            bandwidth_hz=view.bandwidth_hz,
-            requested_start_hz=view.requested_start_hz,
-            requested_stop_hz=view.requested_stop_hz,
-            parent=self,
-        )
-        self._waterfall.show()
 
     def _client(self) -> EmpClient:
         if self._conn.demo:
@@ -3149,7 +3156,8 @@ class MainWindow(QMainWindow):
         if mapping is None:
             return
         local_dir = resolved_download_dir(self._conn.download_dir)
-        local = local_dir / entry.name
+        # The file is saved in the sensor's dated folder (or, by older versions, in the root).
+        local = existing_copy(local_dir, entry.path, int(getattr(entry, "size", 0) or 0)) or local_destination(local_dir, entry.path)
         row = ExcelRow(
             worksheet=record.worksheet or mapping.worksheet,
             collection_event=record.collection_event or self.event_combo.currentText().strip(),
@@ -3882,6 +3890,7 @@ def run(*, demo: bool = False) -> int:
         window._conn.download_dir = str(folder)
     except OSError as exc:
         diag("download_dir_unusable", f"{type(exc).__name__}: {exc}")
+        window._download_dir_unusable = True
         window.log("The download folder cannot be used. Check Settings.", level="error")
     window.show()
     rc = app.exec()

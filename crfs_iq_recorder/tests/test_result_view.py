@@ -39,7 +39,9 @@ def test_complete_recording_shows_requested_received_and_the_recorded_range():
     assert view.received == "Received (read from the files): 2 files, 2.000 s, 2 kB"
     assert view.recorded == "Recorded (file metadata): 3500-3600 MHz (100 MHz)"
     assert (view.tag, view.tag_style) == ("Complete", "badgeOk")
-    assert view.states_text == "Files ready · On the sensor"
+    assert view.states_text == "Recording complete · On the sensor"
+    assert view.facts_text == "2 files · 2.000 s · 2 kB", "the compact card line: files, measured seconds, size"
+    assert view.coverage_note == "", "the sensor's range equals the requested one: nothing to add"
     assert not view.local_ready
 
 
@@ -48,7 +50,8 @@ def test_short_recording_is_tagged_partial_and_the_tolerance_is_two_percent():
     view = view_from_summary(_summary("partial", [_part(PATHS[0], 1.4)]))
     assert view.received == "Received (read from the files): 1 file, 1.400 s, 1 kB"
     assert (view.tag, view.tag_style) == ("Partial", "badgeWait")
-    assert view.recording_state == "Files ready"
+    assert view.recording_state == "Partial recording"
+    assert view.facts_text == "1 file · 1.400 s · 1 kB"
 
 
 def test_unread_metadata_reads_unknown_never_the_requested_values():
@@ -56,7 +59,8 @@ def test_unread_metadata_reads_unknown_never_the_requested_values():
     view = view_from_summary(_summary("unconfirmed", parts))
     assert view.received == "Received (read from the files): 1 file, duration unknown"
     assert view.recorded == "Recorded (file metadata): unknown"
-    assert (view.tag, view.recording_state) == ("Uncertain", "Not confirmed")
+    assert (view.tag, view.recording_state) == ("Uncertain", "Recording not confirmed")
+    assert view.facts_text == "1 file · duration unknown · 1 kB"
 
 
 def test_a_wider_request_recorded_narrower_says_so():
@@ -68,6 +72,7 @@ def test_a_wider_request_recorded_narrower_says_so():
     # Counted as completed (time and data), but the badge does not claim the requested range.
     assert view.result == "completed"
     assert (view.tag, view.tag_style) == ("Other range", "badgeWait")
+    assert view.coverage_note == "Sensor reported 3500-3600 MHz (100 MHz), not the requested range"
 
 
 def test_node_100_18_file_shows_its_measured_seconds_rate_and_decimal_size():
@@ -81,6 +86,7 @@ def test_node_100_18_file_shows_its_measured_seconds_rate_and_decimal_size():
     assert view.requested == "Requested: 500 MHz for 0.5 s"
     assert view.received == "Received (read from the files): 1 file, 0.503 s at 125 MS/s, 251.4 MB"
     assert view.recorded == "Recorded (file metadata): 3500-3600 MHz (100 MHz), not the requested range"
+    assert view.facts_text == "1 file · 0.503 s · 251.4 MB"
 
 
 def test_no_files_is_failed_with_no_transfer_state():
@@ -88,6 +94,7 @@ def test_no_files_is_failed_with_no_transfer_state():
     assert view.received == "Received: no files" and view.recorded == "Recorded (file metadata): unknown"
     assert (view.tag, view.tag_style) == ("Failed", "badgeBad")
     assert view.transfer_state == "" and view.states_text == "Not recorded"
+    assert view.facts_text == "No files"
 
 
 def test_local_copies_count_only_the_recording_s_files_in_the_folder(tmp_path):
@@ -100,11 +107,20 @@ def test_local_copies_count_only_the_recording_s_files_in_the_folder(tmp_path):
     assert view.local_ready and view.transfer_state == SAVED_LOCALLY
 
 
+def test_local_copies_look_in_the_sensor_s_dated_folder_first(tmp_path):
+    dated = tmp_path / "20261103"
+    dated.mkdir()
+    (dated / "iq_20261103_171321_0001.wav").write_bytes(b"x" * 10)
+    (tmp_path / "iq_20261103_171321_0002.wav").write_bytes(b"y")  # saved by an older version in the root
+    assert local_copies(PATHS, tmp_path) == [str(dated / "iq_20261103_171321_0001.wav"), str(tmp_path / "iq_20261103_171321_0002.wav")]
+
+
 def test_transfer_state_follows_the_task_files():
     assert transfer_state([]) == ""
     assert transfer_state([{"download_status": "verified"}, {"download_status": "verified"}]) == SAVED_LOCALLY
     assert transfer_state([{"download_status": "verified"}, {"download_status": "downloading"}]) == "Downloading 1 of 2"
     assert transfer_state([{"download_status": "present"}]) == "Downloading"
+    assert transfer_state([{"download_status": "pending"}]) == "Download queued"
     assert transfer_state([{"download_status": "verified"}, {"download_status": "failed"}]) == DOWNLOAD_FAILED
     assert transfer_state([{"download_status": "not_requested"}]) == ON_SENSOR
 
@@ -120,9 +136,13 @@ def test_task_view_keeps_recording_transfer_and_excel_apart(tmp_path):
     )
     view = view_from_task(state, title="Row 1 of 1: 3500-3600 MHz", bandwidth_hz=100 * MHZ, centre_hz=3550 * MHZ,
                           seconds=2.0, excel_state="Excel update pending")
-    assert view.states_text == "Files ready · Saved locally · Excel update pending"
+    assert view.states_text == "Recording complete · Download saved · Excel update pending"
     assert view.local_paths == [str(local)] and view.attempt == 2
     rejected = SimpleNamespace(summary={}, files=[], result="failed", attempts=1)
     view = view_from_task(rejected, title="Row 1 of 1", bandwidth_hz=100 * MHZ, centre_hz=3550 * MHZ, seconds=2.0)
     assert view.requested == "Requested: 100 MHz for 2 s" and view.received == "Received: no files"
-    assert view.tag == "Failed" and view.transfer_state == ""
+    assert view.tag == "Failed" and view.transfer_state == "" and view.facts_text == "No files"
+    # Verified once, then the file went missing: never "saved" next to an unusable Open folder.
+    local.unlink()
+    view = view_from_task(state, title="Row 1 of 1", bandwidth_hz=100 * MHZ, centre_hz=3550 * MHZ, seconds=2.0)
+    assert view.transfer_state == "Local copy missing" and not view.local_ready and view.local_paths == []

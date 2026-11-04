@@ -82,7 +82,8 @@ from .cellular_workbook import (
 )
 from .cellular_preflight import PreflightResult, default_probes, gather_preflight
 from .diagnostic_log import diag
-from .download_util import already_saved, part_path
+from .download_paths import candidate_paths, existing_copy, local_destination, local_folder, plan_destinations, remote_name
+from .download_util import already_saved, cleanup_part, part_path
 from .excel_writer import ExcelBusyError
 from .operator_text import clip, files_text, seconds_text
 from .result_view import EXCEL_FAILED, EXCEL_PENDING, EXCEL_UPDATED, ResultView, view_from_task
@@ -1269,6 +1270,60 @@ class CellularRunner(QObject):
         else:
             runner(work, apply)
 
+    def readiness_check(self, plan, settings: CampaignSettings):
+        """(work, apply) for "Check readiness": the pre-collection checks, with nothing started.
+
+        ``work()`` runs on a worker and returns a PreflightResult; ``apply(result)``
+        returns ``(text, blocking, temporary)`` where ``blocking`` means Start would
+        pause at once and ``temporary`` means only Excel is unavailable for now
+        (results would queue). The outcome is written to the diagnostic log.
+        """
+        host = self.host
+        conn = getattr(host, "_conn", None)
+        probes = default_probes(host, conn)
+        expected = {"model": settings.sensor_model, "serial": settings.sensor_serial}
+        local_dir = Path(self._download_dir())
+        reserve = int(settings.local_reserve_bytes)
+        excel_on = bool(settings.protocol_results) or self._excel_target() is not None
+        workbook = settings.protocol_path if excel_on and settings.protocol_path else ""
+        sheet = settings.protocol_sheet
+        protocol_loaded = bool(settings.plan_rows)
+
+        def work() -> PreflightResult:
+            return gather_preflight(
+                plan=plan,
+                local_dir=local_dir,
+                reserve_bytes=reserve,
+                expected_identity=expected if expected.get("serial") else None,
+                workbook_path=workbook or None,
+                workbook_sheet=sheet,
+                protocol_loaded=protocol_loaded,
+                fetch_info=probes["fetch_info"],
+                fetch_clock=probes["fetch_clock"],
+                fetch_storage=probes["fetch_storage"],
+                workbook_state=probes["workbook_state"],
+                previous_identity=None,
+            )
+
+        def apply(result) -> tuple[str, bool, bool]:
+            if not isinstance(result, PreflightResult):
+                diag("readiness_check", "incomplete", result=str(result)[:200])
+                return "The check could not be completed. Try again.", True, False
+            diag("readiness_check", result.level, checks=[c.to_dict() for c in result.checks], duration_s=round(result.duration_s, 2))
+            blocking = result.blocking()
+            if blocking:
+                return clip("Not ready: " + " ".join(c.message for c in blocking), 220), True, False
+            if result.excel_waiting():
+                others = [c for c in result.problems() if c.name != "workbook"]
+                note = " " + clip(" ".join(c.message for c in others), 120) if others else ""
+                return "Ready to start. Excel is not available right now: results will wait in the queue until it is." + note, False, True
+            problems = result.problems()
+            if problems:
+                return clip("Ready to start, with notes: " + " ".join(c.message for c in problems), 220), False, False
+            return f"Ready to start ({len(result.checks)} checks passed).", False, False
+
+        return work, apply
+
     def _note_clock(self, result: PreflightResult) -> None:
         """Keep the sensor clock reading (offset to the computer, time source) with the session."""
         if self.session is None:
@@ -1806,18 +1861,28 @@ class CellularRunner(QObject):
             return
         folder = Path(self._download_dir())
         folder.mkdir(parents=True, exist_ok=True)
-        local = folder / str(item["name"])
         state = self.session.task_by_key(round_id, task_key)
-        leftover = part_path(local)
-        if leftover.exists():
-            # An interrupted transfer (.part) from before a restart or a lost
-            # connection: never counted as the file; replaced by this download.
+        local = self._local_destination(state, item, folder)
+        try:
+            local.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            diag("download_folder_failed", str(item["name"]), folder=str(local.parent), error=str(exc))
+            local = folder / str(item["name"])
+        # An interrupted transfer (.part) from before a restart or a lost connection,
+        # at this destination or where an older version saved it: never counted as the
+        # file; removed and replaced by this download.
+        for stale in {local, *candidate_paths(folder, str(item.get("remote_path") or ""), sensor=self._sensor_key())}:
+            leftover = part_path(stale)
+            if not leftover.exists():
+                continue
             try:
                 size = leftover.stat().st_size
             except OSError:
                 size = 0
-            diag("download_part_leftover", str(item["name"]), part_bytes=size)
+            diag("download_part_leftover", str(item["name"]), part_bytes=size, part=str(leftover))
             item["note"] = f"An unfinished download ({size:,} bytes, .part) was found and is replaced by a fresh transfer."
+            if stale != local:
+                cleanup_part(leftover)
         if already_saved(local, int(item.get("size") or 0)):
             problem, stages = self._verify_local_copy(state, item, local)
             if not problem:
@@ -1863,6 +1928,54 @@ class CellularRunner(QObject):
         track_worker_thread(thread, worker)
         thread.start()
         self._save()
+
+    def _sensor_key(self) -> str:
+        """Serial of the connected sensor (else its address): names the sub-folder when two sensors clash."""
+        info = getattr(self.host, "_sensor_info", None)
+        serial = _identity_text(getattr(info, "serial", ""))
+        if serial:
+            return serial
+        sensor = self.session.sensor if self.session is not None else {}
+        if sensor and sensor.get("serial"):
+            return str(sensor["serial"])
+        conn = getattr(self.host, "_conn", None)
+        return str(getattr(conn, "host", "") or "")
+
+    def _local_destination(self, state: TaskState | None, item: dict[str, Any], root: Path) -> Path:
+        """Where this file is saved: the sensor's dated folder under the download root.
+
+        All parts of one recording share a folder (the folder of a part already
+        saved wins); a copy saved by an earlier version in the flat root is used
+        where it is; a different file of the same name is never overwritten
+        (see download_paths).
+        """
+        remote = str(item.get("remote_path") or "")
+        name = str(item.get("name") or remote_name(remote))
+        size = int(item.get("size") or 0)
+        sensor = self._sensor_key()
+        known = existing_copy(root, remote, size, sensor=sensor) if remote else None
+        if known is not None:
+            return known
+        if state is not None:
+            for sibling in state.files:
+                if sibling is item:
+                    continue
+                saved = str(sibling.get("local_path") or "")
+                if saved and Path(saved).parent.exists():
+                    sibling_dest = Path(saved).parent / name
+                    present = sibling_dest.stat().st_size if sibling_dest.is_file() else None
+                    if present is None or present == size:
+                        return sibling_dest
+        if state is not None and remote:
+            plan = plan_destinations(
+                root,
+                [str(f.get("remote_path") or "") for f in state.files],
+                lambda path: next((int(f.get("size") or 0) for f in state.files if str(f.get("remote_path") or "") == path), 0),
+                sensor=sensor,
+            )
+            if remote in plan:
+                return plan[remote]
+        return local_destination(root, remote, sensor="") if remote else root / name
 
     def _verify_local_copy(self, state: TaskState | None, item: dict[str, Any], path: Path) -> tuple[str, dict[str, str]]:
         """(problem, stages) for a local file against the sensor's; problem is '' when size and structure check out.
@@ -2614,7 +2727,9 @@ class CellularRunner(QObject):
                     problem = "not written" in note or "unchanged" in note or "could not" in note
                     self._log(f"Excel: {clip(note, 150)}", "error" if problem else "info")
                 if report.written:
-                    self._log(f"Excel updated: {report.written} row" + ("" if report.written == 1 else "s") + ".")
+                    # Named, because the recording log of the Manual tab reports its own rows in the same words.
+                    where = Path(report.workbooks[-1]).name if report.workbooks else "the protocol workbook"
+                    self._log(f"Excel updated: {report.written} row" + ("" if report.written == 1 else "s") + f" in {where}.")
                 if report.busy:
                     self._workbook_status = "busy"
                     self._workbook_note = report.busy
@@ -2658,6 +2773,19 @@ class CellularRunner(QObject):
                 return 0
             queue = self.workbook_queue()
         return queue.pending_count()
+
+    def written_workbook(self) -> str:
+        """The protocol workbook that actually received results ('' until a row was saved).
+
+        Read from the persistent queue, so it survives a restart and stays the
+        file the rows went into even after another workbook is chosen.
+        """
+        queue = self._workbook_queue
+        if queue is None:
+            if not queue_path(self._config_dir).is_file():
+                return ""
+            queue = self.workbook_queue()
+        return queue.written_workbook()
 
     def workbook_text(self) -> str:
         """'Excel updated' / 'Waiting for Excel' / 'Excel update failed' / '' for the status line."""
@@ -2744,12 +2872,30 @@ class CellularRunner(QObject):
             # A later attempt never overwrites the manifest of an earlier one.
             fallback += f"_attempt{state.attempts}"
         try:
-            path = write_manifest(manifest_path(Path(self._download_dir()), stem, fallback_name=fallback), data)
+            path = write_manifest(manifest_path(self._task_folder(state), stem, fallback_name=fallback), data)
             state.manifest_path = str(path)
         except OSError as exc:
             state.notes.append(f"Manifest not written: {exc}")
             diag("manifest_failed", planned.label(), error=f"{type(exc).__name__}: {exc}")
             self._log(f"Could not save the record file for {self._row_position(planned)}. See details.", "error")
+
+    def _task_folder(self, state: TaskState) -> Path:
+        """The local folder of a recording: where its parts were saved, else the sensor's dated folder."""
+        root = Path(self._download_dir())
+        for item in state.files:
+            saved = str(item.get("local_path") or "")
+            if saved:
+                return Path(saved).parent
+        for item in state.files:
+            remote = str(item.get("remote_path") or "")
+            if remote:
+                folder = local_folder(root, remote)
+                try:
+                    folder.mkdir(parents=True, exist_ok=True)
+                    return folder
+                except OSError:
+                    return root
+        return root
 
     def _rewrite_manifest(self, state: TaskState) -> None:
         planned = self.session.planned(state.task_key) if self.session is not None else None
@@ -3073,7 +3219,13 @@ class CellularRunner(QObject):
             for state in tasks:
                 for item in state.files:
                     name = str(item.get("name") or "")
-                    if name and part_path(folder / name).exists():
+                    if not name:
+                        continue
+                    candidates = [folder / name, local_destination(folder, str(item.get("remote_path") or name))]
+                    saved = str(item.get("local_path") or "")
+                    if saved:
+                        candidates.append(Path(saved))
+                    if any(part_path(path).exists() for path in candidates):
                         out.append(name)
         return out
 
@@ -3339,6 +3491,7 @@ class CellularRunner(QObject):
                 "workbook_status": self._workbook_status,
                 "workbook_note": self._workbook_note,
                 "workbook_text": self.workbook_text(),
+                "written_workbook": self.written_workbook(),
                 "preflight_pending": False,
                 "pending_work": "",
             }
@@ -3368,7 +3521,11 @@ class CellularRunner(QObject):
         uncertain_total = sum(1 for items in session.tasks.values() for t in items if t.status in UNCERTAIN)
         rows_total = session.plan.row_count or len(session.settings.rows())
         row_position = self._row_position(planned) if planned is not None else ""
-        recording = f"Recording {row_position}: {planned.range_text}" if planned is not None else ""
+        # Row, band and direction, then the requested range: what is being recorded right now.
+        recording = (
+            " · ".join(part for part in (f"Recording {row_position}", self.row_label(planned), planned.range_text) if part)
+            if planned is not None else ""
+        )
         if self._idle_check_pending and not recording:
             recording = "Checking the sensor is free"
         if self._preflight_pending and not recording:
@@ -3462,6 +3619,7 @@ class CellularRunner(QObject):
             "workbook_status": self._workbook_status,
             "workbook_note": self._workbook_note,
             "workbook_text": self.workbook_text(),
+            "written_workbook": self.written_workbook(),
             "preflight_pending": self._preflight_pending,
             "preflight_level": self._preflight_last.level if self._preflight_last is not None else "",
             "pending_work": self.pending_work_text() if self.state in {S_INTERRUPTED, S_DONE} else "",

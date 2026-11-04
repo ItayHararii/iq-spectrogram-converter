@@ -224,6 +224,33 @@ def test_the_sensor_position_from_a_reply_body_is_never_written_out():
     assert "12.345678" not in text and "98.765432" not in text
 
 
+def test_activity_lines_do_not_point_at_a_details_button_that_is_not_there(qapp):
+    """1.16: the Details / Copy details buttons left the everyday view; the phrase goes with them and
+    the support actions sit in the Activity panel's right-click menu."""
+    from PySide6.QtCore import Qt
+
+    from crfs_iq_recorder.gui import MainWindow
+
+    window = MainWindow(demo=True)
+    try:
+        window.log("CRFS rejected the request. See details.", level="error")
+        window.log("Could not open Sensor Files. See the diagnostic log.")
+        window.log("Recording confirmed: 2 files, 1.98 s.")
+        lines = window.log_edit.toPlainText().splitlines()[-3:]
+        assert lines[0].endswith("CRFS rejected the request.") and "details" not in lines[0]
+        assert lines[1].endswith("Could not open Sensor Files.")
+        assert lines[2].endswith("Recording confirmed: 2 files, 1.98 s.")
+        assert not hasattr(window, "details_btn") and not hasattr(window, "copy_details_btn")
+        menu = window._log_menu()
+        actions = [a.text() for a in menu.actions() if a.text()]
+        menu.deleteLater()
+        assert {"Copy diagnostic details", "Open diagnostic log"} <= set(actions), actions
+        assert window.log_edit.contextMenuPolicy() == Qt.ContextMenuPolicy.CustomContextMenu
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
 def test_copy_details_in_the_window_masks_the_stored_passwords(qapp):
     from PySide6.QtWidgets import QApplication
 

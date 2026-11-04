@@ -152,6 +152,61 @@ def excel_has_workbook(path: Path) -> bool:
     return excel_workbook_state(path) == OPEN
 
 
+def activate_workbook(path: Path) -> bool:
+    """Bring this workbook to the front when the running Excel holds it; False when it is not open.
+
+    Used by "Open written Excel file": a workbook that Excel already has must
+    not be opened a second time (Excel would refuse or open it read-only).
+    """
+    try:
+        import win32com.client  # type: ignore
+        import pythoncom  # type: ignore
+    except ImportError:
+        return False
+    if not _excel_window_exists():
+        return False
+    try:
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
+    try:
+        try:
+            app = win32com.client.GetActiveObject("Excel.Application")
+        except Exception:
+            return False
+        want = _norm(path)
+        try:
+            for book in app.Workbooks:
+                try:
+                    if _norm(Path(str(book.FullName))) != want:
+                        continue
+                    book.Activate()
+                    try:
+                        app.Visible = True
+                        window = app.ActiveWindow
+                        if window is not None and int(window.WindowState) == -4140:  # xlMinimized
+                            window.WindowState = -4143  # xlNormal
+                    except Exception:
+                        pass
+                    try:
+                        import ctypes
+
+                        ctypes.windll.user32.SetForegroundWindow(int(app.Hwnd))
+                    except Exception:
+                        pass
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
 def _range_values(sheet, first_row: int, first_col: int, last_row: int, last_col: int) -> list[list]:
     """Read a block with one COM call. Cell-by-cell access costs ~50 µs per cell."""
     if last_row < first_row or last_col < first_col:

@@ -1,17 +1,26 @@
-"""The last recording of a workflow: requested next to received, its states, and its files."""
+"""The last recording of a workflow, as a compact three-line summary.
+
+    LAST RECORDING  Row 19 of 20 · 3700-3800 MHz                [Complete]
+    1 file · 0.503 s · 251.4 MB
+    Recording complete · Download saved · Excel updated
+    [Open folder]
+
+The requested, received and recorded values stay on the ResultView for
+validation and the diagnostic log; only the facts line, the states line and a
+short coverage note (when the sensor reported another range) are shown here.
+"""
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
-from .result_view import DOWNLOAD_REQUIRED, ResultView
+from .result_view import ResultView
 from .theme import restyle
 
 
 class ResultCard(QFrame):
     open_folder_clicked = Signal()
-    waterfall_clicked = Signal()
     download_clicked = Signal()
 
     def __init__(self, heading: str = "Last recording", *, downloadable: bool = False, parent=None) -> None:
@@ -39,40 +48,30 @@ class ResultCard(QFrame):
         head.addWidget(self.tag, 0, Qt.AlignmentFlag.AlignTop)
         layout.addLayout(head)
 
-        self.requested = QLabel("")
-        self.received = QLabel("")
-        self.recorded = QLabel("")
+        self.facts = QLabel("")
+        self.facts.setToolTip("Files, measured duration and size read from the downloaded or listed files; \"unknown\" when not read.")
+        self.coverage = QLabel("")
+        self.coverage.setObjectName("warn")
+        self.coverage.setToolTip("The range CRFS stored in the file differs from the requested range in the title.")
         self.states = QLabel("")
         self.states.setObjectName("muted")
-        self.requested.setToolTip("What the application asked CRFS for: bandwidth and duration as sent.")
-        self.received.setToolTip(
-            "Read from each file's WAVE header: samples divided by the sample rate, and the file sizes. "
-            "\"unknown\" when the header could not be read."
-        )
-        self.recorded.setToolTip(
-            "The centre frequency and bandwidth CRFS stored in the file. \"unknown\" when the file holds none."
-        )
-        for label in (self.requested, self.received, self.recorded, self.states):
+        self.states.setToolTip("Recording, download and Excel are reported separately; a slow download never means the recording is still running.")
+        for label in (self.facts, self.coverage, self.states):
             label.setWordWrap(True)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             layout.addWidget(label)
+        self.coverage.setVisible(False)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
         self.download_btn = self._button("Download", "Copy this recording's files from the sensor into the download folder")
         self.download_btn.clicked.connect(self.download_clicked)
         self.download_btn.setVisible(False)
-        self.open_btn = self._button("Open folder", "Show the file in its folder")
+        self.open_btn = self._button("Open folder", "Show the downloaded file in its folder")
         self.open_btn.clicked.connect(self.open_folder_clicked)
-        self.waterfall_btn = self._button("View waterfall", "Show the waterfall of the downloaded file")
-        self.waterfall_btn.clicked.connect(self.waterfall_clicked)
-        self.hint = QLabel("")
-        self.hint.setObjectName("muted")
         buttons.addWidget(self.download_btn)
         buttons.addWidget(self.open_btn)
-        buttons.addWidget(self.waterfall_btn)
-        buttons.addWidget(self.hint, 1)
-        buttons.addStretch(0)  # takes the width while the hint is hidden
+        buttons.addStretch(1)
         layout.addLayout(buttons)
         self.setVisible(False)
 
@@ -101,29 +100,23 @@ class ResultCard(QFrame):
         self.tag.setObjectName(view.tag_style)
         self.tag.setVisible(bool(view.tag))
         restyle(self.tag)
-        self.requested.setText(view.requested)
-        self.received.setText(view.received)
-        self.recorded.setText(view.recorded)
-        self.recorded.setVisible(bool(view.remote_paths))
+        self.facts.setText(view.facts_text)
+        self.facts.setVisible(bool(view.facts_text))
+        self.coverage.setText(view.coverage_note)
+        self.coverage.setVisible(bool(view.coverage_note))
         self.states.setText(view.states_text)
         self.states.setVisible(bool(view.states_text))
         ready = view.local_ready
         if ready:
-            reason = ""
+            tip = "Show the downloaded file in its folder"
         elif not view.remote_paths:
-            reason = "No files were received."
+            tip = "No files were received."
         elif self._downloading:
-            reason = "Downloading…"
+            tip = "Available when the download has finished."
         else:
-            reason = DOWNLOAD_REQUIRED
-        for button, tip in (
-            (self.open_btn, "Show the file in its folder"),
-            (self.waterfall_btn, "Show the waterfall of the downloaded file"),
-        ):
-            button.setEnabled(ready)
-            button.setToolTip(tip if ready else reason)
-        self.hint.setText(reason)
-        self.hint.setVisible(bool(reason))
+            tip = "Available when a verified local copy exists."
+        self.open_btn.setEnabled(ready)
+        self.open_btn.setToolTip(tip)
         can_download = self._downloadable and bool(view.remote_paths) and not ready
         self.download_btn.setVisible(can_download)
         self.download_btn.setEnabled(can_download and not self._downloading)

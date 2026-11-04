@@ -965,6 +965,7 @@ class FlushReport:
     backups: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     blocks_created: list[tuple[str, int, int]] = field(default_factory=list)  # (round_id, ordinal, first_row)
+    workbooks: list[str] = field(default_factory=list)  # workbooks that received rows in this flush
 
     @property
     def ok(self) -> bool:
@@ -1018,6 +1019,29 @@ class WorkbookQueue:
     def was_written(self, round_id: str, plan_index: int) -> bool:
         with self._lock:
             return any(w.get("round_id") == round_id and int(w.get("plan_index", -1)) == plan_index for w in self._data["written"])
+
+    def written_workbook(self) -> str:
+        """Path of the workbook that most recently received results ('' when none has).
+
+        This is the file the rows went into, kept with every written row, so it
+        stays right when the operator later picks another protocol workbook.
+        """
+        with self._lock:
+            for entry in reversed(self._data["written"]):
+                path = str(entry.get("workbook") or "")
+                if path:
+                    return path
+        return ""
+
+    def written_workbooks(self) -> list[str]:
+        """Every workbook that received results, most recent first, without repeats."""
+        out: list[str] = []
+        with self._lock:
+            for entry in reversed(self._data["written"]):
+                path = str(entry.get("workbook") or "")
+                if path and _norm(Path(path)) not in {_norm(Path(p)) for p in out}:
+                    out.append(path)
+        return out
 
     def row_state(self, round_id: str, plan_index: int) -> str:
         """'written', 'pending', 'retrying' (a write failed), 'conflict' (row holds other entries) or ''."""
@@ -1076,7 +1100,9 @@ class WorkbookQueue:
             for item in items:
                 # A result already in the sheet unchanged counts as written too (row 0: not changed now).
                 key = (item.result.round_id, item.result.plan_index)
-                self._data["written"].append({"round_id": key[0], "plan_index": key[1], "row": rows.get(key, 0), "at": now})
+                self._data["written"].append(
+                    {"round_id": key[0], "plan_index": key[1], "row": rows.get(key, 0), "at": now, "workbook": str(item.workbook)}
+                )
             self._data["conflicts"] = [
                 c for c in self._data.get("conflicts") or []
                 if (c.get("round_id"), int(c.get("plan_index", -1))) not in {(i.result.round_id, i.result.plan_index) for i in items}
@@ -1222,6 +1248,8 @@ def flush_queue(queue: WorkbookQueue, *, excel_open: Callable[[Path], Any] | Non
             queue.mark_done(done, written_rows=written.written)
             report.written += len(written.written)
             report.unchanged += written.unchanged
+            if (written.written or done) and str(file) not in report.workbooks:
+                report.workbooks.append(str(file))
             report.notes.extend(written.skipped)
             clashing = [item for item in group if (item.result.round_id, item.result.plan_index) in conflicts]
             if clashing:

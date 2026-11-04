@@ -215,7 +215,8 @@ def test_run_now_sequence_follows_the_worksheet_waits_after_confirmation_and_fin
     assert first.collection_event.startswith("Camp / Site A / Camp_")
     state = runner.current_tasks()[0]
     assert state.status == T_SUBMITTING and state.attempts == 1
-    assert runner.status()["text"] == "Recording row 1 of 3: 703-713 MHz"
+    # Row, band and direction, then the requested range: the operator sees what is being recorded.
+    assert runner.status()["text"] == "Recording row 1 of 3 · 700 MHz UL · 703-713 MHz"
     # Nothing else starts while the capture runs.
     runner._tick()
     assert len(host.requests) == 1
@@ -1607,6 +1608,29 @@ def test_after_a_backlog_pause_the_resume_line_says_which_files_were_not_downloa
     assert runner.state == S_RUNNING
     assert "Not downloaded: 1 file, still on the sensor. The collection continues." in logs
     assert not [m for m in logs if m.startswith("Downloads caught up")]
+
+
+def test_check_readiness_reports_without_starting_anything(qapp, tmp_path):
+    """The button runs the pre-collection checks and says Ready / Not ready in one short line; no request is sent."""
+    from crfs_iq_recorder.cellular_preflight import PreflightResult
+
+    host = FakeHost()
+    runner = _runner(tmp_path, host)
+    plan = _plan(tmp_path)
+    work, apply = runner.readiness_check(plan, _settings(sensor_model="R40-8", sensor_serial="SN1"))
+    result = work()
+    assert isinstance(result, PreflightResult)
+    text, blocking, temporary = apply(result)
+    assert not blocking and not temporary and text.startswith("Ready to start"), text
+    assert host.requests == [] and runner.session is None and host.owner == ""
+    # Another sensor than the plan expects: a short "Not ready" with the reason, still nothing started.
+    work, apply = runner.readiness_check(plan, _settings(sensor_model="R40-8", sensor_serial="OTHER"))
+    text, blocking, temporary = apply(work())
+    assert blocking and text.startswith("Not ready:") and len(text) <= 220, text
+    assert host.requests == [] and runner.session is None
+    # A worker that did not return a result is reported, not treated as ready.
+    text, blocking, _ = apply(RuntimeError("boom"))
+    assert blocking and text == "The check could not be completed. Try again."
 
 
 def test_a_local_copy_counts_as_downloaded_only_when_size_and_samples_match_the_sensor(qapp, tmp_path):

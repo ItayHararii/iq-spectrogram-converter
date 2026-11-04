@@ -214,12 +214,15 @@ class MergeController(QObject):
         """Delete half-written outputs left by an interrupted merge (restart recovery)."""
         removed: list[Path] = []
         try:
-            for leftover in folder.glob(f"*_merged*.wav{PARTIAL_SUFFIX}"):
-                try:
-                    leftover.unlink()
-                    removed.append(leftover)
-                except OSError:
-                    pass
+            # The root and the sensor's dated sub-folders (one level, plus a sensor folder below a date).
+            patterns = (f"*_merged*.wav{PARTIAL_SUFFIX}", f"*/*_merged*.wav{PARTIAL_SUFFIX}", f"*/*/*_merged*.wav{PARTIAL_SUFFIX}")
+            for pattern in patterns:
+                for leftover in folder.glob(pattern):
+                    try:
+                        leftover.unlink()
+                        removed.append(leftover)
+                    except OSError:
+                        pass
         except OSError:
             pass
         for item in removed:

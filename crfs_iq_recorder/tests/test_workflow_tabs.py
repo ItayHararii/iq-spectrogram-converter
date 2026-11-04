@@ -205,7 +205,7 @@ def test_manual_series_pauses_after_the_current_recording_and_paused_time_counts
         _close(window, qapp)
 
 
-def test_manual_result_card_downloads_then_opens_the_folder_and_the_waterfall(qapp, tmp_path, no_desktop_open):
+def test_manual_result_card_downloads_into_the_dated_folder_then_opens_it(qapp, tmp_path, no_desktop_open):
     window = _window(tmp_path)
     try:
         card = window.manual_result
@@ -215,26 +215,23 @@ def test_manual_result_card_downloads_then_opens_the_folder_and_the_waterfall(qa
         assert _pump_until(qapp, lambda: card.view is not None and not window._recording_active)
         assert not card.isHidden()
         assert card.title.text() == "156-162 MHz"
-        assert card.requested.text() == "Requested: 6 MHz for 0.05 s"
-        assert card.received.text().startswith("Received (read from the files): 1 file, ")
-        assert card.states.text() == "Files ready · On the sensor"
-        assert not card.open_btn.isEnabled() and card.open_btn.toolTip() == "Download required."
-        assert not card.waterfall_btn.isEnabled() and card.download_btn.isEnabled()
+        # Compact: one facts line and one states line; no Requested/Received/Recorded paragraphs, no waterfall button.
+        assert card.facts.text().startswith("1 file · ") and "MB" in card.facts.text() or "kB" in card.facts.text(), card.facts.text()
+        assert card.states.text() == "Recording complete · On the sensor"
+        assert not hasattr(card, "waterfall_btn") and not hasattr(card, "requested")
+        assert not card.open_btn.isEnabled() and card.open_btn.toolTip() == "Available when a verified local copy exists."
+        assert card.download_btn.isEnabled()
         card.download_btn.click()
         assert _pump_until(qapp, lambda: window._manual_download is None, timeout=15.0)
-        assert "Saved locally" in card.states.text(), card.states.text()
+        assert "Download saved" in card.states.text(), card.states.text()
+        assert "Download required" not in card.states.text() and "required" not in card.open_btn.toolTip()
         local = Path(card.view.local_paths[0])
-        assert local.is_file() and local.parent == tmp_path / "downloads"
-        assert card.open_btn.isEnabled() and card.waterfall_btn.isEnabled() and not card.download_btn.isEnabled()
+        remote = card.view.remote_paths[0]
+        dated = remote.replace("\\", "/").rsplit("/", 2)[-2]
+        assert local.is_file() and local.parent == tmp_path / "downloads" / dated, "mirrors the sensor's dated folder"
+        assert card.open_btn.isEnabled() and not card.download_btn.isEnabled()
         card.open_btn.click()
         assert no_desktop_open == [("reveal", str(local))]
-        card.waterfall_btn.click()
-        dialog = window._waterfall
-        assert dialog is not None
-        assert _pump_until(qapp, lambda: not dialog.running(), timeout=30.0)
-        assert not dialog.error and dialog.result is not None, dialog.error
-        assert dialog.image.pixmap() is not None and not dialog.image.pixmap().isNull()
-        dialog.close()
     finally:
         _close(window, qapp)
 
@@ -260,6 +257,12 @@ def test_missing_locations_get_one_actionable_line_each(qapp, tmp_path):
         window._report_missing_locations()
         if not Path("Q:\\").exists():
             assert lines == [("error", "Download folder not found. Choose it again in Settings.")]
+        # 1.16.0 EXE check with a missing drive: main() had already said the folder cannot be
+        # used, and this check added a second line about the same folder.
+        lines.clear()
+        window._download_dir_unusable = True
+        window._report_missing_locations()
+        assert lines == []
     finally:
         window._conn.demo = True
         _close(window, qapp)
