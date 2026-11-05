@@ -288,6 +288,7 @@ class WaterfallView(QWidget):
         self._window: TimeWindow | None = None
         self._coverage: Coverage | None = None
         self._scene: tuple[tuple, QPixmap] | None = None
+        self._scene_buffer: QPixmap | None = None  # reused across renders while the size holds
         self._plot_rect = QRectF()
         self._drag: tuple[float, TimeWindow] | None = None
         self._dragged = False
@@ -328,7 +329,10 @@ class WaterfallView(QWidget):
         else:
             rows, cols = int(data.rgb.shape[0]), int(data.rgb.shape[1])
             self._buffer = data.rgb.tobytes()
-            self._image = QImage(self._buffer, cols, rows, cols * 3, QImage.Format.Format_RGB888)
+            # RGB32 draws about twice as fast as packed RGB888 with the raster engine.
+            self._image = QImage(self._buffer, cols, rows, cols * 3, QImage.Format.Format_RGB888).convertToFormat(
+                QImage.Format.Format_RGB32
+            )
             bar = data.colorbar_rgb
             self._bar_buffer = bar.tobytes()
             self._bar_image = QImage(self._bar_buffer, 1, int(bar.shape[0]), 3, QImage.Format.Format_RGB888)
@@ -534,9 +538,14 @@ class WaterfallView(QWidget):
         palette = current_palette()
         dpr = self.devicePixelRatioF()
         width, height = max(self.width(), 1), max(self.height(), 1)
-        pixmap = QPixmap(int(width * dpr), int(height * dpr))
+        # Reuse the previous buffer when the size is unchanged: a fresh 20 MB pixmap at 200 % costs
+        # ~5 ms of page faults before the first fill.
+        px_w, px_h = int(width * dpr), int(height * dpr)
+        pixmap = self._scene_buffer
+        if pixmap is None or pixmap.width() != px_w or pixmap.height() != px_h:
+            pixmap = QPixmap(px_w, px_h)
+            self._scene_buffer = pixmap
         pixmap.setDevicePixelRatio(dpr)
-        pixmap.fill(QColor(palette.surface))
         painter = QPainter(pixmap)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
@@ -563,6 +572,17 @@ class WaterfallView(QWidget):
             top = 8.0
             plot = QRectF(left, top, max(width - left - right, 10.0), max(height - top - bottom, 10.0))
             self._plot_rect = plot
+            # Background: only the margins get the surface colour; the plot is painted once below
+            # (filling the whole pixmap twice costs ~5 ms at 200 % on a large pane).
+            surface = QColor(palette.surface)
+            full = QRectF(0.0, 0.0, float(width), float(height))
+            for margin in (
+                QRectF(0.0, 0.0, full.width(), plot.top()),
+                QRectF(0.0, plot.bottom(), full.width(), full.height() - plot.bottom()),
+                QRectF(0.0, plot.top(), plot.left(), plot.height()),
+                QRectF(plot.right(), plot.top(), full.width() - plot.right(), plot.height()),
+            ):
+                painter.fillRect(margin, surface)
 
             e_lo, e_hi = coverage.extent
             e_span = max(e_hi - e_lo, 1e-12)
@@ -591,7 +611,10 @@ class WaterfallView(QWidget):
                 target = QRectF(x_of(data.freq_lo), plot.top(), x_of(data.freq_hi) - x_of(data.freq_lo), plot.height())
                 painter.save()
                 painter.setClipRect(plot)
-                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, source.height() > target.height() or source.width() > target.width())
+                # Filter only when the picture is shrunk on screen (device pixels); enlarging data
+                # cells keeps their edges and costs a fraction of a bilinear draw at 200 %.
+                shrinking = source.height() > target.height() * dpr or source.width() > target.width() * dpr
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, shrinking)
                 painter.drawImage(target, self._image, source)
                 painter.restore()
 

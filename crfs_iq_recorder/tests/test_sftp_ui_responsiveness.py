@@ -335,6 +335,12 @@ def test_list_failure_does_not_open_a_popup(qapp, monkeypatch):
     )
     window = SftpWindow(ConnectionState(demo=False, host="192.0.2.1"))
     try:
+        # The window's own listing fails first (the test guard refuses SFTP); wait for that so
+        # its queued failure cannot overwrite the one under test.
+        deadline = time.time() + 5
+        while time.time() < deadline and window.status.text() != "SFTP error.":
+            qapp.processEvents()
+            time.sleep(0.01)
         window._on_failed("SFTP connection failed: timed out")
         qapp.processEvents()
         assert shown == []
