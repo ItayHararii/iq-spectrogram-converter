@@ -4,10 +4,10 @@ CRFS IQ Recorder is a Windows app for CRFS sensors. It starts an IQ recording, d
 
 ## Download and run
 
-**Version:** 1.16.0
+**Version:** 1.17.0
 **File:** `CRFS_IQ_Recorder.exe` - one file, no Python, no install. `CRFS_IQ_Recorder_Setup.exe` - installer for company-managed PCs (installs to Program Files, Start-menu shortcut). With the installer, keep the default folder: do not install into Documents, Desktop or Pictures - Windows ransomware protection guards those folders and can block the uninstaller there.
 
-> Windows EXE: [CRFS IQ Recorder 1.16.0](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.16.0)
+> Windows EXE: [CRFS IQ Recorder 1.17.0](https://github.com/ItayHararii/iq-spectrogram-converter/releases/tag/v1.17.0)
 
 1. Save the exe on this PC (Desktop or a local folder).
 2. Double-click **CRFS_IQ_Recorder.exe**. The window opens in a few seconds; sensor details fill in afterwards.
@@ -29,7 +29,7 @@ The window has two tabs under one sensor header: **Manual Recording** (one recor
 2. Check **Model**, **Firmware**, **Serial**, and **Status** in the header. Status should read **Connected**. The same text is shown at the bottom left. The app checks the sensor every 10 seconds. After one missed check the badge turns amber **Reconnecting...**; after two it turns red **Disconnected**. It returns to green **Connected** on its own when the sensor answers. SFTP problems stay in Sensor Files and are not treated as an API disconnect.
 3. Choose **Start / End** or **Center / Bandwidth** (values in MHz).
 4. Enter **Recording time (s)** and check **Estimate**.
-5. Click **Start Recording**. Only a click (or **Space** after moving to the button with **Tab**) starts a recording; **Enter** in a field never does. Status goes **Sending request…**, then **Recording**, then **Waiting for files** while the app waits for the sensor's files, then **Files ready**. If the sensor finishes but no file appears, the status says so instead of reporting a completed recording.
+5. Click **Start Recording**. Only a click (or **Space** after moving to the button with **Tab**) starts a recording; **Enter** in a field never does. Status goes **Sending request…**, then **Recording**, then **Waiting for files** while the app waits for the sensor's files, then **Files ready**. If the sensor finishes but no file appears, the status says so instead of reporting a completed recording. Large recordings stay in **Waiting for files** for a while: 2 s at 60 MHz on a Node 100-18 is about 1 GB, which the sensor needs about a minute to write (longer while other files are downloaded). The app waits until the sensor has finished the file; closing the app earlier makes the sensor cut the file short.
 6. The **Last recording** card shows what happened in three short lines: the range (`758-768 MHz`) with a tag (**Complete**, **Partial**, **Uncertain**, **Failed** or **Other range**), the facts read from the files (`1 file · 0.536 s · 33.5 MB`, or *duration unknown* when the file could not be read) and the states (`Recording complete · Download saved`). When the sensor recorded a different range than requested, one more line says so (`Sensor reported 3500-3600 MHz (100 MHz), not the requested range`; the Node 100-18 records at most 100 MHz around the centre). **Partial** means the files hold more than 2 % less time than requested. **Download** copies the files to this PC into a folder named after the sensor's recording day (`Recordings\20261104\`); **Open folder** opens that folder with the file selected once the copy has been verified. The waterfall is in **Sensor Files**.
 
 To log into a collection workbook: tick **Log each recording to an Excel log workbook (.xlsm)**, choose the `.xlsm` file, and check the collection event and target class. When a recording finishes, the app adds that capture to the Excel log automatically (class, frequencies, filename, and Playback Start as `N seconds`). Split parts stay on the same row.

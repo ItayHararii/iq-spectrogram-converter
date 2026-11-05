@@ -129,6 +129,8 @@ If you enter `2.5` seconds, all three timing fields are `2.5`. Format defaults t
 
 A successful HTTP response means the request was accepted. It does not prove the file has finished writing. The app keeps the EMP response stream open: the sensor names each file it opens (`time.RemoteTimeData`) and reports "Remote recording is now finished". After the requested time the app also watches the sensor folder over SFTP (whether or not Sensor Files is open) until every file the sensor named is present and has stopped growing. There is no EMP completion URL in public CRFS docs.
 
+"Finished" ends the radio capture, not the file: the sensor then writes the samples to its disk, and if the client disconnects before that is done it ends the task and closes the file at what it has written (a valid WAVE that is simply shorter). Since 1.17.0 the app keeps the stream open until the sensor has finished every file (real sizes and the CRFS metadata in its header). A 2 s recording at 60 MHz on a Node 100-18 is about 1 GB and took over a minute to write while other files were being downloaded.
+
 Estimated size uses `61.051 * (bandwidth_Hz / 10_000_000) * recording_seconds` MB. That number is an estimate for the whole capture. The file list shows each part's size separately.
 
 ## Connection and files

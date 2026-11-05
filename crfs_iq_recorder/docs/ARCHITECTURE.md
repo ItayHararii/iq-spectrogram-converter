@@ -1,6 +1,6 @@
 # CRFS IQ Recorder - architecture
 
-**Version documented:** 1.16.0
+**Version documented:** 1.17.0
 **Code:** `crfs_iq_recorder/` as of this file (5 November 2026). The Excel Collection rows below (called Cellular Collection before 1.13.0) describe the 1.13.0 design; `docs/CELLULAR_COLLECTION.md` has the detail.
 **Related app:** IQ Spectrogram Converter (`iq_gui.py`, `iq_data.py`) at the repository root
 
@@ -191,11 +191,8 @@ sequenceDiagram
 3. **Excel gate** (optional) - workbook path and a unique class/worksheet mapping.
 4. **History** - `RecordingParams` with the typed window, duration, host, sensor serial if known, collection fields if Excel is on.
 5. **POST** - `task_id` like `iq-YYYYMMDD-HHMMSS`. Format from the combo (WAVE default).
-6. **Timer** - UI phase moves to Recording. When the timer fires, HTTP is treated as finished even if the POST is still open (`client.close()`, late replies ignored).
-7. **After elapsed**
-   - **Collection watch** if Excel or Repeat is on: SFTP poll every 2 s; a part is "finalized" after two listings with the same size and 8 s with no growth; give up 60 s after elapsed if nothing settles.
-   - **Sensor Files open**: refresh after 3 s and 12 s; confirm after 2 / 6 / 14 s if matching sizes are unchanged.
-   - **Otherwise**: tell the operator to open Sensor Files. HTTP accept is not file-done.
+6. **Event stream** - the POST is answered with an SSE stream that names each part (`time.RemoteTimeData`) and reports "Remote recording is now finished" a few seconds after the nominal end. That ends the radio capture only: the Node keeps writing the samples to its disk, and a client that disconnects ends the mission, so the Node closes the file at what is on its disk (a well-formed, shorter WAVE). The app keeps the stream open until every part is final (1.17.0).
+7. **After elapsed** - the collection watch polls the dated folders over SFTP every 2 s: a part has settled after two listings with the same size (and 8 s of quiet, or 98 % of the expected bytes once the sensor said finished); then its header is read. While a part still has the Node's in-progress header (RIFF and data sizes are the ASCII placeholder `size`, no `meta` trailer; a `.xdat` without its `.xhdr`) the stream stays open and the watch goes on (1.17.0); otherwise the stream is closed and the result reported. The stream's own safety-net budget is `d + max(60 s, d) + capture bytes / 4 MB/s` at the 125 MS/s full rate (about 5 min for 2 s at 60 MHz); measured on a Node 100-18, the 1.0 GB of 2 s at 125 MS/s took 45-49 s to write on an idle Node and 63-67 s while a file was read over SFTP. HTTP accept is not file-done.
 
 Repeat (count or until stopped) waits after the current capture (default 5 s). **Stop after current recording** finishes that capture or cancels the countdown. Consecutive tasks are not gapless IQ.
 

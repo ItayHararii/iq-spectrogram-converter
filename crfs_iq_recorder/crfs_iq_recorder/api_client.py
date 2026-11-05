@@ -309,17 +309,31 @@ def sse_task_id(event: SseEvent) -> str:
     return ""
 
 
-def recording_stream_budget_s(duration_s: float) -> float:
+# Slowest rate at which a Node is assumed to write a capture to its disk when
+# sizing the stream budget. Measured on a Node 100-18 (2.25-325): the 1.0 GB of
+# a 2 s capture at 125 MS/s reached the disk at 13-20 MB/s on an idle Node and
+# at about 10 MB/s while another file was read from it over SFTP.
+NODE_SLOWEST_WRITE_BYTES_PER_S = 4_000_000
+
+
+def recording_stream_budget_s(duration_s: float, capture_bytes: int = 0) -> float:
     """How long to keep the sensor's event stream open after the POST.
 
-    Hardware measurements (RFeye Node 40-8, firmware 2.25): the completion
-    message arrives about 1.5-2.5 s after the nominal end of the capture, and
-    the last WAVE part can take another 20 s to reach the disk at 62.5 MS/s.
-    The GUI holds the stream until the files are confirmed and then closes it;
-    this budget is the safety net when that confirmation never comes.
+    Hardware measurements (RFeye Node 40-8 and 100-18, firmware 2.25): the
+    completion message arrives about 1.5-2.5 s after the nominal end of the
+    capture, but that only ends the radio capture. The Node then keeps writing
+    the samples to its disk, and when the client disconnects first it ends the
+    mission and closes the WAVE file at whatever is on the disk: a well-formed
+    file that is simply shorter. A 2 s capture at 125 MS/s (1.0 GB) needs over
+    a minute to reach the disk while other files are read from the Node, so
+    the budget allows for writing `capture_bytes` at
+    `NODE_SLOWEST_WRITE_BYTES_PER_S`. The GUI holds
+    the stream until the files are final and then closes it; this budget is
+    the safety net when that confirmation never comes.
     """
     seconds = max(float(duration_s), 0.0)
-    return seconds + max(60.0, seconds)
+    writing = max(int(capture_bytes or 0), 0) / NODE_SLOWEST_WRITE_BYTES_PER_S
+    return seconds + max(60.0, seconds) + writing
 
 
 class RequestsTransport:
@@ -842,7 +856,11 @@ class EmpClient:
         auth = HTTPBasicAuth(target.username, password)
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/plain;q=0.8"}
         duration_s = _payload_duration(payload)
-        budget = stream_budget_s if stream_budget_s is not None else recording_stream_budget_s(duration_s)
+        budget = (
+            stream_budget_s
+            if stream_budget_s is not None
+            else recording_stream_budget_s(duration_s, _payload_largest_capture_bytes(payload))
+        )
         parts: list[str] = []
         file_dir = ""
         task_echo = ""
@@ -1351,3 +1369,21 @@ def _payload_duration(payload: dict[str, Any]) -> float:
         return float(scans[0].get("duration", 0.0)) if scans else 0.0
     except (AttributeError, IndexError, TypeError, ValueError):
         return 0.0
+
+
+def _payload_largest_capture_bytes(payload: dict[str, Any]) -> int:
+    """Bytes the request can produce on the fastest Node (125 MS/s full rate); 0 when unknown.
+
+    The model of the sensor is not known here, so the larger Node 100 file size
+    is assumed: a longer budget only matters when the files are never confirmed.
+    """
+    from .constants import DATASHEET_FULLRATE_COMPLEX_SPS
+    from .size_estimate import SizeEstimateError, wave_size_model
+
+    try:
+        scans = payload.get("remote_recording_scans") or []
+        bandwidth = int(scans[0].get("bandwidth", 0)) if scans else 0
+        model = wave_size_model(bandwidth, _payload_duration(payload), max_rate_hz=DATASHEET_FULLRATE_COMPLEX_SPS)
+    except (AttributeError, IndexError, TypeError, ValueError, SizeEstimateError, ArithmeticError):
+        return 0
+    return int(model.total_bytes)

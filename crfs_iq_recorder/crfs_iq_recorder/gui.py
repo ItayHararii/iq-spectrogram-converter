@@ -2846,8 +2846,9 @@ class MainWindow(QMainWindow):
         def work() -> tuple[int, HttpOutcome]:
             try:
                 # Hold the stream after "finished": the Node drops the mission
-                # as soon as its client disconnects, and the last WAVE part can
-                # still be flushing. _finish_current_capture() closes it.
+                # as soon as its client disconnects and closes a WAVE file it is
+                # still writing at what is on its disk. _apply_measurement()
+                # closes the stream once every file's header is final.
                 outcome = client.start_recording(
                     target,
                     self._conn.http_password,
@@ -3211,10 +3212,9 @@ class MainWindow(QMainWindow):
         # A folder listing still running on the worker must not re-run this
         # once it lands: it belongs to the capture that has just been closed.
         self._watch_token += 1
-        self._abort_record_stream()
-        self._log_repeated_sensor_messages()
         paths = sorted(self._watch_state.finalized)
         if not paths:
+            self._release_capture_stream()
             self._complete_capture(None)
             return
         self._measuring = True
@@ -3272,7 +3272,30 @@ class MainWindow(QMainWindow):
             return
         if error:
             diag("measure_failed", "could not read the recording headers", error=error)
-        self._complete_capture(measurement if isinstance(measurement, CaptureMeasurement) else None)
+        measurement = measurement if isinstance(measurement, CaptureMeasurement) else None
+        writing = [part for part in measurement.parts if part.being_written] if measurement is not None else []
+        if writing and self._http_in_flight and self._record_client is not None:
+            # The Node writes a WAVE file's real sizes and metadata only once
+            # every sample is on its disk, and a client that disconnects before
+            # that ends the mission: the file is closed short. Keep the stream
+            # and watch until the headers are final (the stream budget bounds it).
+            diag(
+                "files_still_writing",
+                "the sensor is still writing; the recording stream stays open",
+                files=[part.name for part in writing],
+                sizes=[part.size for part in writing],
+            )
+            self._set_msg(self._finalizing_text())
+            self._watching = True
+            self._watch_timer.start()
+            return
+        self._release_capture_stream()
+        self._complete_capture(measurement)
+
+    def _release_capture_stream(self) -> None:
+        """Close the sensor's event stream (the Node then drops the mission) once the capture is settled."""
+        self._abort_record_stream()
+        self._log_repeated_sensor_messages()
 
     def _result_message(self, verdict: Verdict, measurement, requested_s: float, count: int) -> tuple[str, str, str]:
         """(operator text, log level, phase) for the end of a capture."""

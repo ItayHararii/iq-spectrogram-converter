@@ -742,6 +742,33 @@ def test_xdat_duration_start_time_and_tuning_come_from_the_sensors_header(tmp_pa
     assert classify(requested_s=1.0, measurement=pending, named_parts=[xdat.name]).result == "unconfirmed"
 
 
+def test_a_wave_part_the_node_is_still_writing_is_told_apart_from_a_finished_one(tmp_path: Path):
+    from crfs_iq_recorder.capture_measure import measure_part
+    from crfs_iq_recorder.iq_wav import crfs_style_wav_bytes
+
+    final = crfs_style_wav_bytes(
+        frames=4_000, sample_rate=8_000, center_hz=2.14e9, bandwidth_hz=60e6, signal_time="2026-11-05T19:46:42.000Z"
+    )
+    data_at = final.index(b"data", 12)
+    data_size = int.from_bytes(final[data_at + 4:data_at + 8], "little")
+    done = tmp_path / "iq_20261105_194642_0001.wav"
+    done.write_bytes(final)
+    assert not measure_part(None, str(done)).header_pending and not measure_part(None, str(done)).being_written
+
+    # Node 100-18 mid-write: RIFF and data sizes are the ASCII placeholder "size", no meta trailer yet.
+    writing = tmp_path / "iq_20261105_194643_0001.wav"
+    writing.write_bytes(final[:4] + b"size" + final[8:data_at + 4] + b"size" + final[data_at + 8:data_at + 8 + data_size])
+    part = measure_part(None, str(writing))
+    assert part.header_pending and part.being_written
+
+    # A finished file without the CRFS metadata: its sizes match the file, so it is not being written.
+    bare = final[:data_at + 8 + data_size]
+    no_meta = tmp_path / "iq_20261105_194644_0001.wav"
+    no_meta.write_bytes(bare[:4] + (len(bare) - 8).to_bytes(4, "little") + bare[8:])
+    part = measure_part(None, str(no_meta))
+    assert part.header_pending and not part.being_written
+
+
 def test_xdat_shorter_than_its_header_is_cut_short_and_an_unknown_layout_is_not_decoded(tmp_path: Path):
     from crfs_iq_recorder.iq_merge import MergeError
     from crfs_iq_recorder.xdat_header import inspect_xdat

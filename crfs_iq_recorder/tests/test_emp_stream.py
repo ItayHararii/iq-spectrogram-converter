@@ -28,10 +28,12 @@ def _loopback_only_create_connection(address, *args, **kwargs):
     return _REAL_CREATE_CONNECTION(address, *args, **kwargs)
 
 from crfs_iq_recorder.api_client import (
+    NODE_SLOWEST_WRITE_BYTES_PER_S,
     STREAM_BUDGET,
     STREAM_CANCELLED,
     STREAM_FINISHED,
     EmpClient,
+    RawResponse,
     SseEvent,
     parse_sse_blocks,
     recording_stream_budget_s,
@@ -278,6 +280,31 @@ def test_budget_scales_with_duration():
     assert recording_stream_budget_s(2) == 62
     assert recording_stream_budget_s(40) == 100
     assert recording_stream_budget_s(300) == 600
+    assert recording_stream_budget_s(2, 1_000_000_000) == 62 + 1_000_000_000 / NODE_SLOWEST_WRITE_BYTES_PER_S
+
+
+def test_default_budget_leaves_the_node_time_to_write_a_full_rate_capture():
+    """2 s of 2110-2170 MHz is 1.0 GB at 125 MS/s on a Node 100-18; with a download
+    running the Node needed over a minute to write it, and a client that leaves
+    earlier gets the file closed short."""
+    budgets = []
+
+    class Transport:
+        def request(self, method, url, **kwargs):
+            budgets.append(kwargs["stream"].budget_s)
+            return RawResponse(
+                status_code=200, text='{"status":"ok"}', headers={"Content-Type": "application/json"},
+                elapsed_s=0.0, url=url,
+            )
+
+        def close(self):
+            pass
+
+    payload = build_payload_for_recording_time(from_center_bandwidth(2_140_000_000, 60_000_000), 2.0, task_id="iq-test")
+    target = ConnectionTarget(host="127.0.0.1", port=80, use_https=False, username="admin", timeout_s=5.0)
+    outcome = EmpClient(transport=Transport(), demo=False).start_recording(target, "pw", payload)
+    assert outcome.accepted
+    assert budgets and budgets[0] >= 2 + 60 + 1_000_000_000 / NODE_SLOWEST_WRITE_BYTES_PER_S
 
 
 def test_gui_mode_holds_the_stream_after_finished_until_cancelled(sensor):

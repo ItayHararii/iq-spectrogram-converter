@@ -2082,6 +2082,100 @@ def test_gui_follows_the_sensor_stream_and_pins_the_reported_filename(qapp, tmp_
         qapp.processEvents()
 
 
+def _node_wave_being_written(final: bytes) -> bytes:
+    """A WAVE part as a Node has it on its disk mid-write: placeholder sizes (ASCII "size"), no meta yet."""
+    data_at = final.index(b"data", 12)
+    data_size = int.from_bytes(final[data_at + 4:data_at + 8], "little")
+    return final[:4] + b"size" + final[8:data_at + 4] + b"size" + final[data_at + 8:data_at + 8 + data_size]
+
+
+def test_gui_holds_the_stream_until_the_node_has_finished_writing_the_file(qapp, tmp_path, monkeypatch):
+    """A Node closes a WAVE file short when its client disconnects before the last block is on its disk.
+
+    Node 100-18, 2 s at 125 MS/s: the 1.0 GB file can take over a minute to
+    write while downloads run. A file whose size has stopped changing but whose
+    header still holds the placeholder sizes is not finished: keep the stream.
+    """
+    from crfs_iq_recorder import gui as gui_module
+    from crfs_iq_recorder.diagnostic_log import recent
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.recording_history import load_recordings
+    from crfs_iq_recorder.demo_sftp import shared_demo_browser
+    from crfs_iq_recorder.recording_status import CONFIRMED, FINALIZING
+
+    monkeypatch.setattr(gui_module, "HEADER_RETRY_S", 0.0)
+    monkeypatch.setattr(gui_module, "_open_browser", lambda *_a, **_k: shared_demo_browser())
+    window = MainWindow(demo=True)
+    window._settle_s = 0
+    window._stable_needed = 2
+    box = {}
+
+    def part_event():
+        record = load_recordings(tmp_path / "recordings.json")[0]
+        serial = "".join(ch if ch.isalnum() else "_" for ch in (record.sensor_id or "demo")) or "demo"
+        box["stem"] = f"iq_{serial}_{record.started_at:%Y%m%d_%H%M%S}_{record.id[:8]}"
+        return _sse("time.RemoteTimeData", [{"first_filename": f"{box['stem']}_0001.wav",
+                                             "file_dir": "/mnt/1/remdata/20261031/", "task_id": "iq-test"}])()
+
+    client = _StreamingClient([
+        _sse("crfs_iq_recorder.http_accepted", {"status": 200}),
+        part_event,
+        _message("INFO", "Remote recording is now finished"),
+    ])
+    monkeypatch.setattr(window, "_client", lambda: client)
+    try:
+        window.mode_start.setChecked(True)
+        window.field_a.setText("2110")
+        window.field_b.setText("2170")
+        window.time_edit.setText("0.05")
+        window.wait_spin.setValue(0)
+        window.repeat_n.setChecked(True)
+        window.repeat_spin.setValue(1)
+        window._on_start()
+        assert _pump_until(qapp, lambda: window._sensor_finished, timeout=5)
+        window._record_timer.stop()
+        # Against a real Node the stream stays open past the nominal end; the
+        # files below come from the in-memory sensor.
+        window._conn.demo = False
+        window._on_recording_time_elapsed()
+        window._conn.demo = True
+        assert _pump_until(qapp, lambda: not window._watch_in_flight, timeout=5)
+
+        record = load_recordings(tmp_path / "recordings.json")[0]
+        browser = shared_demo_browser()
+        entry = browser.publish_capture(
+            box["stem"], when=record.started_at, seconds=float(record.duration_s),
+            center_hz=float(record.center_hz), bandwidth_hz=float(record.bandwidth_hz),
+        )[0]
+        folder = entry.path.rsplit("/", 1)[0]
+        final = browser.open_read(entry.path)[0].read()
+        browser.add_file(entry.name, folder, payload=_node_wave_being_written(final), modified=entry.modified)
+        for _ in range(4):
+            window._poll_collection_files()
+        qapp.processEvents()
+        assert window._record_phase == FINALIZING, window.log_edit.toPlainText()
+        assert client.cancel is not None and not client.cancel.is_set(), "disconnecting now closes the file short"
+        assert not client.returned.is_set()
+        assert any("files_still_writing" in line for line in recent(400))
+
+        # The Node writes its last block, the real sizes and the metadata.
+        browser.add_file(entry.name, folder, payload=final, modified=entry.modified)
+        for _ in range(4):
+            window._poll_collection_files()
+        assert _pump_until(qapp, lambda: window._record_phase == CONFIRMED, timeout=5), (
+            window._record_phase,
+            window.log_edit.toPlainText(),
+        )
+        assert client.returned.wait(3), "the stream is released once the file is final"
+        assert window._measurement.duration_s == pytest.approx(float(record.duration_s), rel=0.01)
+        assert "Recording confirmed" in window.log_edit.toPlainText()
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
+
+
 def test_gui_gives_up_quickly_when_the_sensor_finishes_without_a_file(qapp, tmp_path, monkeypatch):
     from crfs_iq_recorder.gui import MainWindow
     from crfs_iq_recorder.recording_status import UNKNOWN

@@ -71,6 +71,24 @@ class PartMeasurement:
         """The sensor has not finished the header yet (worth reading again shortly)."""
         return (self.readable and not self.final) or any("still being written" in p for p in self.problems)
 
+    @property
+    def being_written(self) -> bool:
+        """The header does not describe the file yet, so the sensor is still writing it.
+
+        While a Node writes a WAVE part, its RIFF and data sizes hold a
+        placeholder (ASCII "size") and the CRFS metadata trailer is missing; a
+        .xdat part has no .xhdr yet. A finished file without metadata is not
+        counted: its sizes match the file.
+        """
+        if not self.header_pending:
+            return False
+        return self.truncated or any(
+            "still being written" in problem
+            or problem.startswith("RIFF size says")
+            or "trailer chunk is cut short" in problem
+            for problem in self.problems
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "path": self.path,
