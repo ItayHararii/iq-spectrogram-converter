@@ -1,15 +1,29 @@
 # CRFS IQ Spectrogram Converter
 
-Sister app of the CRFS IQ Recorder (same Sensorz look, light and dark theme, status bar). Current version: 1.5.1.
+Sister app of the CRFS IQ Recorder (same Sensorz look, light and dark theme, status bar). Current version: 1.6.0.
 
 Turns a stereo IQ WAV into a PNG. I must be on the left channel and Q on the right. Mono files and ordinary audio are not supported.
 
-The PNG has two plots that share a frequency axis, centered at 0 Hz:
+The PNG has two plots that share a frequency axis:
 
 - Spectrum (top): frequency vs bin power in dBFS/bin. Blue is the average. Orange is peak-hold.
 - Spectrogram (bottom): frequency vs time. Color is dBFS/bin.
 
 Large files are read in chunks, so the whole capture does not have to sit in RAM.
+
+### Frequency axis and requested range
+
+When the WAV carries CRFS metadata (the `meta` chunk the sensor writes), the axis shows absolute RF frequency around the file's centre frequency, at full precision (a capture centred at 1842.5 MHz shows 1842.5 MHz in the middle). Without a centre frequency the axis stays as the offset from the centre and says that the absolute frequency is unknown.
+
+Every PNG marks the recording's frequency range on both plots (on by default; "Mark frequency ranges" in Display, or `--no-range-markers`):
+
+- **Requested range**: magenta dashed lines at the requested start and end, with tags such as `Requested start 1805 MHz`. The request comes from the CRFS IQ Recorder: first the `<recording>.cellular.json` manifest beside the WAV, otherwise the Recorder's recording history. It is used only when the match is unambiguous (same recording name, same receiver, and the same centre frequency as the file). Duplicate or conflicting records, or a file without a centre frequency, leave the request unmarked and the legend says why.
+- **Sensor-reported range**: white dotted lines from the centre frequency and the bandwidth in the file's metadata. Drawn when no request was matched, or when it differs from the request; labelled "Sensor-reported", never "Requested".
+- A boundary outside the displayed span gets no line. An edge tag shows its value instead, for example `◀ Requested start 3300 MHz (outside view)`.
+
+The legend under the plots lists the requested range, the sensor-reported bandwidth, the centre, the sample rate in MS/s and the displayed span in MHz. The displayed span equals the sample rate for complex IQ; it is not a measured bandwidth. The markers show the requested boundaries; they do not prove uniform sensitivity, exact filter edges or complete capture. Only the axis labels, lines and text change: the spectrum and spectrogram values are the same as without markers.
+
+The Recorder history is found automatically on a PC where the CRFS IQ Recorder is installed (in the user's local app data). On other PCs set "Recorder history" in Display, or the `IQ_RECORDER_HISTORY` environment variable, to a copy of that file; with neither, manifests beside the WAVs are still used. The history and manifests are only read.
 
 Split recordings (`name_0001.wav`, `name_0002.wav`, ...) are converted one part per PNG. When the earlier parts sit in the same folder, a later part's time axis continues from where they ended and the title says so (for example `part 2 from 8.38 s`); otherwise the time axis starts at 0 and the title notes that the earlier parts were not found.
 
@@ -24,6 +38,7 @@ The CRFS IQ Recorder lives in [`crfs_iq_recorder/`](crfs_iq_recorder/). Use that
 - Set RBW in Hz, or use 5 / 15 / 30 / 50 kHz
 - Switch dark / light theme (remembered)
 - Pick a colormap, optional frequency smoothing, and auto or manual dB range
+- See the requested recording range and the sensor-reported range on an absolute frequency axis
 - Watch progress, elapsed time, and ETA in the status bar
 - Cancel a running conversion (no half-written PNG is left behind)
 - Preview the last PNG
@@ -49,9 +64,9 @@ venv\Scripts\python.exe iq_data.py --input path\to\file.wav --output "IQ Results
 venv\Scripts\python.exe iq_data.py --folder path\to\wavs --output "IQ Results" --rbw 15000
 ```
 
-Use either `--input` or `--folder`, not both. Default RBW is 15000 Hz. Optional flags: `--cmap jet|turbo|viridis|gray`, `--freq-smooth`, `--db-min`, `--db-max`.
+Use either `--input` or `--folder`, not both. Default RBW is 15000 Hz. Optional flags: `--cmap jet|turbo|viridis|gray`, `--freq-smooth`, `--db-min`, `--db-max`, `--recorder-history path\to\history.json`, `--no-range-markers`.
 
-The EXE converts without opening a window when `--input` is given:
+The EXE converts without opening a window when `--input` is given (same `--recorder-history` and `--no-range-markers` flags):
 
 ```text
 dist\IQ_Spectrogram_Converter.exe --input path\to\file.wav --output "IQ Results" --rbw 15000 --log run.txt
@@ -76,6 +91,7 @@ Windows shows "Unknown publisher" on first open because the EXE is not code-sign
 | --- | --- |
 | `iq_gui.py` | Desktop GUI |
 | `iq_data.py` | STFT and PNG conversion |
+| `iq_metadata.py` | CRFS file metadata and requested-range lookup (Recorder manifest / history) |
 | `iq_theme.py` | Light and dark theme |
 | `requirements.txt` | Python packages |
 | `IQ_Spectrogram_Converter.spec` | PyInstaller config (version resource, icon, excludes) |

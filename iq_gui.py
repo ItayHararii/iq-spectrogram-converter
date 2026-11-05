@@ -11,6 +11,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tkinter import filedialog, ttk
 
+import iq_metadata
 from iq_theme import (
     DARK_MODE,
     FONT_LOG,
@@ -75,7 +76,7 @@ except Exception:
     _HAS_DND = False
 
 
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 # Sister application of "CRFS IQ Recorder" (same product family, same Sensorz icon).
 APP_NAME = "CRFS IQ Spectrogram Converter"
 COMPANY_NAME = "Sensorz"
@@ -152,6 +153,16 @@ STATUS_SAVED = "Image saved"
 STATUS_CANCELLED = "Cancelled"
 STATUS_FAILED = "Conversion failed"
 RBW_TOOLTIP = "Lower values show finer frequency detail. Higher values process faster."
+RANGE_MARKERS_TOOLTIP = (
+    "Mark the requested recording range (dashed lines) and the sensor-reported range (dotted lines) "
+    "on the spectrum and the spectrogram. The frequency axis shows absolute RF when the file gives its "
+    "centre frequency. Only labels and lines change; the spectrum and spectrogram values do not."
+)
+RECORDER_HISTORY_TOOLTIP = (
+    "Where the requested start/end frequencies come from when there is no Recorder manifest "
+    "(.cellular.json) beside the WAV: the CRFS IQ Recorder's recording history file. Leave blank to use "
+    f"the {iq_metadata.HISTORY_ENV} environment variable or this PC's Recorder. The file is only read."
+)
 
 
 def parse_drop_paths(data):
@@ -273,10 +284,10 @@ def format_size(n_bytes):
 
 def format_rate(fs):
     if fs >= 1e6:
-        return f"{fs / 1e6:g} MHz"
+        return f"{fs / 1e6:g} MS/s"
     if fs >= 1e3:
-        return f"{fs / 1e3:g} kHz"
-    return f"{fs:g} Hz"
+        return f"{fs / 1e3:g} kS/s"
+    return f"{fs:g} S/s"
 
 
 def list_wavs(folder):
@@ -330,6 +341,8 @@ class IQConverterGUI(_TkBase):
         self.progress_var = tk.DoubleVar(value=0.0)
         self.file_info_var = tk.StringVar(value="")
         self.open_when_done_var = tk.BooleanVar(value=True)
+        self.range_markers_var = tk.BooleanVar(value=True)
+        self.recorder_history_var = tk.StringVar(value="")
 
         self._logo_photo = None
         self._window_icon_photo = None
@@ -358,6 +371,8 @@ class IQConverterGUI(_TkBase):
         self._job_db_auto = True
         self._job_db_vmin = None
         self._job_db_vmax = None
+        self._job_range_markers = True
+        self._job_recorder_history = None
         self._last_input_dir = str(DEFAULT_INPUT_DIR if DEFAULT_INPUT_DIR.is_dir() else APP_DIR)
         self._busy_widgets = []
         self._preset_buttons = []
@@ -739,6 +754,12 @@ class IQConverterGUI(_TkBase):
             self.db_vmax_var.set(db_vmax)
         elif isinstance(db_vmax, (int, float)):
             self.db_vmax_var.set(str(db_vmax))
+        range_markers = data.get("range_markers")
+        if isinstance(range_markers, bool):
+            self.range_markers_var.set(range_markers)
+        history = data.get("recorder_history")
+        if isinstance(history, str):
+            self.recorder_history_var.set(history.strip())
         theme = data.get("ui_theme")
         if isinstance(theme, str):
             self._ui_theme = normalize_theme(theme)
@@ -761,6 +782,8 @@ class IQConverterGUI(_TkBase):
             "db_auto": bool(self.db_auto_var.get()),
             "db_vmin": self.db_vmin_var.get().strip(),
             "db_vmax": self.db_vmax_var.get().strip(),
+            "range_markers": bool(self.range_markers_var.get()),
+            "recorder_history": self.recorder_history_var.get().strip(),
             "ui_theme": normalize_theme(getattr(self, "_ui_theme", current_mode())),
         }
         try:
@@ -917,7 +940,7 @@ class IQConverterGUI(_TkBase):
         )
         self._display_toggle.pack(side="left")
         self._display_toggle.bind("<Button-1>", lambda e: self._toggle_display())
-        ttk.Label(d_head, text="Colormap, dB scale, open when done", style="Muted.TLabel").pack(
+        ttk.Label(d_head, text="Colormap, dB scale, range markers, open when done", style="Muted.TLabel").pack(
             side="left", padx=(s(self, 10), 0)
         )
 
@@ -979,6 +1002,28 @@ class IQConverterGUI(_TkBase):
             command=self._save_settings,
         )
         self.open_check.pack(side="left")
+
+        self.range_markers_check = ttk.Checkbutton(
+            extra_row,
+            text="Mark frequency ranges",
+            variable=self.range_markers_var,
+            style="Surface.TCheckbutton",
+            command=self._on_range_options_changed,
+        )
+        self.range_markers_check.pack(side="left", padx=(16, 0))
+
+        history_row = ttk.Frame(self._display_body, style="Surface.TFrame")
+        history_row.pack(fill="x", pady=(10, 0))
+        history_label = ttk.Label(history_row, text="Recorder history (optional)", style="Field.TLabel")
+        history_label.pack(side="left")
+        self.history_entry = ttk.Entry(history_row, textvariable=self.recorder_history_var, style="App.TEntry")
+        self.history_entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        self.history_entry.bind("<FocusOut>", lambda *_: self._on_range_options_changed())
+        self.history_entry.bind("<Return>", lambda *_: self._on_range_options_changed())
+        self.browse_history_btn = ttk.Button(
+            history_row, text="Browse", style="Secondary.TButton", command=self.choose_recorder_history
+        )
+        self.browse_history_btn.pack(side="left")
 
         actions = ttk.Frame(body, style="App.TFrame")
         actions.pack(fill="x", pady=(s(self, 4), s(self, 8)))
@@ -1098,6 +1143,8 @@ class IQConverterGUI(_TkBase):
             self.cmap_combo,
             self.freq_smooth_check,
             self.db_auto_check,
+            self.range_markers_check,
+            self.browse_history_btn,
             *self._preset_buttons,
         ]
         self._set_widget_tooltip(self.cancel_button, "Stop the current conversion. No PNG is written for it.")
@@ -1121,7 +1168,10 @@ class IQConverterGUI(_TkBase):
         self._set_widget_tooltip(
             self.open_check, "Open the PNG in the default viewer when conversion finishes."
         )
-        self._set_widget_tooltip(self._display_toggle, "Colormap, dB scale, and open-when-done.")
+        self._set_widget_tooltip(self.range_markers_check, RANGE_MARKERS_TOOLTIP)
+        for widget in (history_label, self.history_entry, self.browse_history_btn):
+            self._set_widget_tooltip(widget, RECORDER_HISTORY_TOOLTIP)
+        self._set_widget_tooltip(self._display_toggle, "Colormap, dB scale, range markers, and open-when-done.")
         self._set_widget_tooltip(self.theme_btn, theme_toggle_tooltip())
 
         ready = "Ready. Choose a stereo IQ WAV (I on left, Q on right). Enter converts when a file is selected."
@@ -1269,7 +1319,9 @@ class IQConverterGUI(_TkBase):
             except tk.TclError:
                 pass
         entry_state = "disabled" if busy else "normal"
-        for entry in (self.input_entry, self.output_entry, self.rbw_entry):
+        for entry in (self.input_entry, self.output_entry, self.rbw_entry, getattr(self, "history_entry", None)):
+            if entry is None:
+                continue
             try:
                 entry.configure(state=entry_state)
             except tk.TclError:
@@ -1292,6 +1344,28 @@ class IQConverterGUI(_TkBase):
     def _on_db_auto_changed(self):
         self._apply_db_entry_state()
         self._save_settings()
+
+    def _on_range_options_changed(self):
+        self._save_settings()
+        if not self._converting:
+            self._schedule_inspect()
+
+    def _recorder_history_setting(self):
+        return self.recorder_history_var.get().strip() or None
+
+    def choose_recorder_history(self):
+        current = self._recorder_history_setting()
+        guess = Path(current) if current else iq_metadata.resolve_history_path()
+        initial = guess.parent if guess is not None and guess.parent.is_dir() else Path.home()
+        selected = filedialog.askopenfilename(
+            title="Choose the CRFS IQ Recorder history file",
+            initialdir=str(initial),
+            filetypes=[("Recorder history", "*.json"), ("All files", "*.*")],
+        )
+        if selected:
+            self.recorder_history_var.set(selected)
+            self._append_log(f"Recorder history: {selected}")
+            self._on_range_options_changed()
 
     def _on_return_key(self, event):
         if self._converting or self._closing:
@@ -1376,11 +1450,13 @@ class IQConverterGUI(_TkBase):
             rbw = None
         self.file_info_var.set("Reading WAV header…")
         self.file_info_label.configure(style="Hint.TLabel")
+        markers = bool(self.range_markers_var.get())
+        history = self._recorder_history_setting()
         threading.Thread(
-            target=self._inspect_worker, args=(str(path), rbw, token), daemon=True
+            target=self._inspect_worker, args=(str(path), rbw, token, markers, history), daemon=True
         ).start()
 
-    def _inspect_worker(self, path, rbw, token):
+    def _inspect_worker(self, path, rbw, token, markers=True, history=None):
         result = {"path": path}
         try:
             result["info"] = engine().wav_info(path)
@@ -1389,6 +1465,13 @@ class IQConverterGUI(_TkBase):
         if "info" in result and rbw is not None and result["info"]["channels"] >= 2:
             try:
                 result["estimate"] = engine().estimate_conversion_seconds(path, rbw)
+            except Exception:
+                pass
+        if "info" in result and result["info"]["channels"] >= 2:
+            try:
+                result["frequency"] = engine().frequency_overview(
+                    path, recorder_history=history, look_up_request=markers
+                )["text"]
             except Exception:
                 pass
         self._safe_after(self._on_inspect_done, token, result)
@@ -1429,7 +1512,10 @@ class IQConverterGUI(_TkBase):
             self.file_info_label.configure(style="Warn.TLabel")
             self.time_var.set("")
             return
-        self.file_info_var.set("  ·  ".join(bits))
+        text = "  ·  ".join(bits)
+        if result.get("frequency"):
+            text += "\n" + result["frequency"]
+        self.file_info_var.set(text)
         self.file_info_label.configure(style="Info.TLabel")
         est = result.get("estimate")
         self.time_var.set(f"Est. ~{format_duration(est)}" if est else "")
@@ -1674,6 +1760,8 @@ class IQConverterGUI(_TkBase):
         self._job_db_auto = db_auto
         self._job_db_vmin = db_vmin
         self._job_db_vmax = db_vmax
+        self._job_range_markers = bool(self.range_markers_var.get())
+        self._job_recorder_history = self._recorder_history_setting()
         self.progress_var.set(0)
         self._set_busy(True)
         self._set_status(STATUS_CONVERTING, "busy")
@@ -1687,6 +1775,7 @@ class IQConverterGUI(_TkBase):
         self._append_log(
             f"Display: {cmap}  ·  freq smooth {'on' if freq_smooth else 'off'}  ·  "
             + ("auto dB" if db_auto else "manual dB")
+            + f"  ·  range markers {'on' if self._job_range_markers else 'off'}"
         )
         renamed = [(p.name, n) for p, n in jobs if n != f"{p.stem}.png"]
         for src, name in renamed:
@@ -1792,6 +1881,8 @@ class IQConverterGUI(_TkBase):
                         db_vmax=self._job_db_vmax,
                         cancel_event=cancel_event,
                         output_name=out_name,
+                        range_markers=self._job_range_markers,
+                        recorder_history=self._job_recorder_history,
                     )
 
                 details = buffer.getvalue().strip()
@@ -1973,7 +2064,9 @@ class IQConverterGUI(_TkBase):
 
 
 def run_headless(argv):
-    """`--input file.wav [--output dir] [--rbw hz] [--log file]`: convert without a window.
+    """`--input file.wav [--output dir] [--rbw hz] [--log file] [--recorder-history file] [--no-range-markers]`.
+
+    Converts without a window.
 
     Used by the packaged EXE for scripted runs and by the QA suite to prove the
     bundle converts on a machine without Python. Exit code 0 on success.
@@ -1986,13 +2079,26 @@ def run_headless(argv):
     parser.add_argument("--rbw", default="15000", help="Resolution bandwidth in Hz")
     parser.add_argument("--cmap", default="jet")
     parser.add_argument("--log", default=None, help="Write the conversion log to this file")
+    parser.add_argument(
+        "--recorder-history",
+        default=None,
+        help=f"CRFS IQ Recorder history file (default: ${iq_metadata.HISTORY_ENV} or this PC's Recorder)",
+    )
+    parser.add_argument("--no-range-markers", action="store_true", help="Do not mark requested / sensor-reported ranges")
     args = parser.parse_args(argv)
 
     buffer = io.StringIO()
     code = 0
     try:
         with redirect_stdout(buffer), redirect_stderr(buffer):
-            out = engine().process_file(args.input, args.output, args.rbw, cmap=args.cmap)
+            out = engine().process_file(
+                args.input,
+                args.output,
+                args.rbw,
+                cmap=args.cmap,
+                range_markers=not args.no_range_markers,
+                recorder_history=args.recorder_history,
+            )
         buffer.write(f"OK {out}\n")
     except Exception as exc:
         buffer.write(f"ERROR {user_error_text(exc)}\n{traceback.format_exc()}")

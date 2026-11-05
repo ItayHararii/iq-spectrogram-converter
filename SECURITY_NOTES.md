@@ -1,7 +1,7 @@
 # Security notes - CRFS IQ Spectrogram Converter
 
 Why Windows warns when the EXE is opened, what was checked, what was changed,
-and what is still needed. Written for release 1.4.0; hash and version updated for 1.5.1 (31 October 2026; still unsigned - no certificate on the build PC).
+and what is still needed. Written for release 1.4.0; hash and version updated for 1.6.0 (5 November 2026; still unsigned - no certificate on the build PC).
 
 ## Why Windows shows a warning
 
@@ -51,6 +51,16 @@ same as no signature, so it would only mislead users.
 
 ## What changed in this release
 
+1.6.0 (requested-range markers) adds no package, no network access and no
+change to the build settings. To label the plots, the app now reads, read-only,
+the CRFS `meta` chunk at the end of the WAV, a `<recording>.cellular.json`
+manifest beside it, and the CRFS IQ Recorder's recording history (by default
+under %LOCALAPPDATA%\CRFS IQ Recorder, or the file named in the settings or the
+`IQ_RECORDER_HISTORY` variable). These files are opened with full sharing so
+the Recorder can keep replacing them, and nothing is written to them.
+
+The items below were introduced in 1.4.0 and still apply:
+
 - Version resource embedded in the EXE (`IQ_Spectrogram_Converter.spec`):
   CompanyName "Sensorz", ProductName and FileDescription "CRFS IQ Spectrogram
   Converter", FileVersion and ProductVersion 1.4.0, LegalCopyright,
@@ -95,12 +105,12 @@ Use these details for the current build:
 | --- | --- |
 | Product name | CRFS IQ Spectrogram Converter |
 | Publisher / company | Sensorz |
-| Version | 1.5.1 |
+| Version | 1.6.0 |
 | File name | IQ_Spectrogram_Converter.exe |
-| Size | 69,176,941 bytes (66 MB) |
-| SHA-256 | 24F786ECF769166E4EEACBF0A7757BB50FC87D2DEDFEDCA746B264947745977F |
+| Size | 69,211,800 bytes (66 MB) |
+| SHA-256 | BDA825A7A9242563C4758A6B2D1642D0914C163DCA27687D0B734DE66D424E33 |
 | Build tool | PyInstaller 6.22.0, Python 3.13.14, one-file, windowed, no UPX |
-| What it does | Reads a stereo IQ WAV, computes an STFT, writes a PNG spectrogram. No network access, no installer, no registry changes. Settings are stored in a JSON file next to the EXE and a matplotlib cache under %LOCALAPPDATA%\CRFS IQ Spectrogram Converter. |
+| What it does | Reads a stereo IQ WAV, computes an STFT, writes a PNG spectrogram. Reads (never writes) the CRFS IQ Recorder's manifest and history files to label the requested frequency range. No network access, no installer, no registry changes. Settings are stored in a JSON file next to the EXE and a matplotlib cache under %LOCALAPPDATA%\CRFS IQ Spectrogram Converter. |
 
 Recompute the hash after every rebuild (`Get-FileHash dist\IQ_Spectrogram_Converter.exe -Algorithm SHA256`);
 a new build is a new file to SmartScreen.

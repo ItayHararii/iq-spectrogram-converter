@@ -11,6 +11,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+import iq_metadata
+
 # matplotlib and scipy are imported on first use (see _plt / _fft / _get_window).
 # Importing them here costs about a second before the GUI window can appear.
 _plt_mod = None
@@ -77,6 +79,25 @@ SPECTRUM_COLOR = "#1f77b4"
 SPECTRUM_HOLD_COLOR = "#e07a3d"
 SPECTRUM_FACE = "#f7f7f7"
 FLOOR_COLOR = "#666666"
+# Range markers: a light line on a dark stroke stays visible on every colormap
+# and on the light spectrum panel. Requested = dashed magenta, sensor-reported =
+# dotted white, so the two never look alike.
+REQUEST_LINE_COLOR = "#ff3bd4"
+REQUEST_TEXT_COLOR = "#a3007f"
+SENSOR_LINE_COLOR = "#ffffff"
+SENSOR_TEXT_COLOR = "#222222"
+MARKER_STROKE_COLOR = "#111111"
+REQUEST_DASHES = (0, (6.0, 3.0))
+SENSOR_DASHES = (0, (1.0, 2.0))
+MARKER_LINEWIDTH = 1.1
+MARKER_STROKE_WIDTH = 2.6
+TAG_FONTSIZE = 7.5
+TAG_ROW_PT = 14.0
+TAG_GAP_PT = 3.0
+TAG_EDGE_INSET_PT = 3.0
+INFO_FONTSIZE = 8.0
+INFO_WRAP_CHARS = 135
+TITLE_PAD_PT = 6.0
 ETA_SCALE_MIN = 0.25
 ETA_SCALE_MAX = 4.0
 ETA_EMA_ALPHA = 0.35
@@ -354,15 +375,18 @@ def _robust_noise_floor_db(spec_db):
     return float(np.percentile(finite, 20.0))
 
 
-def _annotate_peak_marker(ax, freq_plot, freq_hz, peak_db):
+def _annotate_peak_marker(ax, freq_plot, freq_hz, peak_db, x_mid=0.0, freq_text=None):
     ax.axvline(freq_plot, color="#444444", linewidth=0.7, alpha=0.65, zorder=3)
-    ha = "right" if freq_plot >= 0 else "left"
-    x_off = -8 if freq_plot >= 0 else 8
+    right_half = freq_plot >= x_mid
+    ha = "right" if right_half else "left"
+    x_off = -8 if right_half else 8
+    if freq_text is None:
+        freq_text = f"{freq_hz / 1e6:.4f} MHz"
     # The y-axis ends 4 dB above the peak, so a label placed above the peak
     # left the axes and covered the title (seen on real sensor files). Anchor
     # the label inside the axes, below the stats box, with a line to the peak.
     ax.annotate(
-        f"{freq_hz / 1e6:.4f} MHz, {peak_db:.2f} dBFS/bin",
+        f"{freq_text}, {peak_db:.2f} dBFS/bin",
         xy=(freq_plot, peak_db),
         xytext=(x_off, 0.66),
         textcoords=("offset points", "axes fraction"),
@@ -416,6 +440,516 @@ def _annotate_spectrum_stats(ax, peak_db, floor_db):
                 "linewidth": 1.0,
             },
         )
+
+
+def _fmt_freq(hz, scale):
+    """Exact value in the axis unit, never rounded to a tidy number: 1842.5, 1805, 3.90625."""
+    text = f"{float(hz) / float(scale):.9f}".rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
+def _fmt_rate(fs):
+    fs = float(fs)
+    if fs >= 1e6:
+        return f"{_fmt_freq(fs, 1e6)} MS/s"
+    if fs >= 1e3:
+        return f"{_fmt_freq(fs, 1e3)} kS/s"
+    return f"{_fmt_freq(fs, 1.0)} S/s"
+
+
+def _rf_units(centre_hz):
+    centre = abs(float(centre_hz))
+    if centre >= 1e6:
+        return 1e6, "MHz"
+    if centre >= 1e3:
+        return 1e3, "kHz"
+    return 1.0, "Hz"
+
+
+def _frequency_plan(fs, meta, lookup, markers=True):
+    """Axis, marker positions and legend text, from numeric metadata only.
+
+    The axis is absolute RF when the file's centre frequency is verified and
+    the offset from the centre otherwise. Markers: the requested start/end
+    (a matched request on an absolute axis) and the sensor-reported range
+    (when no request was matched, or when it differs from the request). A
+    boundary outside the displayed span gets no line, only an edge tag.
+    """
+    fs = float(fs)
+    half = fs / 2.0
+    meta = meta if meta is not None else iq_metadata.FileMeta()
+    absolute = bool(meta.centre_verified)
+    if absolute:
+        centre = float(meta.centre_hz)
+        scale, unit = _rf_units(centre)
+        lo_hz, hi_hz = centre - half, centre + half
+    else:
+        centre = None
+        scale, unit = _axis_units(fs)
+        lo_hz, hi_hz = -half, half
+
+    def f(hz):
+        return _fmt_freq(hz, scale)
+
+    request = lookup.request if (markers and lookup is not None) else None
+    sensor = None
+    bw = meta.sensor_bandwidth_hz
+    if bw:
+        if absolute:
+            sensor = (centre - bw / 2.0, centre + bw / 2.0)
+        elif meta.centre_hz is None:
+            sensor = (-bw / 2.0, bw / 2.0)
+    same = bool(
+        request is not None
+        and sensor is not None
+        and absolute
+        and iq_metadata.same_hz(request.start_hz, sensor[0])
+        and iq_metadata.same_hz(request.stop_hz, sensor[1])
+    )
+    draw_request = bool(markers and request is not None and absolute)
+    draw_sensor = bool(markers and sensor is not None and not (draw_request and same))
+
+    boundaries = []
+
+    def add(kind, start, stop):
+        for name, hz in (("start", start), ("end", stop)):
+            hz = float(hz)
+            if hz < lo_hz - iq_metadata.HZ_TOLERANCE:
+                side = "left"
+            elif hz > hi_hz + iq_metadata.HZ_TOLERANCE:
+                side = "right"
+            else:
+                side = None
+            boundaries.append(
+                {"kind": kind, "boundary": name, "hz": hz, "x": hz / scale, "in_view": side is None, "side": side}
+            )
+
+    if draw_request:
+        add("requested", request.start_hz, request.stop_hz)
+    if draw_sensor:
+        add("sensor", sensor[0], sensor[1])
+
+    def outside_note(kind):
+        out = [b["boundary"] for b in boundaries if b["kind"] == kind and not b["in_view"]]
+        if len(out) == 2:
+            return " · both boundaries outside the displayed span"
+        if out:
+            return f" · {out[0]} outside the displayed span"
+        return ""
+
+    rate = _fmt_rate(fs)
+    legend = []
+    log = [f"  Displayed span : {f(fs)} {unit} ({f(lo_hz)} - {f(hi_hz)} {unit}{'' if absolute else ' from centre'}), "
+           "= sample rate, not a measured bandwidth"]
+    if absolute:
+        xlabel = f"Frequency ({unit})"
+        log.append(f"  Centre         : {f(centre)} {unit} (file metadata)")
+    else:
+        why = "centre-frequency metadata not used" if meta.problem else "no centre-frequency metadata"
+        xlabel = f"Offset from centre ({unit}) · absolute frequency unknown ({why})"
+        log.append(
+            f"  Centre         : unknown ({meta.problem or 'no frequency metadata in the file'}); axis is the offset from centre"
+        )
+    if sensor is not None:
+        sbw = sensor[1] - sensor[0]
+        where = f"{f(sensor[0])} - {f(sensor[1])} {unit}" if absolute else f"+/-{f(sbw / 2.0)} {unit} around the centre"
+        log.append(f"  Sensor-reported: bandwidth {f(sbw)} {unit}, {where} (file metadata)")
+    elif meta.problem:
+        log.append(f"  Sensor-reported: not used ({meta.problem})")
+    else:
+        log.append(f"  Sensor-reported: {'not in the file metadata' if meta.present else 'unknown (no frequency metadata in the file)'}")
+    if not markers:
+        log.append("  Requested range: not looked up (range markers off)")
+    elif request is not None:
+        rs, ru = _rf_units(request.centre_hz)
+        log.append(
+            f"  Requested range: {_fmt_freq(request.start_hz, rs)} - {_fmt_freq(request.stop_hz, rs)} {ru}, "
+            f"bandwidth {_fmt_freq(request.bandwidth_hz, rs)} {ru} ({request.source}"
+            + (f", {request.detail}" if request.detail else "")
+            + ")"
+        )
+    else:
+        note = lookup.note if lookup is not None and lookup.note else "no request record"
+        log.append(f"  Requested range: not available ({note})")
+
+    if markers:
+        if draw_request:
+            s, e = float(request.start_hz), float(request.stop_hz)
+            text = (
+                f"Requested range: start {f(s)} {unit} · end {f(e)} {unit} · bandwidth {f(e - s)} {unit}"
+                + outside_note("requested")
+            )
+            if request.is_window and request.allocation_start_hz is not None:
+                text += (
+                    f" · capture window {request.window_index or '?'} of {request.window_count} of the requested "
+                    f"{f(request.allocation_start_hz)}–{f(request.allocation_stop_hz)} {unit}"
+                )
+            legend.append(("requested", f"{text}  ({request.source})"))
+        elif request is not None:
+            rs, ru = _rf_units(request.centre_hz)
+            legend.append((
+                None,
+                f"Requested range {_fmt_freq(request.start_hz, rs)}–{_fmt_freq(request.stop_hz, rs)} {ru} "
+                f"({request.source}): not marked, absolute frequency unknown",
+            ))
+        else:
+            note = lookup.note if lookup is not None and lookup.note else "no request record"
+            legend.append((None, f"Requested range: not available ({note})"))
+        if sensor is not None:
+            sbw = sensor[1] - sensor[0]
+            if draw_sensor and absolute:
+                legend.append((
+                    "sensor",
+                    f"Sensor-reported range: {f(sensor[0])}–{f(sensor[1])} {unit} · sensor-reported bandwidth "
+                    f"{f(sbw)} {unit}" + outside_note("sensor") + "  (file metadata)",
+                ))
+            elif draw_sensor:
+                legend.append((
+                    "sensor",
+                    f"Sensor-reported bandwidth {f(sbw)} {unit} (file metadata): ±{f(sbw / 2.0)} {unit} "
+                    "around the unknown centre",
+                ))
+            else:
+                legend.append((None, f"Sensor-reported bandwidth {f(sbw)} {unit} (file metadata): same range as requested"))
+        elif meta.problem:
+            legend.append((None, f"Sensor-reported bandwidth: not used ({meta.problem})"))
+        elif meta.present:
+            legend.append((None, "Sensor-reported bandwidth: not in the file metadata"))
+        else:
+            legend.append((None, "Sensor-reported bandwidth: unknown (no frequency metadata in the file)"))
+        if absolute:
+            legend.append((None, f"Centre {f(centre)} {unit} (file metadata) · Sample rate {rate}"))
+            legend.append((
+                None,
+                f"Displayed span {f(fs)} {unit}, {f(lo_hz)}–{f(hi_hz)} {unit} "
+                "(= sample rate for complex IQ, not a measured bandwidth)",
+            ))
+        else:
+            what = f"Centre-frequency metadata not used ({meta.problem})" if meta.problem else "Centre frequency unknown"
+            legend.append((None, f"{what}: the axis shows the offset from the centre · Sample rate {rate}"))
+            legend.append((
+                None,
+                f"Displayed span {f(fs)} {unit} (= sample rate for complex IQ, not a measured bandwidth)",
+            ))
+        tail = "do not prove uniform sensitivity, exact filter edges or complete capture."
+        req_shown = any(b["kind"] == "requested" and b["in_view"] for b in boundaries)
+        sensor_shown = any(b["kind"] == "sensor" and b["in_view"] for b in boundaries)
+        if req_shown and sensor_shown:
+            legend.append((None, "Dashed: requested. Dotted: sensor-reported. The markers " + tail))
+        elif req_shown:
+            legend.append((None, "Dashed lines: requested boundaries. They " + tail))
+        elif sensor_shown and draw_request:
+            legend.append((None, "Dotted lines: sensor-reported range. They " + tail))
+        elif sensor_shown:
+            legend.append((None, "Dotted lines: sensor-reported range, not a request. They " + tail))
+        elif draw_request:
+            legend.append((None, "The requested boundaries are outside the displayed span; the tags show their values."))
+
+    tag_rows = []
+    for kind in ("requested", "sensor"):
+        own = [b for b in boundaries if b["kind"] == kind]
+        if not own:
+            continue
+        label = "Requested" if kind == "requested" else "Sensor-reported"
+        specs = []
+        for b in own:
+            word = f"{label} {b['boundary']}" if kind == "requested" else label
+            value = f"{f(b['hz'])} {unit}"
+            if b["in_view"]:
+                options = ("right", "center", "left") if b["boundary"] == "start" else ("left", "center", "right")
+                specs.append({"x": b["x"], "text": f"{word} {value}", "options": options})
+            elif b["side"] == "left":
+                specs.append(
+                    {"x": lo_hz / scale, "text": f"◀ {word} {value} (outside view)", "options": ("left",), "dx": TAG_EDGE_INSET_PT}
+                )
+            else:
+                specs.append(
+                    {"x": hi_hz / scale, "text": f"{word} {value} (outside view) ▶", "options": ("right",), "dx": -TAG_EDGE_INSET_PT}
+                )
+        start = next(b for b in own if b["boundary"] == "start")
+        end = next(b for b in own if b["boundary"] == "end")
+        merged = f"{label} {f(start['hz'])}–{f(end['hz'])} {unit}"
+        outs = [b for b in own if not b["in_view"]]
+        if len(outs) == 2 and outs[0]["side"] == outs[1]["side"]:
+            merged += " (outside view)"
+        elif len(outs) == 1:
+            merged += f" ({outs[0]['boundary']} outside view)"
+        elif len(outs) == 2:
+            merged += " (both outside view)"
+        if any(b["side"] == "left" for b in outs):
+            merged_spec = {"x": lo_hz / scale, "text": f"◀ {merged}", "options": ("left",), "dx": TAG_EDGE_INSET_PT}
+        elif outs:
+            merged_spec = {"x": hi_hz / scale, "text": f"{merged} ▶", "options": ("right",), "dx": -TAG_EDGE_INSET_PT}
+        else:
+            merged_spec = {"x": 0.5 * (start["x"] + end["x"]), "text": merged, "options": ("center", "left", "right")}
+        tag_rows.append({"kind": kind, "specs": specs, "merged": merged_spec})
+
+    return {
+        "absolute": absolute,
+        "centre_hz": centre,
+        "scale": scale,
+        "unit": unit,
+        "lo_hz": lo_hz,
+        "hi_hz": hi_hz,
+        "x_min": lo_hz / scale,
+        "x_max": hi_hz / scale,
+        "span_hz": fs,
+        "xlabel": xlabel,
+        "markers": bool(markers),
+        "request": request,
+        "sensor_range_hz": sensor,
+        "request_matches_sensor": same,
+        "draw_request": draw_request,
+        "draw_sensor": draw_sensor,
+        "boundaries": boundaries,
+        "legend": legend,
+        "tag_rows": tag_rows,
+        "log": log,
+    }
+
+
+def _marker_style(kind):
+    from matplotlib import patheffects
+
+    stroke = [patheffects.withStroke(linewidth=MARKER_STROKE_WIDTH, foreground=MARKER_STROKE_COLOR, alpha=0.85)]
+    if kind == "requested":
+        return {"color": REQUEST_LINE_COLOR, "linestyle": REQUEST_DASHES, "linewidth": MARKER_LINEWIDTH, "path_effects": stroke}
+    return {"color": SENSOR_LINE_COLOR, "linestyle": SENSOR_DASHES, "linewidth": MARKER_LINEWIDTH, "path_effects": stroke}
+
+
+def _tag_style(kind):
+    if kind == "requested":
+        edge, text, ls = REQUEST_LINE_COLOR, REQUEST_TEXT_COLOR, "--"
+    else:
+        edge, text, ls = "#444444", SENSOR_TEXT_COLOR, ":"
+    return text, {"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": edge, "linewidth": 0.8, "linestyle": ls}
+
+
+def _place_tag_row(fig, ax, row, row_index, renderer):
+    """Put one row of boundary tags just above the axes, inside its width, without overlaps.
+
+    Tries the alignments of every tag in a fixed order, then one merged range
+    tag; if nothing fits the row is left out (the legend still has the values).
+    Returns (annotations, how) with how in "separate" / "merged" / "dropped".
+    """
+    import itertools
+
+    text_color, box = _tag_style(row["kind"])
+    axbox = ax.get_window_extent(renderer)
+    px = fig.dpi / 72.0
+    pad = (0.2 * TAG_FONTSIZE + 1.0) * px
+    gap = 3.0 * px
+
+    def make(spec):
+        ann = ax.annotate(
+            spec["text"],
+            xy=(spec["x"], 1.0),
+            xycoords=("data", "axes fraction"),
+            xytext=(spec.get("dx", 0.0), TAG_GAP_PT + row_index * TAG_ROW_PT),
+            textcoords="offset points",
+            ha=spec["options"][0],
+            va="bottom",
+            fontsize=TAG_FONTSIZE,
+            color=text_color,
+            bbox=dict(box),
+            annotation_clip=False,
+            zorder=6,
+        )
+        ann.set_clip_on(False)
+        ann.set_gid(f"range-tag:{row['kind']}")
+        return ann
+
+    def fits(anns):
+        boxes = [a.get_window_extent(renderer) for a in anns]
+        for b in boxes:
+            if b.x0 - pad < axbox.x0 - 0.5 or b.x1 + pad > axbox.x1 + 0.5:
+                return False
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                a, b = boxes[i], boxes[j]
+                if a.x0 - pad - gap < b.x1 + pad and b.x0 - pad - gap < a.x1 + pad:
+                    return False
+        return True
+
+    anns = [make(spec) for spec in row["specs"]]
+    for combo in itertools.product(*[spec["options"] for spec in row["specs"]]):
+        for ann, ha in zip(anns, combo):
+            ann.set_horizontalalignment(ha)
+        if fits(anns):
+            return anns, "separate"
+    for ann in anns:
+        ann.remove()
+    merged = make(row["merged"])
+    for ha in row["merged"]["options"]:
+        merged.set_horizontalalignment(ha)
+        if fits([merged]):
+            return [merged], "merged"
+    merged.remove()
+    return [], "dropped"
+
+
+def _draw_frequency_ranges(fig, ax_spec, ax_wf, plan, title):
+    """Marker lines on both panels, boundary tags above the spectrum, legend under the x label."""
+    from matplotlib.lines import Line2D
+
+    info = {"lines": [], "tags": [], "tag_rows": [], "legend": None, "title_pad": TITLE_PAD_PT}
+    for b in plan["boundaries"]:
+        if not b["in_view"]:
+            continue
+        style = _marker_style(b["kind"])
+        for name, ax in (("spectrum", ax_spec), ("spectrogram", ax_wf)):
+            line = ax.axvline(b["x"], zorder=2.6, **style)
+            line.set_gid(f"range-line:{b['kind']}:{b['boundary']}")
+            info["lines"].append(
+                {
+                    "kind": b["kind"],
+                    "boundary": b["boundary"],
+                    "hz": b["hz"],
+                    "axes": name,
+                    "xdata": [float(v) for v in line.get_xdata()],
+                    "color": line.get_color(),
+                    "dashes": [float(v) for v in style["linestyle"][1]],
+                    "linewidth": float(line.get_linewidth()),
+                    "artist": line,
+                }
+            )
+    ax_spec.set_xlim(plan["x_min"], plan["x_max"])
+    ax_wf.set_xlim(plan["x_min"], plan["x_max"])
+
+    renderer = fig.canvas.get_renderer()
+    rows_used = 0
+    for row in plan["tag_rows"]:
+        anns, how = _place_tag_row(fig, ax_spec, row, rows_used, renderer)
+        info["tag_rows"].append({"kind": row["kind"], "how": how, "texts": [a.get_text() for a in anns]})
+        if anns:
+            info["tags"].extend(anns)
+            rows_used += 1
+    if rows_used:
+        info["title_pad"] = TITLE_PAD_PT + rows_used * TAG_ROW_PT + 2.0
+    ax_spec.set_title(title, pad=info["title_pad"])
+
+    if plan["legend"]:
+        import textwrap
+
+        handles, labels = [], []
+        for kind, text in plan["legend"]:
+            if kind is None:
+                handles.append(Line2D([], [], linestyle="none"))
+            else:
+                handles.append(Line2D([0, 1], [0, 0], **_marker_style(kind)))
+            labels.append(textwrap.fill(text, INFO_WRAP_CHARS, subsequent_indent="    ", break_on_hyphens=False))
+        below = ax_wf.get_tightbbox(renderer)
+        axbox = ax_wf.get_window_extent(renderer)
+        top = below.y0 - 6.0 * fig.dpi / 72.0
+        legend = fig.legend(
+            handles,
+            labels,
+            loc="upper left",
+            bbox_to_anchor=(axbox.x0 / fig.bbox.width, top / fig.bbox.height),
+            bbox_transform=fig.transFigure,
+            frameon=False,
+            fontsize=INFO_FONTSIZE,
+            handlelength=3.2,
+            handletextpad=0.6,
+            borderaxespad=0.0,
+            borderpad=0.0,
+            labelspacing=0.35,
+        )
+        legend.set_gid("range-legend")
+        info["legend"] = legend
+    return info
+
+
+def _layout_boxes(fig, ax_spec, ax_wf, cbar, drawn):
+    """Display-pixel boxes [x0, y0, x1, y1] of the labels, for overlap and clipping checks."""
+    import matplotlib
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    def box(b):
+        return [float(b.x0), float(b.y0), float(b.x1), float(b.y1)]
+
+    def text_box(t):
+        patch = t.get_bbox_patch()
+        if patch is not None:
+            return box(patch.get_window_extent(renderer))
+        return box(t.get_window_extent(renderer))
+
+    tags = [
+        {"text": a.get_text(), "ha": a.get_horizontalalignment(), "box": text_box(a)} for a in drawn["tags"]
+    ]
+    spectrum_texts = [
+        {"text": t.get_text(), "box": text_box(t)}
+        for t in ax_spec.texts
+        if not str(t.get_gid() or "").startswith("range-tag") and t.get_text()
+    ]
+    ticks = [t.get_window_extent(renderer) for t in ax_wf.get_xticklabels() if t.get_visible() and t.get_text()]
+    legend = drawn["legend"]
+    tight = fig.get_tightbbox(renderer).padded(float(matplotlib.rcParams["savefig.pad_inches"]))
+    dpi = float(fig.dpi)
+    return {
+        "dpi": dpi,
+        "saved": [tight.x0 * dpi, tight.y0 * dpi, tight.x1 * dpi, tight.y1 * dpi],
+        "title": box(ax_spec.title.get_window_extent(renderer)),
+        "spectrum_axes": box(ax_spec.get_window_extent(renderer)),
+        "spectrogram_axes": box(ax_wf.get_window_extent(renderer)),
+        "colorbar": box(cbar.ax.get_tightbbox(renderer)),
+        "xlabel": box(ax_wf.xaxis.label.get_window_extent(renderer)),
+        "xticklabels": [box(t) for t in ticks],
+        "legend": box(legend.get_window_extent(renderer)) if legend is not None else None,
+        "legend_texts": [
+            {"text": t.get_text(), "box": box(t.get_window_extent(renderer))} for t in legend.get_texts()
+        ]
+        if legend is not None
+        else [],
+        "tags": tags,
+        "spectrum_texts": spectrum_texts,
+    }
+
+
+def frequency_overview(path, recorder_history=None, look_up_request=True):
+    """File metadata, request lookup and a one-line summary for the GUI (header + trailer reads only)."""
+    info = sf.info(os.fspath(path))
+    meta = iq_metadata.read_file_meta(path, float(info.samplerate))
+    lookup = iq_metadata.find_request(path, meta, recorder_history) if look_up_request else None
+
+    def mhz(hz):
+        return _fmt_freq(hz, 1e6)
+
+    parts = []
+    if meta.centre_verified:
+        parts.append(f"Centre {mhz(meta.centre_hz)} MHz")
+    elif meta.problem:
+        parts.append("Centre not used (metadata inconsistent): relative axis")
+    else:
+        parts.append("Centre unknown (no frequency metadata): relative axis")
+    sensor = None
+    if meta.centre_verified and meta.sensor_bandwidth_hz:
+        half = meta.sensor_bandwidth_hz / 2.0
+        sensor = (meta.centre_hz - half, meta.centre_hz + half)
+    req = lookup.request if lookup is not None else None
+    if lookup is None:
+        if sensor:
+            parts.append(f"Sensor-reported {mhz(sensor[0])}–{mhz(sensor[1])} MHz")
+        parts.append("range markers off")
+    elif req is not None:
+        parts.append(f"Requested {mhz(req.start_hz)}–{mhz(req.stop_hz)} MHz ({req.source})")
+        if sensor and not (iq_metadata.same_hz(sensor[0], req.start_hz) and iq_metadata.same_hz(sensor[1], req.stop_hz)):
+            parts.append(f"Sensor-reported {mhz(sensor[0])}–{mhz(sensor[1])} MHz")
+        if not meta.centre_verified:
+            parts.append("not marked without a centre")
+    else:
+        if sensor:
+            parts.append(f"Sensor-reported {mhz(sensor[0])}–{mhz(sensor[1])} MHz")
+        why = {
+            iq_metadata.STATUS_NO_RECORDS: "no Recorder records",
+            iq_metadata.STATUS_AMBIGUOUS: "several Recorder records disagree",
+            iq_metadata.STATUS_CONFLICT: "Recorder records do not match the file",
+            iq_metadata.STATUS_UNVERIFIED: "cannot be checked without a centre",
+        }.get(lookup.status, "no matching Recorder record")
+        parts.append(f"Requested range not available ({why})")
+    return {"meta": meta, "lookup": lookup, "text": "  ·  ".join(parts)}
 
 
 def _normalize_cmap(cmap):
@@ -507,6 +1041,8 @@ def process_file(
     cancel_event=None,
     output_name=None,
     stats=None,
+    range_markers=True,
+    recorder_history=None,
 ):
     """Convert one stereo IQ WAV to <output_dir>/<stem>.png and return the PNG path.
 
@@ -517,7 +1053,14 @@ def process_file(
     stats: optional dict. When given it is filled with the numbers behind the
     image (fs, n_fft, frames, true RBW, peak/floor dBFS, full-resolution
     spectra and the pooled waterfall grid) so tests can check the DSP against
-    independent expectations instead of inspecting pixels.
+    independent expectations instead of inspecting pixels, plus the frequency
+    axis, the marker lines read back from the axes and the label boxes.
+    range_markers: mark the requested (or else sensor-reported) range and
+    explain the axis under the plot. The frequency axis is absolute RF
+    whenever the file's centre frequency is verified, either way.
+    recorder_history: CRFS IQ Recorder history file to look requests up in;
+    None uses IQ_RECORDER_HISTORY or this PC's Recorder (if installed).
+    None of this changes the samples, the FFT or any computed value.
     """
 
     def report(fraction, message):
@@ -562,7 +1105,6 @@ def process_file(
         n_channels = int(snd.channels)
 
         duration_s = n_samples / fs if fs else 0.0
-        bandwidth_hz = fs
         file_size_kb = os.path.getsize(path) / 1024
         n_fft = _n_fft(fs, rbw)
         hop = max(n_fft // 2, 1)
@@ -595,8 +1137,24 @@ def process_file(
 
         part_no, part_offset_s = part_time_offset(path)
 
+        # Frequency facts never stop a conversion: unreadable metadata or
+        # records just leave the axis relative and the request unavailable.
+        try:
+            file_meta = iq_metadata.read_file_meta(path, fs)
+        except Exception:
+            file_meta = iq_metadata.FileMeta()
+        lookup = None
+        if range_markers:
+            try:
+                lookup = iq_metadata.find_request(path, file_meta, recorder_history)
+            except Exception as exc:
+                lookup = iq_metadata.RequestLookup(
+                    None, iq_metadata.STATUS_NOT_FOUND, f"request lookup failed: {exc.__class__.__name__}"
+                )
+        plan = _frequency_plan(fs, file_meta, lookup, markers=bool(range_markers))
+
         print(f"--- {Path(path).name} ---")
-        print(f"  Sample rate    : {fs:,.0f} Hz")
+        print(f"  Sample rate    : {fs:,.0f} Hz ({_fmt_rate(fs)})")
         print(f"  Samples        : {n_samples:,}")
         print(f"  Duration       : {duration_s:.3f} s")
         if part_no is not None and part_no > 1:
@@ -604,7 +1162,8 @@ def process_file(
                 print(f"  Split part     : {part_no} (earlier parts not found; time axis starts at 0)")
             else:
                 print(f"  Split part     : {part_no}, starts {part_offset_s:.3f} s into the recording")
-        print(f"  Bandwidth      : {bandwidth_hz / 1e6:.3f} MHz")
+        for line in plan["log"]:
+            print(line)
         print(f"  RBW requested  : {rbw / 1e3:.3f} kHz")
         print(f"  RBW (ENBW)     : {rbw_true / 1e3:.3f} kHz  ({enbw_bins:.3f} bins x {df_hz / 1e3:.3f} kHz)")
         print(f"  File size      : {file_size_kb:.1f} kB")
@@ -729,8 +1288,8 @@ def process_file(
     plt = _plt()
     fig = None
     out_path = None
-    f_scale, f_unit = _axis_units(axis_meta["fs"])
-    f_max = (axis_meta["fs"] / 2.0) / f_scale
+    f_scale, f_unit = plan["scale"], plan["unit"]
+    x_min, x_max = plan["x_min"], plan["x_max"]
     duration_s = float(axis_meta["duration_s"])
     part_no = axis_meta.get("part_no")
     part_offset_s = axis_meta.get("part_offset_s")
@@ -750,7 +1309,10 @@ def process_file(
     else:
         rbw_label = rbw_true_label
     freqs_hz = _fftshift_freqs(int(axis_meta["n_fft"]), axis_meta["fs"])
-    freqs = freqs_hz / f_scale
+    if plan["absolute"]:
+        freqs = (plan["centre_hz"] + freqs_hz) / f_scale
+    else:
+        freqs = freqs_hz / f_scale
     if np.isfinite(peak_db).any():
         peak_idx = int(np.nanargmax(peak_db))
         peak_val = float(peak_db[peak_idx])
@@ -785,13 +1347,33 @@ def process_file(
                 "floor_db": floor_val,
                 "vmin": vmin,
                 "vmax": vmax,
+                "file_meta": file_meta.as_dict(),
+                "request_lookup": lookup.as_dict() if lookup is not None else None,
+                "frequency_axis": {
+                    "absolute": plan["absolute"],
+                    "centre_hz": plan["centre_hz"],
+                    "unit": f_unit,
+                    "scale": f_scale,
+                    "x_min": x_min,
+                    "x_max": x_max,
+                    "span_hz": plan["span_hz"],
+                    "xlabel": plan["xlabel"],
+                },
+                "range_boundaries": [dict(b) for b in plan["boundaries"]],
+                "range_legend": [text for _kind, text in plan["legend"]],
+                "request_matches_sensor": plan["request_matches_sensor"],
+                "peak_rf_hz": (plan["centre_hz"] + peak_freq_hz)
+                if plan["absolute"] and peak_freq_hz is not None
+                else None,
             }
         )
+    title = f"{Path(path).name}  ·  RBW {rbw_label}{part_label}"
     try:
         fig, (ax_spec, ax_wf) = plt.subplots(
             2,
             1,
             figsize=FIGSIZE,
+            dpi=SAVE_DPI,
             sharex=True,
             gridspec_kw={
                 "height_ratios": [SPECTRUM_HEIGHT_RATIO, WATERFALL_HEIGHT_RATIO],
@@ -816,7 +1398,7 @@ def process_file(
             linewidth=0.95,
             zorder=2,
         )
-        ax_spec.set_xlim(-f_max, f_max)
+        ax_spec.set_xlim(x_min, x_max)
         if finite_mean.size or finite_peak.size:
             y_lo_src = finite_mean if finite_mean.size else finite_peak
             y_hi_src = finite_peak if finite_peak.size else finite_mean
@@ -830,11 +1412,17 @@ def process_file(
         for spine in ax_spec.spines.values():
             spine.set_color("black")
         ax_spec.set_ylabel("Bin Power (dBFS/bin)")
-        ax_spec.set_title(f"{Path(path).name}  ·  RBW {rbw_label}{part_label}")
+        ax_spec.set_title(title)
         ax_spec.tick_params(labelbottom=False)
         ax_spec.grid(False)
         if peak_idx is not None and np.isfinite(peak_val) and np.isfinite(peak_freq_hz):
-            _annotate_peak_marker(ax_spec, freqs[peak_idx], peak_freq_hz, peak_val)
+            if plan["absolute"]:
+                peak_text = f"{(plan['centre_hz'] + peak_freq_hz) / 1e6:.4f} MHz"
+            else:
+                peak_text = f"{peak_freq_hz / 1e6:+.4f} MHz from centre"
+            _annotate_peak_marker(
+                ax_spec, freqs[peak_idx], peak_freq_hz, peak_val, x_mid=0.5 * (x_min + x_max), freq_text=peak_text
+            )
         _annotate_spectrum_stats(ax_spec, peak_val, floor_val)
 
         im = ax_wf.imshow(
@@ -843,24 +1431,46 @@ def process_file(
             origin="lower",
             aspect="auto",
             interpolation="nearest",
-            extent=[-f_max, f_max, t_start, t_start + duration_s],
+            extent=[x_min, x_max, t_start, t_start + duration_s],
             vmin=vmin,
             vmax=vmax,
         )
-        ax_wf.set_xlim(-f_max, f_max)
+        ax_wf.set_xlim(x_min, x_max)
         ax_wf.set_ylim(t_start, t_start + duration_s)
-        ax_wf.set_xlabel(f"Frequency ({f_unit})")
+        ax_wf.set_xlabel(plan["xlabel"])
         ax_wf.set_ylabel("Time (s)")
+        # Absolute MHz must read as 1842.5, not as an offset like "+1.8e3".
+        ax_wf.ticklabel_format(axis="x", style="plain", useOffset=False)
         cbar = fig.colorbar(im, ax=[ax_spec, ax_wf], fraction=0.046, pad=0.04)
         cbar.set_label("dBFS/bin")
+        drawn = _draw_frequency_ranges(fig, ax_spec, ax_wf, plan, title)
+        if stats is not None:
+            stats["waterfall_image_is_data"] = bool(
+                im.get_array().shape == power_db.T.shape and np.array_equal(np.asarray(im.get_array()), power_db.T)
+            )
+            stats["range_lines"] = [{k: v for k, v in line.items() if k != "artist"} for line in drawn["lines"]]
+            stats["range_tag_rows"] = drawn["tag_rows"]
+            stats["layout"] = _layout_boxes(fig, ax_spec, ax_wf, cbar, drawn)
         del power_db, peak_db, mean_db
         check_cancel()
         report(0.95, "Saving PNG…")
         out_path = _save_spectrogram_png(fig, output_dir, out_name, cancel_event)
         print(f"  Saved          : {out_name}")
         print("  Layout         : spectrum + spectrogram")
+        marked = [b for b in plan["boundaries"]]
+        if marked:
+            parts = []
+            for b in marked:
+                where = "" if b["in_view"] else " (outside view, not drawn)"
+                parts.append(f"{b['kind']} {b['boundary']} {_fmt_freq(b['hz'], f_scale)} {f_unit}{where}")
+            print("  Range markers  : " + "; ".join(parts))
+        elif range_markers:
+            print("  Range markers  : none (nothing to mark on this axis)")
         if peak_val is not None and peak_freq_hz is not None:
-            print(f"  Peak           : {peak_val:.2f} dBFS/bin @ {peak_freq_hz / 1e6:.4f} MHz")
+            if plan["absolute"]:
+                print(f"  Peak           : {peak_val:.2f} dBFS/bin @ {(plan['centre_hz'] + peak_freq_hz) / 1e6:.4f} MHz")
+            else:
+                print(f"  Peak           : {peak_val:.2f} dBFS/bin @ {peak_freq_hz / 1e6:+.4f} MHz from centre")
         if floor_val is not None:
             print(f"  Noise floor    : {floor_val:.2f} dBFS/bin")
         if vmin is not None and vmax is not None:
@@ -890,6 +1500,13 @@ if __name__ == "__main__":
     parser.add_argument("--no-freq-smooth", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--db-min", type=float, default=None, help="Colorbar vmin in dB (implies manual scale)")
     parser.add_argument("--db-max", type=float, default=None, help="Colorbar vmax in dB (implies manual scale)")
+    parser.add_argument(
+        "--recorder-history",
+        default=None,
+        help=f"CRFS IQ Recorder history file for the requested ranges (default: ${iq_metadata.HISTORY_ENV} "
+        "or this PC's Recorder)",
+    )
+    parser.add_argument("--no-range-markers", action="store_true", help="Do not mark requested / sensor-reported ranges")
     args = parser.parse_args()
 
     db_auto = args.db_min is None and args.db_max is None
@@ -904,6 +1521,8 @@ if __name__ == "__main__":
             db_auto=db_auto,
             db_vmin=args.db_min,
             db_vmax=args.db_max,
+            range_markers=not args.no_range_markers,
+            recorder_history=args.recorder_history,
         )
 
     if args.input:

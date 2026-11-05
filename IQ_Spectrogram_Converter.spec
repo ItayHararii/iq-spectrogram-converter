@@ -101,6 +101,7 @@ for name in ("sensorz_icon.ico", "sensorz_icon.png", "sensorz_logo.png"):
 binaries = []
 hiddenimports = [
     "iq_data",
+    "iq_metadata",
     "iq_theme",
     "PIL",
     "PIL.ImageTk",

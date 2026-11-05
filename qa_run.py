@@ -110,6 +110,33 @@ def write_iq(path, fs=48_000, seconds=0.25, tones=((4_000.0, 0.5),), subtype="PC
     return fs, n
 
 
+def append_crfs_meta(path, centre_hz, bandwidth_hz, sample_rate, receiver="rfeye100400"):
+    """Trailing CRFS ``meta`` chunk like the sensor writes (centre, sensor-reported bandwidth, sample rate)."""
+    xml = (
+        f'<?xml version="1.0"?><signalinfo><base><rf_frequency>{centre_hz:g}</rf_frequency>'
+        f"<bandwidth>{bandwidth_hz:g}</bandwidth><data_type>complex</data_type>"
+        f"<sample_rate>{sample_rate:g}</sample_rate></base>"
+        f"<extended><receiver>{receiver}</receiver></extended></signalinfo>"
+    ).encode("utf-8")
+    pad = b"\x00" if len(xml) % 2 else b""
+    with open(path, "r+b") as fh:
+        fh.seek(0, os.SEEK_END)
+        fh.write(b"meta" + struct.pack("<I", len(xml)) + xml + pad)
+        size = fh.tell()
+        fh.seek(4)
+        fh.write(struct.pack("<I", size - 8))
+
+
+def write_manifest(folder, stem, start_hz, stop_hz):
+    data = {
+        "schema": 1,
+        "kind": "cellular_capture",
+        "identifiers": {"recording_stem": stem},
+        "allocation": {"requested_start_hz": start_hz, "requested_stop_hz": stop_hz},
+    }
+    (Path(folder) / f"{stem}.cellular.json").write_text(json.dumps(data), encoding="utf-8")
+
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -567,11 +594,13 @@ def t_rbw_true(ctx):
     return f"ENBW {enbw:.4f} bins, RBW true {expected:.1f} Hz, log says {line.split(':', 1)[1].strip()}"
 
 
-@case("DSP unchanged versus reference iq_data.py (STFT arrays equal, PNG pixels equal)")
+@case("DSP unchanged versus reference iq_data.py (spectrum + spectrogram arrays exactly equal)")
 def t_reference(ctx):
     if not ctx.reference:
         raise Skip("no --reference module given")
     import importlib.util
+    import io
+    from contextlib import redirect_stdout
 
     spec = importlib.util.spec_from_file_location("iq_data_reference", ctx.reference)
     ref = importlib.util.module_from_spec(spec)
@@ -581,22 +610,60 @@ def t_reference(ctx):
     for rbw in (100, 500):
         f_new, m_new, p_new, n_new, e_new, _ = peak_spectrum(wav, rbw, iq_data)
         f_old, m_old, p_old, n_old, e_old, _ = peak_spectrum(wav, rbw, ref)
-        assert n_new == n_old and e_new == e_old
-        assert np.array_equal(f_new, f_old)
-        assert np.allclose(m_new, m_old, rtol=0, atol=1e-5, equal_nan=True)
-        assert np.allclose(p_new, p_old, rtol=0, atol=1e-5, equal_nan=True)
-    out_new, out_old = ctx.tmp / "ref_new", ctx.tmp / "ref_old"
-    convert(str(wav), str(out_new), 100, cmap="viridis")
-    ref.process_file(str(wav), str(out_old), 100, cmap="viridis")
-    a, b = (out_new / "ref.png").read_bytes(), (out_old / "ref.png").read_bytes()
-    if a == b:
-        return "arrays equal (atol 1e-5 dB); PNG bytes identical"
-    from PIL import Image
+        assert n_new == n_old and e_new == e_old, f"rbw {rbw}: FFT size / ENBW differ"
+        assert np.array_equal(f_new, f_old), f"rbw {rbw}: frequency grid differs"
+        assert np.array_equal(m_new, m_old, equal_nan=True), f"rbw {rbw}: mean spectrum differs"
+        assert np.array_equal(p_new, p_old, equal_nan=True), f"rbw {rbw}: max-hold spectrum differs"
+    # A CRFS file with a Recorder manifest: the new engine draws an absolute axis and markers.
+    crfs_dir = ctx.tmp / "ref_crfs"
+    crfs_dir.mkdir(parents=True, exist_ok=True)
+    crfs = crfs_dir / "iq_ref_0001.wav"
+    write_iq(crfs, fs=1_000_000, seconds=0.2, tones=((150_000.0, 0.3), (-225_000.0, 0.05)), noise=0.01)
+    append_crfs_meta(crfs, 100e6, 0.8e6, 1_000_000)
+    write_manifest(crfs_dir, "iq_ref", 99_700_000, 100_100_000)
+    keys = ("freqs_hz", "spectrum_mean_db", "spectrum_peak_db", "waterfall_db")
+    scalars = ("n_fft", "hop", "n_frames", "frames_done", "rbw_true_hz", "peak_db", "peak_freq_hz", "floor_db", "vmin", "vmax")
+    checked = 0
+    for src, rbw, cmap in ((wav, 100, "viridis"), (crfs, 2_000, "jet"), (crfs, 500, "gray")):
+        new, old = {}, {}
+        convert(str(src), str(ctx.tmp / "ref_new"), rbw, cmap=cmap, stats=new, recorder_history=str(ctx.tmp / "none.json"))
+        with redirect_stdout(io.StringIO()):
+            ref.process_file(str(src), str(ctx.tmp / "ref_old"), rbw, cmap=cmap, stats=old)
+        for key in keys:
+            assert np.array_equal(new[key], old[key], equal_nan=True), f"{src.name} rbw {rbw}: {key} differs"
+        for key in scalars:
+            assert new[key] == old[key], f"{src.name} rbw {rbw}: {key} {new[key]!r} != {old[key]!r}"
+        assert new["waterfall_image_is_data"], "spectrogram image is not the computed array"
+        checked += 1
+    kinds = sorted(line["kind"] for line in new["range_lines"])
+    assert new["frequency_axis"]["absolute"], new["frequency_axis"]
+    assert kinds == ["requested"] * 4 + ["sensor"] * 4, kinds
+    return (
+        f"{checked} conversions: frequency, mean/max-hold spectrum and spectrogram arrays exactly equal; "
+        "PNG differs by design (absolute axis, markers, legend)"
+    )
 
-    ia = np.asarray(Image.open(out_new / "ref.png").convert("RGB"))
-    ib = np.asarray(Image.open(out_old / "ref.png").convert("RGB"))
-    assert ia.shape == ib.shape and np.array_equal(ia, ib), "PNG pixels differ"
-    return "arrays equal; PNG pixels identical (bytes differ only in metadata)"
+
+@case("requested-range markers: 1805-1880 MHz at centre 1842.5 MHz, 125 MS/s")
+def t_range_markers(ctx):
+    folder = ctx.tmp / "range"
+    wav = folder / "iq_qa_range_0001.wav"
+    write_iq(wav, fs=125_000_000, seconds=0.004, tones=((10e6, 0.5),), noise=0.01)
+    append_crfs_meta(wav, 1_842_500_000.0, 75e6, 125_000_000)
+    write_manifest(folder, "iq_qa_range", 1_805_000_000, 1_880_000_000)
+    stats = {}
+    convert(str(wav), str(folder / "out"), 15_000, stats=stats, recorder_history=str(ctx.tmp / "none.json"))
+    axis = stats["frequency_axis"]
+    assert axis["absolute"] and axis["centre_hz"] == 1_842_500_000.0, axis
+    assert (axis["x_min"], axis["x_max"]) == (1780.0, 1905.0), axis
+    xs = sorted((line["boundary"], line["axes"], line["xdata"][0]) for line in stats["range_lines"])
+    assert xs == [
+        ("end", "spectrogram", 1880.0), ("end", "spectrum", 1880.0),
+        ("start", "spectrogram", 1805.0), ("start", "spectrum", 1805.0),
+    ], xs
+    offsets = sorted(b["hz"] - axis["centre_hz"] for b in stats["range_boundaries"])
+    assert offsets == [-37.5e6, 37.5e6], offsets
+    return "lines at exactly 1805.0 / 1880.0 MHz on both panels; offsets -37.5 / +37.5 MHz from 1842.5 MHz"
 
 
 @case("original IQ file is unchanged after conversion (sha256)")
@@ -820,6 +887,10 @@ def t_gui_settings(ctx):
     app.db_vmin_var.set("-90")
     app.db_vmax_var.set("-10")
     app.freq_smooth_var.set(True)
+    history = ctx.tmp / "history \u05d1.json"
+    assert app.range_markers_var.get() is True, "range markers must be on by default"
+    app.range_markers_var.set(False)
+    app.recorder_history_var.set(str(history))
     app._save_settings()
     second = iq_gui.IQConverterGUI()
     try:
@@ -829,12 +900,45 @@ def t_gui_settings(ctx):
         assert second.db_auto_var.get() is False
         assert second.db_vmin_var.get() == "-90" and second.db_vmax_var.get() == "-10"
         assert second.freq_smooth_var.get() is True
+        assert second.range_markers_var.get() is False
+        assert second.recorder_history_var.get() == str(history)
     finally:
         second._on_close()
     app.db_auto_var.set(True)
     app.freq_smooth_var.set(False)
     app.cmap_var.set("jet")
-    return "ok"
+    app.range_markers_var.set(True)
+    app.recorder_history_var.set("")
+    app._save_settings()
+    return "ok (incl. range markers + Recorder history)"
+
+
+@case("GUI: file info shows centre + requested range; conversion marks it (markers on by default)")
+def t_gui_range(ctx):
+    app = ctx.gui
+    folder = ctx.tmp / "gui_range"
+    wav = folder / "iq_qa_gui_0001.wav"
+    write_iq(wav, fs=10_000_000, seconds=0.05, tones=((1e6, 0.4),), noise=0.01)
+    append_crfs_meta(wav, 100e6, 8e6, 10_000_000)
+    write_manifest(folder, "iq_qa_gui", 97_000_000, 101_000_000)
+    out = ctx.tmp / "gui_range_out"
+    app.recorder_history_var.set(str(ctx.tmp / "none.json"))
+    app.output_var.set(str(out))
+    app.rbw_var.set("2000")
+    assert app.range_markers_var.get() is True
+    app._set_input_file(wav)
+    assert wait_until(app, lambda: "Requested 97–101 MHz" in app.file_info_var.get(), 30), app.file_info_var.get()
+    info = app.file_info_var.get()
+    assert "10 MS/s" in info and "Centre 100 MHz" in info and "Sensor-reported 96–104 MHz" in info, info
+    ctx.dialogs.clear()
+    app.start_conversion()
+    assert wait_until(app, lambda: not app._converting, 90), "conversion did not finish"
+    assert (out / "iq_qa_gui_0001.png").is_file()
+    log = app.log.get("1.0", "end")
+    assert "range markers on" in log and "Requested range: 97 - 101 MHz" in log, log[-1500:]
+    assert "Range markers  : requested start 97 MHz; requested end 101 MHz; sensor start 96 MHz" in log, log[-1500:]
+    app.recorder_history_var.set("")
+    return info.replace("\n", " | ")
 
 
 @case("GUI: resizing respects the minimum size; controls stay visible")
@@ -923,7 +1027,25 @@ def t_exe(ctx):
         text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else "(no log)"
         assert proc.returncode == 0, f"exit {proc.returncode}: {text[-800:]}"
         assert (out / "clean test.png").is_file(), text[-800:]
-        return f"PNG created by the EXE in {dt:.1f} s with PATH stripped of Python; this is not a separate clean VM"
+        crfs = work / "iq_exe_range_0001.wav"
+        write_iq(crfs, fs=10_000_000, seconds=0.05, tones=((1e6, 0.4),), noise=0.01)
+        append_crfs_meta(crfs, 100e6, 8e6, 10_000_000)
+        write_manifest(work, "iq_exe_range", 97_000_000, 101_000_000)
+        log2 = work / "range.log"
+        proc = subprocess.run(
+            [str(target), "--input", str(crfs), "--output", str(out), "--rbw", "2000", "--log", str(log2),
+             "--recorder-history", str(work / "none.json")],
+            cwd=str(work), env=env, capture_output=True, timeout=300,
+        )
+        text = log2.read_text(encoding="utf-8", errors="replace") if log2.is_file() else "(no log)"
+        assert proc.returncode == 0, f"exit {proc.returncode}: {text[-800:]}"
+        assert (out / "iq_exe_range_0001.png").is_file(), text[-800:]
+        assert "Centre         : 100 MHz (file metadata)" in text, text[-1200:]
+        assert "Range markers  : requested start 97 MHz; requested end 101 MHz" in text, text[-1200:]
+        return (
+            f"PNGs created by the EXE ({dt:.1f} s for the first) with PATH stripped of Python; CRFS file got the "
+            "absolute axis and requested-range markers; this is not a separate clean VM"
+        )
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -944,11 +1066,11 @@ ENGINE_CASES = [
     t_non_wav, t_unsupported_encoding, t_no_metadata, t_too_short, t_silence, t_clipped, t_bad_rbw,
     t_db_range, t_bad_cmap, t_unicode_paths, t_long_names, t_missing_input, t_readonly_output,
     t_duplicate_names, t_existing_output, t_cancel, t_sign_convention, t_full_scale, t_two_tones,
-    t_rbw_true, t_reference, t_preserve, t_real_file,
+    t_rbw_true, t_reference, t_range_markers, t_preserve, t_real_file,
 ]
 GUI_CASES = [
     t_gui_open, t_gui_convert, t_gui_cancel, t_gui_recovery, t_gui_batch, t_gui_drop, t_gui_theme,
-    t_gui_settings, t_gui_resize,
+    t_gui_settings, t_gui_range, t_gui_resize,
 ]
 
 

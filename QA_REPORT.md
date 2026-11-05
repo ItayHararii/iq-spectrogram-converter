@@ -1,10 +1,84 @@
-# QA report - CRFS IQ Recorder 1.14.0 / 1.13.1 / 1.13.0 / 1.12.0 / 1.11.0 / 1.10.0 / 1.9.1 / 1.9.0 / 1.8.10 / 1.8.9 and IQ Spectrogram Converter 1.5.1
+# QA report - CRFS IQ Recorder 1.14.0 / 1.13.1 / 1.13.0 / 1.12.0 / 1.11.0 / 1.10.0 / 1.9.1 / 1.9.0 / 1.8.10 / 1.8.9 and IQ Spectrogram Converter 1.6.0 / 1.5.1
 
-Ten passes plus a follow-up. Part I (4 November 2026, midday) investigates the operator's Cellular Collection run of 10:50 (repeating file sizes, requested versus recorded values, the 500 MHz row, and 11 of 15 files not downloaded), makes downloads wait for the sensor's SSH connection limit instead of giving up, verifies every download locally, and labels requested and recorded values; it produced Recorder 1.14.0. Part H (4 November 2026, morning) is an on-screen check of 1.13.0 on the operator's desktop, the investigation of the unexplained series start of 3 November with a guard on every way a recording can start, and a neutral Manual tab while an Excel run records; it fixed nine defects and produced Recorder 1.13.1. Part G (3 November 2026, evening) sends every protocol row as one request, reads every result from the files, splits the window into the Manual Recording and Excel Collection tabs, and ran one hardware campaign through the final application; it found and fixed six defects (the most important one: downloads of a finished collection were lost when the next collection started or the app was closed) and produced Recorder 1.13.0. Part F (3 November 2026, late morning) is the complete end-to-end pass on the Node 100-18 after the 1.11.0 polish: manual recordings in both frequency modes, the SFTP browser, the Cellular Collection with the workbook open in Excel, locked, closed and restarted, connection faults, the executables, and the four presentation observations made on 1.11.0; it found and fixed five defects (the most important one: a scheduled pass whose time went by while the app was closed was started late on its own by *Continue*) and produced Recorder 1.12.0. Part E (3 November 2026, morning) polished the GUI - the Cellular Collection panel above all - and removed the measured window-construction and theme-switch slowness; it produced Recorder 1.11.0 with no change to recording, Excel or scheduling behaviour. Part D (2 November 2026, night) simplified the Cellular Collection to the operator's workflow (the protocol rows are the plan and the result rows, nine columns, compact panel, local-time pickers), fixed the four reliability faults found in the review of the 18:44 run and three more found on the sensor during this pass, and ran the complete path from capture to Excel on the Node 100-18; it produced Recorder 1.10.0. Part C.1 (2 November 2026, evening) ran the Cellular Collection against the operator's own protocol workbook, fixed the import defects that surfaced and added the results sheets in the protocol workbook; it produced Recorder 1.9.1. Part C (2 November 2026) added the Cellular Collection feature and produced Recorder 1.9.0. Part 0 (1 November 2026) fixed the "Time elapsed - file not confirmed" status, investigated why the Node splits recordings, and added the optional merge of recording parts; it produced Recorder 1.8.10 (the Converter did not need a change). Part 1 (31 October 2026) ran against the same RFeye Node and produced Recorder 1.8.9 and Converter 1.5.1. Part 2 (30 October 2026) is the earlier simulation-only pass that produced 1.8.8 / 1.5.0; all are kept unchanged below except where a later result supersedes a statement.
+Ten passes plus a follow-up, and a Converter pass. Part J (5 November 2026) adds the requested-range markers and the absolute frequency axis to the Converter, checked on synthetic and 14 real CRFS cases with the numbers proven unchanged; it produced Converter 1.6.0. Part I (4 November 2026, midday) investigates the operator's Cellular Collection run of 10:50 (repeating file sizes, requested versus recorded values, the 500 MHz row, and 11 of 15 files not downloaded), makes downloads wait for the sensor's SSH connection limit instead of giving up, verifies every download locally, and labels requested and recorded values; it produced Recorder 1.14.0. Part H (4 November 2026, morning) is an on-screen check of 1.13.0 on the operator's desktop, the investigation of the unexplained series start of 3 November with a guard on every way a recording can start, and a neutral Manual tab while an Excel run records; it fixed nine defects and produced Recorder 1.13.1. Part G (3 November 2026, evening) sends every protocol row as one request, reads every result from the files, splits the window into the Manual Recording and Excel Collection tabs, and ran one hardware campaign through the final application; it found and fixed six defects (the most important one: downloads of a finished collection were lost when the next collection started or the app was closed) and produced Recorder 1.13.0. Part F (3 November 2026, late morning) is the complete end-to-end pass on the Node 100-18 after the 1.11.0 polish: manual recordings in both frequency modes, the SFTP browser, the Cellular Collection with the workbook open in Excel, locked, closed and restarted, connection faults, the executables, and the four presentation observations made on 1.11.0; it found and fixed five defects (the most important one: a scheduled pass whose time went by while the app was closed was started late on its own by *Continue*) and produced Recorder 1.12.0. Part E (3 November 2026, morning) polished the GUI - the Cellular Collection panel above all - and removed the measured window-construction and theme-switch slowness; it produced Recorder 1.11.0 with no change to recording, Excel or scheduling behaviour. Part D (2 November 2026, night) simplified the Cellular Collection to the operator's workflow (the protocol rows are the plan and the result rows, nine columns, compact panel, local-time pickers), fixed the four reliability faults found in the review of the 18:44 run and three more found on the sensor during this pass, and ran the complete path from capture to Excel on the Node 100-18; it produced Recorder 1.10.0. Part C.1 (2 November 2026, evening) ran the Cellular Collection against the operator's own protocol workbook, fixed the import defects that surfaced and added the results sheets in the protocol workbook; it produced Recorder 1.9.1. Part C (2 November 2026) added the Cellular Collection feature and produced Recorder 1.9.0. Part 0 (1 November 2026) fixed the "Time elapsed - file not confirmed" status, investigated why the Node splits recordings, and added the optional merge of recording parts; it produced Recorder 1.8.10 (the Converter did not need a change). Part 1 (31 October 2026) ran against the same RFeye Node and produced Recorder 1.8.9 and Converter 1.5.1. Part 2 (30 October 2026) is the earlier simulation-only pass that produced 1.8.8 / 1.5.0; all are kept unchanged below except where a later result supersedes a statement.
 
-Releases: Recorder 1.14.0 (tag `v1.14.0`), Converter 1.5.1 (tag `converter-v1.5.1`). Previous: 1.13.1 (`v1.13.1`), 1.13.0 (`v1.13.0`), 1.12.0 (`v1.12.0`), 1.11.0 (`v1.11.0`), 1.10.0 (`v1.10.0`), 1.9.1 (`v1.9.1`), 1.9.0 (`v1.9.0`), 1.8.10 (`v1.8.10`), 1.8.9 (`v1.8.9`), 1.8.8 (`v1.8.8`), 1.5.0 (`converter-v1.5.0`), 1.8.7 (`v1.8.7`), 1.4.0 (`converter-v1.4.0`). All earlier releases stay on GitHub.
+Releases: Recorder 1.14.0 (tag `v1.14.0`), Converter 1.6.0 (tag `converter-v1.6.0`). Previous: Converter 1.5.1 (`converter-v1.5.1`), 1.13.1 (`v1.13.1`), 1.13.0 (`v1.13.0`), 1.12.0 (`v1.12.0`), 1.11.0 (`v1.11.0`), 1.10.0 (`v1.10.0`), 1.9.1 (`v1.9.1`), 1.9.0 (`v1.9.0`), 1.8.10 (`v1.8.10`), 1.8.9 (`v1.8.9`), 1.8.8 (`v1.8.8`), 1.5.0 (`converter-v1.5.0`), 1.8.7 (`v1.8.7`), 1.4.0 (`converter-v1.4.0`). All earlier releases stay on GitHub.
 
 Legend used throughout: **Hardware** = executed against the real sensor in this pass; **Simulated** = executed against the demo transport, a local proxy or synthetic files; **Untested** = not executed.
+
+---
+
+# Part J - Requested-range markers and absolute frequency axis (5 November 2026, Converter 1.6.0)
+
+## Scope
+
+- **Request:** every spectrogram shows the recording's requested frequency range by default, in single conversion, batch, the GUI preview and the exported PNG. The axis is absolute RF when the centre is verified. The request is kept apart from the sensor-reported bandwidth. No numeric output changes.
+- **Converter only.** The running CRFS IQ Recorder was not touched: its history and the `.cellular.json` manifests were only read, and the sensor was not contacted. Real recordings were read only. The one test that needed a file without its manifest used a copy in %TEMP%.
+- The Converter has one layout (spectrum above spectrogram, one colour bar) and one export size (12 x 8 in at 125 dpi). The GUI preview is a thumbnail of that PNG. All four colormaps were checked.
+
+## What the plots show
+
+- **Axis.** Absolute RF in MHz at full precision (1842.5 MHz, no offset notation) when the CRFS `meta` chunk gives a centre and its sample rate agrees with the WAVE header. Otherwise the axis stays relative to the centre and the legend says *Centre frequency unknown: the axis shows the offset from the centre*.
+- **Requested range.** Thin magenta dashed lines at start and end on both panels, with tags above the spectrum such as *Requested start 1805 MHz* and *Requested end 1880 MHz*. The legend gives *Requested range: start 1805 MHz · end 1880 MHz · bandwidth 75 MHz (Recorder manifest)*.
+- **Sensor-reported range** (centre ± sensor-reported bandwidth / 2). Thin white dotted lines, drawn only when it differs from the request or when there is no request. Its legend line reads *Sensor-reported bandwidth …*.
+- **Outside the displayed span.** No line is drawn at the edge. An edge tag gives the real value, for example *◀ Requested start 3300 MHz (outside view)*.
+- **Legend block** under the x-label: *Centre … (file metadata) · Sample rate … MS/s*, *Displayed span … MHz (= sample rate for complex IQ, not a measured bandwidth)*, and the note that the markers do not prove uniform sensitivity, exact filter edges or complete capture.
+- **Where the request comes from.** First the `<stem>.cellular.json` manifest beside the WAV. Its recording stem must match, and its receiver and recorded centre must not contradict the file. If it is missing, the Recorder history is used, but only on a same-stem, non-demo entry from the same receiver. Every such entry must agree, and its centre must equal the file's centre within 0.5 Hz. Anything else is reported as *not available* with the reason, and the request is never guessed from the sample rate, file name or colours.
+- **History location.** Display → *Recorder history (optional)*, else the `IQ_RECORDER_HISTORY` variable, else `%LOCALAPPDATA%\CRFS IQ Recorder`. The files are opened read-only with full sharing.
+- **Default on.** Display → *Mark frequency ranges* or the `--no-range-markers` flag turns the markers off; the axis stays absolute.
+
+## Findings and fixes (1.6.0)
+
+| Id | Severity | Finding | Fix |
+| --- | --- | --- | --- |
+| J1 | Medium | The conversion log printed *Bandwidth : 125 MHz* from the sample rate. | *Displayed span : 125 MHz (1780 - 1905 MHz), = sample rate, not a measured bandwidth*, plus separate *Centre*, *Sensor-reported* and *Requested range* lines. |
+| J2 | Medium | The axis was always relative; the CRFS centre in the file was ignored. | Absolute axis from the file metadata (checked against the WAVE header). |
+| J3 | Low | The GUI file info showed the sample rate as *125 MHz*. | *125 MS/s*; a second line gives the centre and the request with its source. |
+
+Found and fixed while building, before release:
+- Outside-view tags were dropped, because their box reached past the axes edge.
+- The legend note mentioned dashed lines when none were in view.
+- The legend wrapped under the colour bar.
+
+## Results
+
+- **Synthetic (Simulated).** `test_iq_range_markers.py` adds 40 tests. With the numerics and local-path suites, 73 passed; `test_gui_smoke.py` is OK. They cover:
+  - 1805-1880 MHz at 125 MS/s: axis 1780.0-1905.0, line x-data exactly 1805.0 and 1880.0 on both panels, boundaries −37.5 / +37.5 MHz from 1842.5 MHz.
+  - Four sample rates (3.90625 to 125 MS/s); request wider than the span; request ≠ sensor-reported range (distinct colour and dash pattern); each side and both sides outside the view.
+  - Sensor-only labelling; no centre (relative axis); inconsistent metadata; markers off; all four colormaps.
+  - Manifest, history, conflict, duplicate, demo, receiver and legacy-window matching; history path precedence; CLI batch on a folder.
+  - Layout boxes: tags above the spectrum and inside the saved image, not on the title, the colour bar or each other; the legend below the x-label.
+- **Numbers unchanged (Simulated and real).**
+  - `qa_run.py --reference` compares this engine with the 1.5.1 engine from git HEAD on three conversions (plain WAV and CRFS + manifest; RBW 100/2000/500 Hz). Frequencies, mean and peak spectra, the waterfall grid and all scalars are exactly equal.
+  - Seven real files (cases 01, 05, 06, 07, 08, 09, 14 below) are also exactly equal to 1.5.1.
+  - Only the axis offset, the text and the lines differ in the PNG.
+- **Real CRFS files (read-only; input size and modification time unchanged after each run): 14 of 14 pass.** Every line's x-data equals the boundary in Hz / 1e6, no line is drawn outside the view, and the layout checks pass.
+
+| Case | File (rate) | Centre / sensor-reported bandwidth | Request found | Drawn |
+| --- | --- | --- | --- | --- |
+| 01-04 | `iq_20261105_164741_0001` (125 MS/s) | 1842.5 / 75 MHz (1842500000.0 Hz exactly) | 1805-1880 MHz, manifest | Requested start/end at 1805.0 / 1880.0; jet, turbo, viridis, gray |
+| 05, 13 | `iq_20261104_085608_0001`, `iq_20261104_111940_0001` (125 MS/s) | 3550 / 100 MHz | 3300-3800 MHz, manifest | Both requested boundaries outside view (edge tags); sensor-reported 3500 / 3600 dotted |
+| 06 | `file_200740_0001` (3.90625 MS/s) | 411 / 2 MHz | none (no record) | Sensor-reported 410 / 412 only |
+| 07 | `iq_20260922_111652_0002` (31.25 MS/s) | no metadata | history lists 5310-5330 MHz, unverified | Relative axis, no lines; legend gives the reason |
+| 08 | `iq_20260916_083149_0001` (7.8125 MS/s) | 1658.5 / 5 MHz | 1656-1661 MHz, history | Requested 1656 / 1661 |
+| 09 | `file_084556_0008` (31.25 MS/s) | 511 / 22 MHz | 500-522 MHz, history | Requested 500 / 522 |
+| 10 | `iq_20260916_090319_0001` (125 MS/s) | 3100 / 100 MHz | 3000-3200 MHz, history | Requested outside view (edge tags); sensor-reported 3050 / 3150 |
+| 11 | `iq_20261103_143313_0001` (125 MS/s) | 3450 / 100 MHz | window 2 of 5 of 3300-3800 MHz, manifest | Requested 3400 / 3500 |
+| 12 | copy of `iq_20261104_111300_0001` without its manifest (62.5 MS/s) | 778 / 50 MHz | none: two history entries disagree | Sensor-reported 753 / 803 only |
+| 14 | `iq_20260916_080816_0001` (15.625 MS/s) | 1621 / 10 MHz | 1616-1626 MHz, history | Requested 1616 / 1626 |
+
+- **GUI from source (real files).** The file info shows *Centre 1842.5 MHz · Requested 1805-1880 MHz (Recorder manifest)* (light theme) and the sensor-only line (dark theme). A two-file batch through the GUI had the markers on by default, logged the ranges, and updated the preview. The workstation was locked, so the windows were captured with `PrintWindow` and not seen on screen.
+- **EXE (1.6.0, 69,211,800 bytes, SHA-256 in SECURITY_NOTES.md).**
+  - `qa_run.py --reference --exe --real-wav`: 43 passed, 0 failed, 0 skipped.
+  - Headless on the real 1805-1880 file: exit 0, the log shows the centre and the requested range from the manifest, and the PNG is pixel-identical to the one from source. With `--no-range-markers`: no lines, axis still absolute.
+  - The GUI opened in about 6 s (Smart App Control did not block it), showed v1.6.0 and *Ready*, and closed with exit code 0. Its settings went to a temporary file; the settings next to the EXE were not changed.
+
+## Untested / open
+
+- **Untested:** an on-screen look by an operator (the PC was locked; window captures only).
+- **Untested:** a second PC or a clean VM. Elsewhere the history is looked for under that user's %LOCALAPPDATA%. Without the Recorder, the plots show the sensor-reported range from the file metadata and say *Requested range not available*.
+- The peak label inside the spectrum panel (since 1.5.1) can cover part of a marker line when the peak is close to a boundary. The line continues on the spectrogram.
+- Placing the labels adds about 0.5-1 s per image (warm cache).
 
 ---
 
