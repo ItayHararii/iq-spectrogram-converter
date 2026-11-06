@@ -116,9 +116,15 @@ def snapshot_from_df_text(text: str, path: str) -> StorageSnapshot | None:
     )
 
 
-def estimated_recording_bytes(bandwidth_hz: int, duration_s: float | Decimal | str) -> int:
-    """Expected bytes for all split parts together (sample-rate model)."""
-    return max(int(wave_size_model(bandwidth_hz, duration_s).total_bytes), 0)
+def estimated_recording_bytes(
+    bandwidth_hz: int, duration_s: float | Decimal | str, *, max_rate_hz: int | None = None
+) -> int:
+    """Expected bytes for all split parts together (sample-rate model).
+
+    `max_rate_hz` is the connected model's highest rate (125 MS/s on a Node 100-x); without it
+    the Node 40-8's 62.5 MS/s cap applies, half the size of a wide recording on a Node 100-x.
+    """
+    return max(int(wave_size_model(bandwidth_hz, duration_s, max_rate_hz=max_rate_hz).total_bytes), 0)
 
 
 def needed_bytes_with_margin(estimated_bytes: int) -> int:

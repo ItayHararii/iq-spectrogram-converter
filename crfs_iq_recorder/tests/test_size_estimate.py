@@ -44,6 +44,16 @@ def test_sample_rate_model_matches_hardware_within_one_percent(bandwidth, second
     assert estimated_recording_bytes(bandwidth, seconds) == model.total_bytes
 
 
+def test_recording_estimate_follows_the_connected_models_highest_rate():
+    """Node 100-18, 6 Nov 2026: 2110-2170 MHz (60 MHz) for 5 s is recorded at 125 MS/s (2.43-2.5 GB).
+    1.17.0 estimated it with the Node 40-8's 62.5 MS/s cap: half the size, for the storage check
+    and for the 98 % rule that decides when the capture is complete."""
+    node_100 = estimated_recording_bytes(60_000_000, 5, max_rate_hz=125_000_000)
+    assert node_100 == wave_size_model(60_000_000, 5, max_rate_hz=125_000_000).total_bytes
+    assert node_100 >= 2_500_000_000
+    assert estimated_recording_bytes(60_000_000, 5) < node_100 // 2 + 1_000_000
+
+
 def test_legacy_linear_formula_was_far_off_where_the_rate_steps():
     # 12.5 MHz is recorded at 15.625 MS/s, so the 61.051 MB/10 MHz rule overshoots by about 21 %.
     actual = 125_706_804

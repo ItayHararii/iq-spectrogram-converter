@@ -376,7 +376,8 @@ def test_interrupted_part_is_replaced_and_the_download_is_verified_in_three_stag
     browser, entries = _publish("file_000001")
     host = FakeHost()
     runner = _runner(tmp_path, host)
-    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, verify_checksums=True, quality_checks=False, previews=False))
+    # Downloads run between captures (they share the sensor's storage), so the wait is long.
+    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, verify_checksums=True, quality_checks=False, previews=False, wait_s=60.0))
     # The download mirrors the sensor's dated folder; the .part of an older version sat in the flat root.
     local = tmp_path / "downloads" / "20261103" / "file_000001_0001.wav"
     legacy = tmp_path / "downloads" / "file_000001_0001.wav"
@@ -410,7 +411,7 @@ def test_download_without_a_sensor_checksum_is_verified_by_size_and_structure_on
     browser.set_checksum_available(False)
     host = FakeHost()
     runner = _runner(tmp_path, host)
-    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, verify_checksums=True, quality_checks=False, previews=False))
+    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, verify_checksums=True, quality_checks=False, previews=False, wait_s=60.0))
     host.finish(host.requests[0], names=["file_000001_0001.wav"])
     _pump(qapp)
     state = runner.current_tasks()[0]
@@ -430,7 +431,7 @@ def test_checksum_mismatch_is_not_a_verified_copy_and_is_downloaded_again(qapp, 
     _publish("file_000001")
     host = FakeHost()
     runner = _runner(tmp_path, host)
-    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, verify_checksums=True, quality_checks=False, previews=False))
+    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, verify_checksums=True, quality_checks=False, previews=False, wait_s=60.0))
     local = tmp_path / "downloads" / "20261103" / "file_000001_0001.wav"
     # Simulated corruption in transit: the sensor's digest differs from the bytes that arrived, once.
     from crfs_iq_recorder.sftp_client import DemoSftpBrowser
@@ -518,7 +519,9 @@ def test_restart_shows_pending_work_and_resumes_downloads_without_duplicates(qap
     assert first.files[0]["verification"][V_CHECKSUM] == V_OK
     assert [p.name for p in (tmp_path / "downloads").rglob("file_000001*.wav")] == ["file_000001_0001.wav"]
     assert runner2.leftover_parts() == [] and runner2.pending_work()["downloads"] == 0
-    # The third row was sent once after the restart; the first was never recorded again.
+    # The third row was sent once after the restart (after the download it waited for); the first was never recorded again.
+    assert _pump_until(qapp, lambda: len(host2.requests) >= 1, timeout=5.0)
+    _pump(qapp, 0.6)
     assert len(host2.requests) == 1 and host2.requests[0].label.startswith("1800 MHz DL")
 
 

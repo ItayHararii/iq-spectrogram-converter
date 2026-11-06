@@ -593,14 +593,18 @@ def test_a_missed_pass_is_not_run_while_an_interrupted_pass_still_needs_reconcil
     assert host2.requests == [] and runner2.state == S_INTERRUPTED
 
 
-def test_restart_recovers_an_interrupted_session_without_resending(qapp, tmp_path):
+def test_restart_recovers_an_interrupted_session_without_resending(qapp, tmp_path, monkeypatch):
+    import crfs_iq_recorder.cellular_runner as cr
+
+    monkeypatch.setattr(cr, "FINALIZE_SETTLE_S", 0.01)
     host = FakeHost()
     runner = _runner(tmp_path, host)
     runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True))
     runner._drain_downloads = lambda: None  # the first capture's download never starts before the "crash"
     host.finish(host.requests[0])
-    _pump(qapp)
-    assert len(host.requests) == 2 and runner.current_tasks()[1].status == T_SUBMITTING
+    # The next request follows the first capture's file listing (its download would go first).
+    assert _pump_until(qapp, lambda: len(host.requests) == 2)
+    assert runner.current_tasks()[1].status == T_SUBMITTING
     runner.shutdown()  # application closed during the second capture
     saved = json.loads(session_path(tmp_path / "config").read_text(encoding="utf-8"))
     assert saved["runner_state"] == S_RUNNING
@@ -631,10 +635,13 @@ def test_restart_recovers_an_interrupted_session_without_resending(qapp, tmp_pat
     assert runner2.session.rounds[0].status == ROUND_PARTIAL
 
 
-def test_a_new_collection_waits_for_the_last_downloads_and_a_restart_offers_them_again(qapp, tmp_path):
+def test_a_new_collection_waits_for_the_last_downloads_and_a_restart_offers_them_again(qapp, tmp_path, monkeypatch):
     """Hardware, 3 Nov: a collection started while the last one's downloads ran took them over in
     memory only; the ones finished afterwards were never recorded, and after a restart the rest
     were forgotten (the files stayed on the sensor and nothing said so)."""
+    import crfs_iq_recorder.cellular_runner as cr
+
+    monkeypatch.setattr(cr, "FINALIZE_SETTLE_S", 0.01)
     host = FakeHost()
     runner = _runner(tmp_path, host)
     runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True))
@@ -642,6 +649,7 @@ def test_a_new_collection_waits_for_the_last_downloads_and_a_restart_offers_them
     for index in range(3):
         host.finish(host.requests[index])
         _pump(qapp)
+        assert _pump_until(qapp, lambda: runner._refreshes == 0 and len(host.requests) == min(index + 2, 3))
     runner._tick()
     assert runner.state == S_DONE and len(host.requests) == 3
     reason = runner.previous_work_reason()
@@ -724,7 +732,10 @@ def test_reconcile_confirms_from_the_sensor_files_or_marks_unknown(qapp, tmp_pat
     assert runner2.resume_after_restart() is None
 
 
-def test_backlog_pauses_new_captures_until_downloads_drain(qapp, tmp_path):
+def test_backlog_pauses_new_captures_until_downloads_drain(qapp, tmp_path, monkeypatch):
+    import crfs_iq_recorder.cellular_runner as cr
+
+    monkeypatch.setattr(cr, "FINALIZE_SETTLE_S", 0.01)
     host = FakeHost()
     runner = _runner(tmp_path, host)
     runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, backlog_limit=1))
@@ -732,8 +743,7 @@ def test_backlog_pauses_new_captures_until_downloads_drain(qapp, tmp_path):
     runner._drain_downloads = lambda: None
     runner._downloads_pending = [("k", "r", {"name": f"f{i}.wav", "remote_path": f"/x/f{i}.wav", "size": 1}) for i in range(3)]
     host.finish(host.requests[0])
-    _pump(qapp)
-    assert runner.state == S_PAUSED_BACKLOG
+    assert _pump_until(qapp, lambda: runner.state == S_PAUSED_BACKLOG and runner._refreshes == 0)
     assert runner.status()["pause_reason"].startswith("Downloads: 3 waiting")
     assert len(host.requests) == 1
     runner._downloads_pending = []
@@ -773,7 +783,8 @@ def test_downloads_start_from_a_fresh_listing_that_picks_up_late_files_and_final
     runner = _runner(tmp_path, host)
     started: list[dict] = []
     runner._start_download = lambda task_key, round_id, item: started.append(item)
-    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True))
+    # Downloads run between captures (they share the sensor's storage), so the wait is long.
+    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, wait_s=60.0))
     host.finish(host.requests[0], names=["file_000001_0001.xdat"])
     _pump(qapp)
     state = runner.current_tasks()[0]
@@ -795,7 +806,7 @@ def test_downloads_start_from_a_fresh_listing_that_picks_up_late_files_and_final
 
     monkeypatch.setattr("crfs_iq_recorder.sftp_window._open_browser", broken)
     started.clear()
-    time.sleep(0.05)
+    runner._wait_deadline = 0.0
     runner._tick()
     host.finish(host.requests[1])
     _pump(qapp)
@@ -810,6 +821,9 @@ def test_low_local_storage_pauses_before_the_next_capture_and_never_deletes(qapp
     reason, keeps the finished capture, deletes nothing, and continues once space is back."""
     import shutil as _shutil
 
+    import crfs_iq_recorder.cellular_runner as cr
+
+    monkeypatch.setattr(cr, "FINALIZE_SETTLE_S", 0.01)
     host = FakeHost()
     runner = _runner(tmp_path, host)
     runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, local_reserve_bytes=10_000_000))
@@ -819,8 +833,7 @@ def test_low_local_storage_pauses_before_the_next_capture_and_never_deletes(qapp
     marker = tmp_path / "downloads" / "existing_recording.wav"
     marker.write_bytes(b"keep me")
     host.finish(host.requests[0])
-    _pump(qapp)
-    assert runner.state == S_PAUSED_BACKLOG
+    assert _pump_until(qapp, lambda: runner.state == S_PAUSED_BACKLOG and runner._refreshes == 0)
     reason = runner.status()["pause_reason"]
     assert "free" in reason and "nothing is deleted automatically" in reason
     assert len(host.requests) == 1
@@ -967,15 +980,17 @@ def _drive_capture(window, qapp):
     qapp.processEvents()
 
 
-def test_demo_main_window_runs_a_round_with_downloads_quality_excel_and_blocks_manual_start(qapp, tmp_path, isolated_app_paths):
+def test_demo_main_window_runs_a_round_with_downloads_quality_excel_and_blocks_manual_start(qapp, tmp_path, isolated_app_paths, monkeypatch):
     """End to end on the demo transport: captures confirmed from the demo sensor's files,
     parts downloaded and checksummed, quality report + preview written, Excel rows queued,
     manual Start refused while the runner owns the sensor."""
+    import crfs_iq_recorder.cellular_runner as cr
     from crfs_iq_recorder.gui import MainWindow
     from crfs_iq_recorder.recording_history import split_iq_filenames
     from openpyxl import load_workbook
     from test_collection_excel import build_sample_workbook
 
+    monkeypatch.setattr(cr, "FINALIZE_SETTLE_S", 0.05)
     workbook = build_sample_workbook(tmp_path / "collection.xlsm")
     window = MainWindow(demo=True)
     runner = None
@@ -1009,7 +1024,9 @@ def test_demo_main_window_runs_a_round_with_downloads_quality_excel_and_blocks_m
         window._on_start()
         assert window._external_owner == OWNER
         assert runner.current_tasks()[0].status == T_SUBMITTING
-        for _ in range(3):
+        for index in range(3):
+            # Each row's request follows the previous row's download.
+            assert _pump_until(qapp, lambda: runner.current_tasks()[index].status == T_SUBMITTING, timeout=15.0), runner.status()
             assert _pump_until(qapp, lambda: window._http_in_flight is False)
             _drive_capture(window, qapp)
             runner._tick()
@@ -1499,13 +1516,13 @@ def download_runner(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr("crfs_iq_recorder.sftp_window.random.uniform", lambda _a, _b: 0.0)
     made = []
 
-    def make(sensor):
+    def make(sensor, **settings):
         monkeypatch.setattr("crfs_iq_recorder.sftp_window._open_browser", sensor.open)
         host = FakeHost()
         runner = _runner(tmp_path, host)
         logs: list[str] = []
         runner.log.connect(lambda message, _level: logs.append(message))
-        runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True))
+        runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings(auto_download=True, **settings))
         made.append(runner)
         return host, runner, logs
 
@@ -1522,7 +1539,7 @@ def test_downloads_wait_for_the_sensor_to_accept_connections_without_using_up_at
     15 files were given up after three. Waiting for a connection is not an attempt; it is logged once."""
     payload = _wave()
     sensor = _Sensor(payload, refuse=5)
-    host, runner, logs = download_runner(sensor)
+    host, runner, logs = download_runner(sensor, wait_s=60.0)  # downloads run between captures
     # A same-size copy that is not the sensor's file (no WAVE header) is replaced, never doubled.
     stale = tmp_path / "downloads" / "file_000001_0001.wav"
     stale.write_bytes(b"\0" * len(payload))
@@ -1545,6 +1562,8 @@ def test_with_no_connection_for_the_whole_wait_files_stay_on_the_sensor_until_re
     host, runner, logs = download_runner(sensor)
     round_id = runner.session.current_round_id
     for index in range(3):
+        # A started download holds the next request back until the sensor has refused its connection.
+        assert _pump_until(qapp, lambda: len(host.requests) > index, timeout=10.0)
         host.finish(host.requests[index])
         _pump(qapp)
     # The pass closes as soon as the last task is confirmed (wait_s=0), so the tasks are taken
@@ -1570,7 +1589,7 @@ def test_a_failed_transfer_is_tried_again_after_a_delay_and_given_up_after_three
 
     monkeypatch.setattr(cr, "DOWNLOAD_RETRY_DELAY_S", 0.3)
     sensor = _Sensor(_wave(), broken=2)
-    host, runner, logs = download_runner(sensor)
+    host, runner, logs = download_runner(sensor, wait_s=60.0)  # downloads run between captures
     host.finish(host.requests[0])
     _pump(qapp)
     item = runner.current_tasks()[0].files[0]
@@ -1580,6 +1599,8 @@ def test_a_failed_transfer_is_tried_again_after_a_delay_and_given_up_after_three
     assert all(gap >= 0.29 for gap in gaps), gaps
     assert not [m for m in logs if m.startswith("Download of")], "a retry that works is not reported"
     sensor.broken = 3
+    runner._wait_deadline = 0.0
+    runner._tick()
     host.finish(host.requests[1])
     _pump(qapp)
     second = runner.current_tasks()[1].files[0]

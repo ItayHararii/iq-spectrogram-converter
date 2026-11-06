@@ -603,6 +603,36 @@ def test_sftp_table_shows_saved_recording_parameters(qapp, tmp_path):
         qapp.processEvents()
 
 
+def test_sftp_refresh_keeps_a_selection_of_several_files(qapp):
+    from crfs_iq_recorder.connection_state import ConnectionState
+    from crfs_iq_recorder.sftp_window import ROLE_KIND, SftpWindow
+
+    window = SftpWindow(ConnectionState(demo=True, host="192.0.2.10"))
+    try:
+        _wait_listing(window, qapp, 2, idle=True)
+        tops = (window.table.topLevelItem(i) for i in range(window.table.topLevelItemCount()))
+        files = [item for item in tops if str(item.data(0, ROLE_KIND) or "") == "file"]
+        assert len(files) >= 2
+        window.table.clearSelection()
+        files[0].setSelected(True)
+        files[1].setSelected(True)
+        qapp.processEvents()
+        names = sorted(f.name for f in window._selected_files())
+        assert len(names) == 2 and window.download_btn.text().startswith("Download 2 files")
+        # A file's details arriving (waterfall, measurement) refills the list.
+        window.relabel_files()
+        qapp.processEvents()
+        assert sorted(f.name for f in window._selected_files()) == names
+        assert window.download_btn.text().startswith("Download 2 files")
+        window.table.clearSelection()
+        next(iter(window._items_by_path.values())).setSelected(True)
+        qapp.processEvents()
+        assert "files selected" not in window.status.text()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
 def test_sftp_downloads_multiple_files(qapp, tmp_path):
     import time
 

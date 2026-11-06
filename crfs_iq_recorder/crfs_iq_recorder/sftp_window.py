@@ -12,6 +12,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QCoreApplication,
+    QItemSelectionModel,
     QObject,
     QRect,
     QThread,
@@ -98,6 +99,8 @@ MAX_PARALLEL_DOWNLOADS = 4
 CONNECT_PATIENCE_S = 600.0
 CONNECT_BACKOFF_S = 15.0
 CONNECT_BACKOFF_MAX_S = 60.0
+# paramiko reports every 32 KB chunk (~3,000 a second at 100 MB/s); the table needs a few updates a second.
+PROGRESS_INTERVAL_S = 0.25
 _PREVIEW_CACHE = 8
 _TABLE_HEADERS = [
     "New",
@@ -433,7 +436,8 @@ class FileDownloadWorker(QObject):
 
     finished = Signal(str, str)
     failed = Signal(str, str)
-    progress = Signal(str, int, int)
+    # name, bytes done, bytes total: Python ints, since a C++ int overflows above 2 GiB (a 125 MS/s 5 s part is 2.3 GB).
+    progress = Signal(str, object, object)
     waiting = Signal(str, float, str)
     connected = Signal(str)
     unreachable = Signal(str, str)
@@ -520,8 +524,13 @@ class FileDownloadWorker(QObject):
             if self._browser is None:
                 return
             self.connected.emit(self._name)
+            last_emit = [0.0]
 
             def cb(done: int, total: int) -> None:
+                now = time.monotonic()
+                if 0 < done < total and now - last_emit[0] < PROGRESS_INTERVAL_S:
+                    return
+                last_emit[0] = now
                 self.progress.emit(self._name, int(done), int(total or 0))
 
             self._browser.download(
@@ -974,6 +983,10 @@ class SftpWindow(QWidget):
     def relabel_files(self) -> None:
         if self._entries:
             self._fill(self._entries)
+
+    def downloads_running(self) -> int:
+        """Files this window is downloading now (they read the sensor's storage)."""
+        return len(self._dl_active)
 
     def retry_today(self) -> None:
         if self._closing or self._dl_active or self._dl_pending:
@@ -1549,6 +1562,8 @@ class SftpWindow(QWidget):
                 self.status.setText(f"{files[0].name}  ·  {rec.duration_s:g} s{extra}")
             elif extra:
                 self.status.setText(f"{files[0].name}.{extra}")
+            else:
+                self.status.setText(files[0].name)
         elif len(files) > 1:
             total = sum(item.size for item in files)
             self.status.setText(f"{len(files)} files selected · {format_bytes(total)} ({total:,} B).")
@@ -1756,7 +1771,7 @@ class SftpWindow(QWidget):
         self.status.setText(f"Not downloaded: {name} ({self._dl_ok + self._dl_fail}/{self._dl_total})")
         self._set_local_state(self._remote_path_of(name), LOCAL_FAILED)
 
-    @Slot(str, int, int)
+    @Slot(str, object, object)
     def _on_file_progress(self, name: str, done: int, total: int) -> None:
         if self._closing:
             return
@@ -1894,7 +1909,10 @@ class SftpWindow(QWidget):
             if current is None:
                 current = item
         if current is not None:
-            self.table.setCurrentItem(current)
+            # setCurrentItem would clear the selection down to this one row.
+            self.table.selectionModel().setCurrentIndex(
+                self.table.indexFromItem(current), QItemSelectionModel.SelectionFlag.NoUpdate
+            )
             self.table.scrollToItem(current)
 
     def _set_item_roles(

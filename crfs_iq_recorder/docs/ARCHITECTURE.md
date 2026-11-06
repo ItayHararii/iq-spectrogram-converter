@@ -1,7 +1,7 @@
 # CRFS IQ Recorder - architecture
 
-**Version documented:** 1.17.0
-**Code:** `crfs_iq_recorder/` as of this file (5 November 2026). The Excel Collection rows below (called Cellular Collection before 1.13.0) describe the 1.13.0 design; `docs/CELLULAR_COLLECTION.md` has the detail.
+**Version documented:** 1.18.0
+**Code:** `crfs_iq_recorder/` as of this file (6 November 2026). The Excel Collection rows below (called Cellular Collection before 1.13.0) describe the 1.13.0 design; `docs/CELLULAR_COLLECTION.md` has the detail.
 **Related app:** IQ Spectrogram Converter (`iq_gui.py`, `iq_data.py`) at the repository root
 
 This note describes how the software works today. Items we could not prove from source or from a published CRFS EMP schema are listed under [Unverified](#unverified). Ideas for later work are in [Proposed improvements](#proposed-improvements) and are not current behavior.

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -154,6 +155,15 @@ TICK_MS = 500
 # bounded poll, the next request waits this long before the list is read again.
 IDLE_RETRY_WAIT_S = 10.0
 IDLE_RETRIES = 3
+# Captures and downloads share the sensor's storage. On the Node 100-18 (USB 2.0 stick, 13-16 MB/s) a
+# 125 MS/s 5 s capture is buffered in RAM and its WAVE file is final while ~370 MB of it are still to be
+# written out. Measured 6 Nov 2026, 2110-2170 MHz, 5 s: idle 4.869 s; requested 11 s after the previous
+# file was final (247 MB still unwritten) 4.634 s; with a download reading the stick 4.835 s and the file
+# final after 222 s instead of 157 s. So no download starts while a capture is in flight, the next
+# request waits while a download is transferring, and then until the sensor has written its data out.
+STORAGE_SETTLED_BYTES = 16 * 1024 * 1024
+STORAGE_SETTLE_MAX_S = 180.0
+STORAGE_SETTLE_POLL_S = 2.0
 # A gap between two ticks longer than this means the computer slept or the
 # application was frozen; the schedule is checked again and the user is told.
 SLEEP_GAP_S = 120.0
@@ -652,6 +662,11 @@ class CellularRunner(QObject):
         self._retry_at: dict[int, float] = {}  # id(file item) -> monotonic time its next attempt may start
         self._downloads_waiting = False  # a download waits for the sensor to accept a connection
         self._downloads_stopped_logged = False
+        self._downloads_refused: set[str] = set()  # names whose download waits for the sensor to accept a connection
+        self._yield_logged = False  # "waiting for downloads before the next recording" shown for this task
+        self._storage_settle_pending = False
+        self._storage_settled = False  # the next request may go: the sensor's storage was checked
+        self._storage_cancel = threading.Event()
         self._backlog_failed_base = 0
         # A finished session reopened with downloads that never completed: Continue only downloads them.
         self._downloads_only = False
@@ -1142,6 +1157,18 @@ class CellularRunner(QObject):
             return
         if self._idle_check_pending:
             return
+        if self._refreshes:
+            # The last capture's downloads are queued once its files are listed again (about 10 s).
+            return
+        reading = self._downloads_reading()
+        if reading:
+            if not self._yield_logged:
+                self._yield_logged = True
+                self._log(f"The next recording waits for {files_text(reading)} to finish downloading (they share the sensor's storage).")
+            return
+        if not self._storage_settled:
+            self._begin_storage_settle()
+            return
         verify = getattr(self.host, "verify_sensor_idle", None)
         if verify is None:
             self._submit_task(state, planned)
@@ -1190,6 +1217,91 @@ class CellularRunner(QObject):
             self._idle_check_pending = False
             diag("sensor_idle_check_skipped", f"{type(exc).__name__}: {exc}")
             self._submit_task(state, planned)
+
+    def _downloads_reading(self) -> int:
+        """Downloads that read (or are about to read) the sensor's storage: this runner's and the Sensor files window's.
+
+        A started download connects within a second, so it counts from its start; only one the sensor is
+        refusing a connection reads nothing (it may wait minutes, see CONNECT_PATIENCE_S).
+        """
+        names = {str(getattr(worker, "_name", "")) for _thread, worker, _key, _rid in self._downloads_active}
+        window = getattr(self.host, "_sftp_win", None)
+        try:
+            browsing = int(window.downloads_running()) if window is not None else 0
+        except (AttributeError, RuntimeError, TypeError, ValueError):  # closed window (deleted C++ object)
+            browsing = 0
+        return len(names - self._downloads_refused) + browsing
+
+    def _begin_storage_settle(self) -> None:
+        """On a worker: wait (bounded) until the sensor has written earlier data to its storage, then request."""
+        if self._storage_settle_pending or self.session is None:
+            return
+        conn = getattr(self.host, "_conn", None)
+        if conn is None or getattr(conn, "demo", False):
+            self._storage_settled = True
+            self._start_next_task()
+            return
+        self._storage_settle_pending = True
+        self._storage_cancel = threading.Event()
+        cancel = self._storage_cancel
+        self._emit_status()
+
+        def work() -> dict[str, Any]:
+            from .sftp_window import _open_browser
+
+            started = time.monotonic()
+            first: int | None = None
+            last: int | None = None
+            browser = None
+            try:
+                browser = _open_browser(conn, cancel=cancel)
+                while True:
+                    last = browser.pending_writeback_bytes()
+                    first = last if first is None else first
+                    if last is None or last <= STORAGE_SETTLED_BYTES or time.monotonic() - started >= STORAGE_SETTLE_MAX_S:
+                        break
+                    if cancel.wait(STORAGE_SETTLE_POLL_S):
+                        break
+            except Exception as exc:  # noqa: BLE001 - not readable: the request goes ahead
+                return {"error": f"{type(exc).__name__}: {exc}", "waited_s": time.monotonic() - started, "first": first, "last": None}
+            finally:
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            return {"waited_s": time.monotonic() - started, "first": first, "last": last}
+
+        def apply(result) -> None:
+            self._storage_settle_pending = False
+            if self.session is None or cancel.is_set():
+                return
+            result = result if isinstance(result, dict) else {}
+            waited = float(result.get("waited_s") or 0.0)
+            last = result.get("last")
+            diag(
+                "sensor_storage_settle",
+                waited_s=round(waited, 1),
+                first_bytes=result.get("first"),
+                last_bytes=last,
+                error=result.get("error", ""),
+            )
+            first = result.get("first")
+            seconds = max(1, int(round(waited)))
+            if isinstance(last, int) and last > STORAGE_SETTLED_BYTES:
+                self._log(f"The sensor was still writing to its storage after {seconds} s. The next recording starts anyway.")
+            elif isinstance(first, int) and first > STORAGE_SETTLED_BYTES:
+                self._log(f"Waited {seconds} s for the sensor to finish writing the previous recording to its storage.")
+            self._storage_settled = True
+            self._emit_status()
+            if self.state in {S_RUNNING, S_PAUSE_REQUESTED, S_STOP_REQUESTED} and not self._capture_in_flight:
+                self._start_next_task()
+
+        runner = getattr(self.host, "_start_job", None)
+        if runner is None:
+            apply(work())
+        else:
+            runner(work, apply)
 
     # ------------------------------------------------------------------ pre-collection check
     def _begin_preflight(self) -> None:
@@ -1408,6 +1520,8 @@ class CellularRunner(QObject):
             return
         self._busy_logged = False
         self._capture_in_flight = True
+        self._storage_settled = False
+        self._yield_logged = False
         state.status = T_SUBMITTING
         state.attempts += 1
         state.started_utc = _utc_now_text()
@@ -1829,6 +1943,8 @@ class CellularRunner(QObject):
             self._drain_downloads()
             if self.state == S_DONE and self.background_jobs() == 0:
                 self._write_handover()
+            elif not self._refreshes and not self._capture_in_flight and self.state in {S_RUNNING, S_PAUSE_REQUESTED, S_STOP_REQUESTED}:
+                self._start_next_task()
 
         runner = getattr(self.host, "_start_job", None)
         if runner is None:
@@ -1838,6 +1954,9 @@ class CellularRunner(QObject):
 
     def _drain_downloads(self) -> None:
         if self.session is None:
+            return
+        if self._capture_in_flight or self._storage_settle_pending:
+            # The capture has the sensor's storage to itself (see STORAGE_SETTLED_BYTES).
             return
         now = time.monotonic()
         while len(self._downloads_active) < MAX_DOWNLOADS:
@@ -2186,6 +2305,7 @@ class CellularRunner(QObject):
     def _on_download_waiting(self, name: str, delay_s: float, detail: str) -> None:
         """The sensor does not accept a new connection yet; the worker tries again on its own."""
         diag("download_waiting", name, delay_s=round(float(delay_s), 1), detail=detail)
+        self._downloads_refused.add(str(name))
         if not self._downloads_waiting:
             self._downloads_waiting = True
             if not self._downloads_stopped_logged:
@@ -2194,6 +2314,7 @@ class CellularRunner(QObject):
 
     @Slot(str)
     def _on_download_connected(self, name: str) -> None:
+        self._downloads_refused.discard(str(name))
         self._downloads_stopped_logged = False
         if self._downloads_waiting:
             self._downloads_waiting = False
@@ -2288,6 +2409,7 @@ class CellularRunner(QObject):
         remaining = []
         for entry in self._downloads_active:
             if entry[0] is thread:
+                self._downloads_refused.discard(str(getattr(entry[1], "_name", "")))
                 entry[1].deleteLater()
                 entry[0].deleteLater()
             else:
@@ -2555,7 +2677,7 @@ class CellularRunner(QObject):
                     # Excel is free (the status line shows "Waiting for Excel").
                     state.notes.append(f"Excel deferred: {exc}")
                     diag("excel_deferred", str(exc))
-                    self._log("Waiting for Excel: " + clip(str(exc).rstrip(". "), 100) + ". The row stays queued.")
+                    self._log(_excel_wait_line(exc, "The row stays queued."))
                 self._excel_retry.add(key)
                 self._excel_retry_at = time.monotonic()
                 return
@@ -2734,7 +2856,7 @@ class CellularRunner(QObject):
                     self._workbook_status = "busy"
                     self._workbook_note = report.busy
                     if not self._workbook_busy_logged:
-                        self._log("Waiting for Excel: " + clip(str(report.busy).rstrip(". "), 100) + ". Results stay queued.")
+                        self._log(_excel_wait_line(report.busy, "Results stay queued."))
                         self._workbook_busy_logged = True
                     self._workbook_not_before = time.monotonic() + WORKBOOK_BUSY_RETRY_S
                     QTimer.singleShot(int(WORKBOOK_BUSY_RETRY_S * 1000) + 50, self, self._flush_workbook)
@@ -3528,6 +3650,10 @@ class CellularRunner(QObject):
         )
         if self._idle_check_pending and not recording:
             recording = "Checking the sensor is free"
+        if self._storage_settle_pending and not recording:
+            recording = "Waiting for the sensor to finish writing to its storage"
+        if not recording and not self._capture_in_flight and self.state == S_RUNNING and (self._refreshes or self._downloads_reading()):
+            recording = "Next recording after the downloads that are running"
         if self._preflight_pending and not recording:
             recording = "Checking before the pass: sensor, clock, storage, workbook"
         if self.state == S_WAITING and countdown is not None:
@@ -3638,6 +3764,7 @@ class CellularRunner(QObject):
             if self._capture_in_flight:
                 self.session.pause_reason = "Application closed during a capture; reconcile with the sensor before continuing."
             self._save()
+        self._storage_cancel.set()
         for thread, worker, _key, _rid in list(self._downloads_active):
             try:
                 worker.abort()
@@ -3706,3 +3833,10 @@ def _stem_of(path: str) -> str:
     from .recording_history import iq_group_key
 
     return iq_group_key(path.rsplit("/", 1)[-1])
+
+
+def _excel_wait_line(reason: Any, queued: str) -> str:
+    """The once-only Activity line for a busy workbook; ``queued`` is added when the reason does not say what happens."""
+    text = " ".join(str(reason or "").split()).rstrip(". ")
+    line = f"{text}." if "when Excel is free" in text else f"Waiting for Excel: {text}. {queued}"
+    return clip(line, 140)

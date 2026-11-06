@@ -131,6 +131,8 @@ A successful HTTP response means the request was accepted. It does not prove the
 
 "Finished" ends the radio capture, not the file: the sensor then writes the samples to its disk, and if the client disconnects before that is done it ends the task and closes the file at what it has written (a valid WAVE that is simply shorter). Since 1.17.0 the app keeps the stream open until the sensor has finished every file (real sizes and the CRFS metadata in its header). A 2 s recording at 60 MHz on a Node 100-18 is about 1 GB and took over a minute to write while other files were being downloaded.
 
+Since 1.18.0 an Excel Collection lets recordings and downloads take turns on the sensor's disk: no download starts during a recording, and the next request waits for running downloads and until the sensor has written the previous recording out of its memory (`docs/CELLULAR_COLLECTION.md`, 1.18.0).
+
 Estimated size uses `61.051 * (bandwidth_Hz / 10_000_000) * recording_seconds` MB. That number is an estimate for the whole capture. The file list shows each part's size separately.
 
 ## Connection and files

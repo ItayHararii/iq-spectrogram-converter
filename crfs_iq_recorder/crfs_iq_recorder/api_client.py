@@ -154,6 +154,12 @@ _SSE_IGNORED_MESSAGE_FRAGMENTS = ("gps reference",)
 _MAX_STREAM_EVENTS = 2000
 # Distinct sensor messages kept per recording; repeats are counted, not stored.
 _MAX_DISTINCT_MESSAGES = 50
+# An ERROR after the sensor named its file does not end the stream: the Node drops the mission, and cuts
+# the file at what is on its disk, the moment its client disconnects. On the Node 100-18 "Collection was
+# modified" ~2 s into a capture is not fatal while the stream is held (that capture finished in full);
+# a client that left on it kept 0.117 s of 5 s. Without "finished" this long after the error
+# (plus the requested duration), the stream is given up.
+SENSOR_ERROR_GRACE_S = 30.0
 
 
 def _with_repeat_count(line: str, count: int) -> str:
@@ -870,7 +876,8 @@ class EmpClient:
         # window and hide the error that actually ended the stream.
         messages: list[str] = []
         repeats: dict[str, int] = {}
-        state = {"finished": False, "error": False, "error_text": ""}
+        state: dict[str, Any] = {"finished": False, "error": False, "error_text": "", "error_at": None, "error_first": False}
+        error_grace_s = max(duration_s, 0.0) + SENSOR_ERROR_GRACE_S
 
         def _watch(event: SseEvent) -> bool:
             nonlocal file_dir, task_echo
@@ -898,10 +905,21 @@ class EmpClient:
                     state["finished"] = True
                     stop = stop or stop_on_finished
                 elif sse_message_is_error(item):
+                    if not state["error"]:
+                        state["error_at"] = float(event.received_s)
+                        state["error_first"] = not state["finished"]
                     state["error"] = True
                     if not state["error_text"]:
                         state["error_text"] = line
-                    stop = True
+                    if not parts and not state["finished"]:
+                        # Refused before naming a file: nothing is being written.
+                        stop = True
+            if (
+                state["error"]
+                and not state["finished"]
+                and float(event.received_s) - float(state["error_at"]) >= error_grace_s
+            ):
+                stop = True
             if on_event is not None:
                 try:
                     on_event(event)
@@ -1001,6 +1019,7 @@ class EmpClient:
                 finished=state["finished"],
                 error=state["error"],
                 error_text=str(state["error_text"]),
+                error_first=bool(state["error_first"]),
                 parts=parts,
                 file_dir=file_dir,
                 task_echo=task_echo,
@@ -1073,6 +1092,7 @@ class EmpClient:
         finished: bool,
         error: bool,
         error_text: str = "",
+        error_first: bool = False,
         parts: list[str],
         file_dir: str,
         task_echo: str,
@@ -1114,10 +1134,18 @@ class EmpClient:
             # the capture is still confirmed from the files.
             count = len(parts)
             files = f"{count} file(s): {', '.join(parts)}" if parts else "no file names were reported"
-            late = (
-                f" After that the sensor also reported: {error_line}. The recording itself finished before "
-                "this message; it is confirmed from the files." if error else ""
-            )
+            if error and error_first:
+                late = (
+                    f" Before that the sensor reported: {error_line}. The stream was kept open, so the "
+                    "capture was not cut; what it holds is measured from the files."
+                )
+            elif error:
+                late = (
+                    f" After that the sensor also reported: {error_line}. The recording itself finished before "
+                    "this message; it is confirmed from the files."
+                )
+            else:
+                late = ""
             return HttpOutcome(
                 kind="accepted",
                 title="Sensor reported the recording finished",

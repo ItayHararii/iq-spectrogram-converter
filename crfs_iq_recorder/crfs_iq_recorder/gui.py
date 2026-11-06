@@ -96,7 +96,7 @@ from .capture_measure import (
     received_text,
 )
 from . import desktop_open, diagnostic_log
-from .diagnostic_log import diag, register_secret, scrub_operator
+from .diagnostic_log import RepeatLimiter, diag, exception_signature, register_secret, scrub_operator
 from .diagnostic_report import RECENT_LINES, build_report
 from .download_paths import existing_copy, local_destination
 from .operator_text import files_text, measured_text, range_text, seconds_text, sensor_notice
@@ -1576,12 +1576,16 @@ class MainWindow(QMainWindow):
     def _apply_sensor_info(self, info: SensorInfo) -> None:
         previous_model = getattr(self._sensor_info, "model", "") or ""
         self._sensor_info = info
-        if (info.model or "") != previous_model and hasattr(self, "size_label"):
+        if (info.model or "") != previous_model:
             # The estimate follows the model's highest sample rate (125 MS/s on a
             # Node 100-x, 62.5 MS/s otherwise). The fields are restored before
             # the identity arrives, so a saved 100 MHz plan showed half its size
             # until a field was edited (hardware: 251.5 MB shown, 502.8 MB written).
-            self._refresh_size_keeping_message()
+            if hasattr(self, "size_label"):
+                self._refresh_size_keeping_message()
+            panel = getattr(self, "cellular_panel", None)
+            if panel is not None:
+                panel.sensor_model_changed()
         self.model_value.setText(info.display_model())
         self.firmware_value.setText(info.display_firmware())
         self.serial_value.setText(info.display_serial())
@@ -2454,7 +2458,7 @@ class MainWindow(QMainWindow):
         except ValidationError as exc:
             return str(exc)
         try:
-            estimated = estimated_recording_bytes(int(plan.bandwidth_hz), seconds)
+            estimated = estimated_recording_bytes(int(plan.bandwidth_hz), seconds, max_rate_hz=self._sensor_max_rate_hz())
         except Exception:
             estimated = 0
         blocked = recording_blocked_reason(self._storage, estimated)
@@ -2671,7 +2675,7 @@ class MainWindow(QMainWindow):
             return
         scan = payload["remote_recording_scans"][0]
         try:
-            estimated = estimated_recording_bytes(int(scan["bandwidth"]), scan["duration"])
+            estimated = estimated_recording_bytes(int(scan["bandwidth"]), scan["duration"], max_rate_hz=self._sensor_max_rate_hz())
         except Exception:
             estimated = 0
         blocked = recording_blocked_reason(self._storage, estimated)
@@ -2779,7 +2783,7 @@ class MainWindow(QMainWindow):
         self._pending_excel_entries = []
         self._summary_emitted = False
         try:
-            self._expected_bytes = estimated_recording_bytes(int(scan["bandwidth"]), seconds)
+            self._expected_bytes = estimated_recording_bytes(int(scan["bandwidth"]), seconds, max_rate_hz=self._sensor_max_rate_hz())
         except Exception:
             self._expected_bytes = 0
         if request is not None:
@@ -3896,10 +3900,19 @@ def _install_exception_hook() -> None:
         except Exception:
             pass
 
+    limiter = RepeatLimiter()
+
     def hook(exc_type, exc, tb) -> None:
+        write, left_out = limiter.admit(exception_signature(exc_type, exc, tb))
+        if not write:
+            return
         text = "".join(traceback.format_exception(exc_type, exc, tb))
         _write(text)
-        diag("unhandled_exception", traceback=text)
+        name = getattr(exc_type, "__name__", str(exc_type))
+        fields: dict[str, Any] = {"type": name, "traceback": text}
+        if left_out:
+            fields["repeats_not_logged"] = left_out
+        diag("unhandled_exception", str(exc).strip() or name, **fields)
         sys.__excepthook__(exc_type, exc, tb)
 
     sys.excepthook = hook

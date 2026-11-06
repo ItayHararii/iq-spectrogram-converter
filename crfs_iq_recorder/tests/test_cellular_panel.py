@@ -127,9 +127,40 @@ def test_panel_settings_round_trip(tmp_path):
     assert PanelSettings.from_dict({"repeat": 0}).repeat == 1
 
 
-def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_path):
+def test_plan_estimate_follows_the_model_once_the_identity_arrives(qapp, tmp_path):
+    """Hardware, 6 Nov (Node 100-18): the remembered workbook was imported before the sensor
+    answered, and the plan showed 3.8 GB per pass for rows the sensor records as 7.5 GB."""
+    from crfs_iq_recorder.gui import MainWindow
+    from crfs_iq_recorder.sensor_info import SensorInfo, blank_info
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Plan"
+    ws.append(["Band", "Duplex", "Direction", "Start (MHz)", "Stop (MHz)"])
+    ws.append(["1800", "FDD", "DL", 1805, 1880])
+    book = tmp_path / "wide.xlsx"
+    wb.save(book)
+    window = MainWindow(demo=True)
+    try:
+        window._apply_sensor_info(blank_info(host="h", status="Checking…"))
+        window.tabs.setCurrentIndex(1)
+        panel = window.cellular_panel
+        _load(panel, qapp, book)
+        before = panel.plan.estimated_bytes
+        assert "checked when you press Start" in panel._details_text()
+        window._apply_sensor_info(SensorInfo(host="h", model="R100-18", firmware="2.25-325", serial="x", status="Connected", connected=True))
+        assert panel.plan.estimated_bytes > 1.9 * before, (before, panel.plan.estimated_bytes)
+        assert "Checked against" in panel._details_text()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_path, monkeypatch):
+    import crfs_iq_recorder.cellular_runner as cr
     from crfs_iq_recorder.gui import MainWindow
 
+    monkeypatch.setattr(cr, "FINALIZE_SETTLE_S", 0.05)  # each row's download (after this listing) precedes the next row
     book = _plan_book(tmp_path / "plan.xlsx")
     window = MainWindow(demo=True)
     try:
@@ -296,9 +327,11 @@ def test_schedule_uses_the_pickers_and_the_local_clock(qapp, tmp_path):
         qapp.processEvents()
 
 
-def test_panel_fills_the_protocol_rows_through_the_demo_window(qapp, tmp_path):
+def test_panel_fills_the_protocol_rows_through_the_demo_window(qapp, tmp_path, monkeypatch):
+    import crfs_iq_recorder.cellular_runner as cr
     from crfs_iq_recorder.gui import MainWindow
 
+    monkeypatch.setattr(cr, "FINALIZE_SETTLE_S", 0.05)  # each row's download (after this listing) precedes the next row
     book = _protocol_book(tmp_path / "Cellular_IQ_Collection_Protocol.xlsx")
     window = MainWindow(demo=True)
     try:
@@ -363,10 +396,13 @@ def test_a_workbook_that_cannot_be_read_keeps_the_stored_import_and_queues_resul
     workbook updates off. The rows imported earlier stay the plan, the worksheet stays
     selected, and the results queue up (busy) until the file is free."""
     import crfs_iq_recorder.cellular_panel as cp
+    import crfs_iq_recorder.cellular_runner as cr
     import crfs_iq_recorder.cellular_workbook as cw
     from crfs_iq_recorder.cellular_protocol import ProtocolError, WorkbookUnavailable
     from crfs_iq_recorder.excel_writer import ExcelBusyError
     from crfs_iq_recorder.gui import MainWindow
+
+    monkeypatch.setattr(cr, "FINALIZE_SETTLE_S", 0.05)  # each row's download (after this listing) precedes the next row
 
     def unavailable(*_a, **_k):
         raise WorkbookUnavailable(f"Could not open {book.name}: [Errno 13] Permission denied")

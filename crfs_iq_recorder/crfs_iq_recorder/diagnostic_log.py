@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import threading
+import time
 from collections import deque
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -151,6 +152,53 @@ def diag(event: str, message: str = "", **fields: Any) -> None:
             handler.flush()
         except Exception:  # noqa: BLE001 - diagnostics must never break the application
             pass
+
+
+REPEAT_WINDOW_S = 10.0
+
+
+class RepeatLimiter:
+    """The same event over and over: the first in full, then at most one per window with the count left out.
+
+    Without it an exception raised for every 32 KB of a download filled the
+    log's 10 MB (all backups) in minutes and kept the GUI thread busy writing.
+    """
+
+    def __init__(self, window_s: float = REPEAT_WINDOW_S, *, clock=time.monotonic, max_keys: int = 64) -> None:
+        self._window_s = float(window_s)
+        self._clock = clock
+        self._max_keys = int(max_keys)
+        self._last: dict[str, float] = {}
+        self._suppressed: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def admit(self, key: str) -> tuple[bool, int]:
+        """(write this one?, occurrences left out since the last one written)."""
+        now = self._clock()
+        with self._lock:
+            last = self._last.get(key)
+            if last is not None and now - last < self._window_s:
+                self._suppressed[key] = self._suppressed.get(key, 0) + 1
+                return False, 0
+            if last is None and len(self._last) >= self._max_keys:
+                oldest = min(self._last, key=self._last.__getitem__)
+                self._last.pop(oldest, None)
+                self._suppressed.pop(oldest, None)
+            self._last[key] = now
+            return True, self._suppressed.pop(key, 0)
+
+
+def exception_signature(exc_type, exc, tb) -> str:
+    """Type, innermost frame and message: what makes two unhandled exceptions "the same"."""
+    where = ""
+    frame = tb
+    while frame is not None and frame.tb_next is not None:
+        frame = frame.tb_next
+    if frame is not None:
+        code = frame.tb_frame.f_code
+        where = f"{code.co_filename}:{frame.tb_lineno}"
+    name = getattr(exc_type, "__name__", str(exc_type))
+    return f"{name}|{where}|{str(exc)[:200]}"
 
 
 def recent(count: int = 30) -> list[str]:

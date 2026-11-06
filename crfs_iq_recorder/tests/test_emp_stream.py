@@ -355,7 +355,7 @@ def test_repeated_warning_is_counted_once_and_never_hides_the_real_error(sensor)
     """Root cause (a), Node 100-18 at 18:44: the clock WARNING arrived several times a second,
     filled the message window and the ERROR that ended the stream was invisible."""
     script = _Script([(0.02, CLOCK * 60), (0.02, remote_time("file_164410_0001.wav")), (0.02, SCHEDULE_ERROR)])
-    outcome = EmpClient(demo=False).start_recording(sensor(script), "pw", _payload(), stream_budget_s=10)
+    outcome = EmpClient(demo=False).start_recording(sensor(script), "pw", _payload(), stream_budget_s=1.5)
     assert outcome.kind == "sensor_error", "a WARNING is not fatal; the ERROR is what ended this recording"
     assert outcome.sensor_messages == [
         "WARNING: Using internal clock because of ncpd.conf settings (×60)",
@@ -417,9 +417,79 @@ def test_refused_request_names_no_file_and_is_not_finished(sensor):
     )
     assert finished.kind == "accepted" and finished.sensor_finished is True and finished.sensor_parts == ["f.wav"]
     partial = EmpClient(demo=False).start_recording(
-        sensor(_Script([(0.02, remote_time("f.wav")), (0.02, SCHEDULE_ERROR)])), "pw", _payload(), stream_budget_s=10
+        sensor(_Script([(0.02, remote_time("f.wav")), (0.02, SCHEDULE_ERROR)])), "pw", _payload(), stream_budget_s=1.5
     )
     assert partial.kind == "sensor_error" and partial.sensor_parts == ["f.wav"]
+
+
+COLLECTION_ERROR = (
+    'event: message.MessageData\ndata: [{"level":"ERROR","message":"Collection was modified; enumeration '
+    'operation may not execute.","timestamp":"2026-11-05T21:10:26+00:00"}]\n\n'
+)
+
+
+def test_error_after_the_file_is_named_keeps_the_stream_until_finished(sensor):
+    """R3, Node 100-18, 5 Nov 21:10: "Collection was modified" 1.7 s into a 5 s capture. The client
+    closed the stream on it, the Node dropped the mission and the file kept 0.117 s. Held, the same
+    error is followed by "finished" and the capture is whole (19:30 the same day, 2.003 s of 2 s)."""
+    script = _Script([
+        (0.02, remote_time("iq_20261105_211026_0001.wav")),
+        (0.05, COLLECTION_ERROR),
+        (0.3, CLOCK),
+        (0.3, FINISHED),
+    ])
+    target = sensor(script)
+    cancel = threading.Event()
+    client = EmpClient(demo=False)
+    box = {}
+
+    def work():
+        box["outcome"] = client.start_recording(
+            target, "pw", _payload(5.0), cancel=cancel, stream_budget_s=30, stop_on_finished=False
+        )
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    time.sleep(1.2)
+    assert thread.is_alive() and not script.disconnected.is_set(), "the ERROR must not close the stream"
+    cancel.set()
+    client.abort()
+    thread.join(5)
+    outcome = box["outcome"]
+    assert outcome.kind == "accepted" and outcome.sensor_finished is True
+    assert outcome.sensor_error.startswith("ERROR: Collection was modified")
+    assert "Before that the sensor reported" in outcome.detail and "not cut" in outcome.detail
+    assert outcome.sensor_parts == ["iq_20261105_211026_0001.wav"]
+
+
+def test_error_after_the_file_is_named_then_finished_ends_a_runner_stream_at_finished(sensor):
+    script = _Script([(0.02, remote_time("f.wav")), (0.05, COLLECTION_ERROR), (0.3, FINISHED)])
+    outcome = EmpClient(demo=False).start_recording(sensor(script), "pw", _payload(5.0), stream_budget_s=10)
+    assert outcome.kind == "accepted" and outcome.sensor_finished is True
+    assert outcome.stream_ended == STREAM_FINISHED
+    assert outcome.sensor_error.startswith("ERROR: Collection was modified")
+
+
+def test_error_without_finished_is_given_up_after_the_grace(sensor, monkeypatch):
+    """Bounded: a mission that never reports "finished" after its ERROR does not hold the client for
+    the whole stream budget (minutes for a large capture)."""
+    monkeypatch.setattr("crfs_iq_recorder.api_client.SENSOR_ERROR_GRACE_S", 0.3)
+    script = _Script([(0.02, remote_time("f.wav")), (0.02, SCHEDULE_ERROR)] + [(0.1, CLOCK)] * 40)
+    started = time.monotonic()
+    outcome = EmpClient(demo=False).start_recording(sensor(script), "pw", _payload(1.0), stream_budget_s=20)
+    took = time.monotonic() - started
+    assert outcome.kind == "sensor_error" and outcome.sensor_parts == ["f.wav"]
+    assert outcome.stream_ended == STREAM_FINISHED
+    assert 1.2 <= took < 3.5, f"requested 1 s + grace 0.3 s after the error, took {took:.2f} s"
+
+
+def test_refusal_before_any_file_still_ends_the_stream_at_once(sensor):
+    started = time.monotonic()
+    outcome = EmpClient(demo=False).start_recording(
+        sensor(_Script([(0.02, SCHEDULE_ERROR)])), "pw", _payload(5.0), stream_budget_s=20
+    )
+    assert outcome.kind == "sensor_error" and outcome.sensor_parts == []
+    assert time.monotonic() - started < 2.0
 
 
 MISSIONS_HTML = (

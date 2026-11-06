@@ -42,7 +42,18 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .cellular_protocol import ColumnMapping, ProtocolImport, _normalise_header, parse_direction_cell, parse_frequency_cell
-from .excel_com import BUSY, OPEN, XL_FORMULAS, XL_PART, XL_BY_ROWS, XL_PREVIOUS, _norm, com_busy_reason, excel_workbook_state
+from .excel_com import (
+    BUSY,
+    OPEN,
+    XL_BY_ROWS,
+    XL_FORMULAS,
+    XL_PART,
+    XL_PREVIOUS,
+    _bind_open_workbook,
+    _norm,
+    com_busy_reason,
+    excel_workbook_state,
+)
 from .excel_writer import ExcelBusyError, backup_workbook
 from .json_store import read_json, write_json
 from .recording_history import iq_group_key, sort_iq_filenames
@@ -842,28 +853,25 @@ def write_results_com(path: Path, *, layout: SheetLayout, plan: list[PlanRow], r
     pythoncom.CoInitialize()
     try:
         try:
-            app = win32com.client.GetActiveObject("Excel.Application")
-        except Exception as exc:  # noqa: BLE001 - no instance, or one that cannot be asked
-            raise ExcelBusyError(f"Excel could not be reached for {Path(path).name}: {com_busy_reason(exc) or exc}") from exc
-        want = _norm(Path(path))
-        book = None
-        try:
-            for item in app.Workbooks:
-                try:
-                    if _norm(Path(str(item.FullName))) == want:
-                        book = item
-                        break
-                except Exception as exc:  # noqa: BLE001
-                    if com_busy_reason(exc):
-                        raise
-                    continue
+            app, book = _bind_open_workbook(win32com.client, Path(path))
         except Exception as exc:  # noqa: BLE001
             reason = com_busy_reason(exc)
             if reason:
                 raise ExcelBusyError(f"{reason}; {Path(path).name} is written when Excel is free.") from exc
-            raise
+            from .diagnostic_log import diag
+
+            diag("excel_bind_failed", Path(path).name, type=type(exc).__name__, detail=str(exc)[:300])
+            raise ExcelBusyError(f"Excel could not be reached for {Path(path).name}") from exc
         if book is None:
             raise ExcelBusyError(f"{Path(path).name} is not open in Excel any more.")
+        try:
+            read_only = bool(book.ReadOnly)
+        except Exception as exc:  # noqa: BLE001
+            raise ExcelBusyError(f"{com_busy_reason(exc) or 'Excel refused the call'}; {Path(path).name} is written when Excel is free.") from exc
+        if read_only:
+            raise ExcelBusyError(
+                f"{Path(path).name} is open read-only in Excel; the results stay queued until it is opened for editing or closed."
+            )
         try:
             sheet = book.Worksheets(layout.worksheet)
         except Exception as exc:  # noqa: BLE001

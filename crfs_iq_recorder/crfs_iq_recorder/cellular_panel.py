@@ -1117,6 +1117,16 @@ class CellularPanel(QFrame):
         else:
             runner(work, apply)
 
+    def sensor_model_changed(self) -> None:
+        """The estimate and the model checks follow the connected sensor.
+
+        A remembered workbook is imported before the sensor answers, so the plan was
+        checked against an unknown model (62.5 MS/s): 3.8 GB per pass was shown for
+        three 5 s rows that a Node 100-18 records as 7.5 GB.
+        """
+        if self._built and self.imported is not None and not self.runner.active():
+            self._rebuild_plan()
+
     def _rebuild_plan(self, *_args) -> None:
         if self.imported is None:
             return

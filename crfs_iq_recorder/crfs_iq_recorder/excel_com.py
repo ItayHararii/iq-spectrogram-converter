@@ -53,6 +53,119 @@ def _norm(path: Path) -> str:
     return str(path.resolve()).casefold()
 
 
+def _same_file(display_name: str, want: str) -> bool:
+    """A running-object-table display name that is this file's full path (URLs and class monikers never are)."""
+    text = str(display_name or "")
+    if len(text) < 3 or text.startswith("!") or "://" in text:
+        return False
+    try:
+        return _norm(Path(text)) == want
+    except (OSError, ValueError):
+        return False
+
+
+def _rot_names() -> list[str]:
+    """Display names in the running-object table. Reading names never calls into an Excel instance."""
+    import pythoncom  # type: ignore
+
+    names: list[str] = []
+    rot = pythoncom.GetRunningObjectTable()
+    ctx = pythoncom.CreateBindCtx(0)
+    for moniker in rot:
+        try:
+            names.append(str(moniker.GetDisplayName(ctx, None)))
+        except Exception:  # noqa: BLE001 - an entry that went away meanwhile
+            continue
+    return names
+
+
+def _rot_has_file(path: Path) -> bool:
+    want = _norm(path)
+    try:
+        return any(_same_file(name, want) for name in _rot_names())
+    except Exception:  # noqa: BLE001 - no COM / no table: unknown, not open
+        return False
+
+
+def file_locked(path: Path) -> bool:
+    """True when another process holds the file and lets nobody else write it (Excel, while it has it open).
+
+    Opens and closes a handle without reading or writing a byte.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return False
+    generic_read, generic_write = 0x80000000, 0x40000000
+    file_share_read, open_existing = 0x00000001, 3
+    sharing_violation, lock_violation = 32, 33
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel32.CreateFileW
+        create.restype = wintypes.HANDLE
+        create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        handle = create(str(path), generic_read | generic_write, file_share_read, None, open_existing, 0, None)
+        if handle in (None, wintypes.HANDLE(-1).value):
+            return ctypes.get_last_error() in (sharing_violation, lock_violation)
+        kernel32.CloseHandle(handle)
+        return False
+    except Exception:  # noqa: BLE001 - not on Windows / no access: no evidence of a lock
+        return False
+
+
+class ExcelRefused(RuntimeError):
+    """The Excel instance that has the workbook open does not answer calls about it (busy)."""
+
+
+def _bind_open_workbook(win32com_client, path: Path):
+    """(Application, Workbook) of the Excel instance that has this file open, or (None, None).
+
+    Bound by the file's full path through the running-object table, where every
+    Excel instance registers each workbook it opens. GetActiveObject("Excel.Application")
+    returns one instance only, so a workbook open in a second Excel looked closed
+    (6 Nov 2026: two instances on the collection PC). That lookup stays as the fallback.
+    Busy COM errors propagate (see com_busy_reason): the caller keeps the work queued.
+    """
+    import pythoncom  # type: ignore
+
+    want = _norm(path)
+    rot = pythoncom.GetRunningObjectTable()
+    ctx = pythoncom.CreateBindCtx(0)
+    for moniker in rot:
+        try:
+            name = moniker.GetDisplayName(ctx, None)
+        except Exception:  # noqa: BLE001
+            continue
+        if not _same_file(name, want):
+            continue
+        unknown = rot.GetObject(moniker)
+        book = win32com_client.Dispatch(unknown.QueryInterface(pythoncom.IID_IDispatch))
+        try:
+            full = str(book.FullName)
+        except AttributeError as exc:
+            # pywin32 reports a refused name lookup as AttributeError("<unknown>.FullName") and drops
+            # its HRESULT; seen on hardware (6 Nov 2026) with that Excel in cell-edit mode.
+            raise ExcelRefused(f"Excel refused to be asked about {path.name}") from exc
+        if _norm(Path(full)) == want:
+            return book.Application, book
+    try:
+        app = win32com_client.GetActiveObject("Excel.Application")
+    except Exception as exc:  # noqa: BLE001
+        if com_busy_reason(exc):
+            raise
+        return None, None
+    for item in app.Workbooks:
+        try:
+            if _norm(Path(str(item.FullName))) == want:
+                return app, item
+        except Exception as exc:  # noqa: BLE001
+            if com_busy_reason(exc):
+                raise
+            continue
+    return None, None
+
+
 def _hresults_of(exc: BaseException) -> set[int]:
     """Every HRESULT a pywin32 com_error carries (its own and the one in EXCEPINFO)."""
     codes: set[int] = set()
@@ -75,6 +188,8 @@ def com_busy_reason(exc: BaseException) -> str | None:
     RPC_E_DISCONNECTED / RPC_S_SERVER_UNAVAILABLE. These are "wait and try
     again" states: the results stay queued.
     """
+    if isinstance(exc, ExcelRefused):
+        return "Excel is busy (a cell is being edited or a dialog is open)"
     codes = _hresults_of(exc)
     if codes & {VBA_E_IGNORE}:
         return "Excel is busy (a cell is being edited or a dialog is open)"
@@ -94,6 +209,9 @@ def excel_workbook_state(path: Path) -> str:
     'busy' is distinct from 'closed' on purpose: a workbook may well be open
     in an Excel that is in cell edit mode, and writing the file with openpyxl
     meanwhile would race the open instance. Callers treat 'busy' as "wait".
+    The workbook is found in any Excel instance by its full path. A file that no
+    reachable Excel has open but that another process keeps locked is 'busy'
+    too: it is never rewritten behind a window that has it.
     """
     try:
         import win32com.client  # type: ignore
@@ -101,17 +219,21 @@ def excel_workbook_state(path: Path) -> str:
     except ImportError:
         return CLOSED
     if not _excel_window_exists():
-        return CLOSED
+        return BUSY if file_locked(path) else CLOSED
     # Callers may run on a worker thread that never initialised COM.
     try:
         pythoncom.CoInitialize()
     except Exception:
         pass
     try:
+        if _rot_has_file(path):
+            return OPEN
         try:
             app = win32com.client.GetActiveObject("Excel.Application")
         except Exception as exc:
-            return BUSY if com_busy_reason(exc) else CLOSED
+            if com_busy_reason(exc):
+                return BUSY
+            return BUSY if file_locked(path) else CLOSED
         want = _norm(path)
         try:
             for book in app.Workbooks:
@@ -123,8 +245,9 @@ def excel_workbook_state(path: Path) -> str:
                         return BUSY
                     continue
         except Exception as exc:
-            return BUSY if com_busy_reason(exc) else CLOSED
-        return CLOSED
+            if com_busy_reason(exc):
+                return BUSY
+        return BUSY if file_locked(path) else CLOSED
     finally:
         try:
             pythoncom.CoUninitialize()
@@ -171,35 +294,32 @@ def activate_workbook(path: Path) -> bool:
         pass
     try:
         try:
-            app = win32com.client.GetActiveObject("Excel.Application")
+            app, book = _bind_open_workbook(win32com.client, Path(path))
         except Exception:
             return False
-        want = _norm(path)
+        if book is None:
+            return False
         try:
-            for book in app.Workbooks:
-                try:
-                    if _norm(Path(str(book.FullName))) != want:
-                        continue
-                    book.Activate()
-                    try:
-                        app.Visible = True
-                        window = app.ActiveWindow
-                        if window is not None and int(window.WindowState) == -4140:  # xlMinimized
-                            window.WindowState = -4143  # xlNormal
-                    except Exception:
-                        pass
-                    try:
-                        import ctypes
+            book.Activate()
+            try:
+                app.Visible = True
+                window = app.ActiveWindow
+                if window is not None and int(window.WindowState) == -4140:  # xlMinimized
+                    window.WindowState = -4143  # xlNormal
+            except Exception:
+                pass
+            try:
+                import ctypes
 
-                        ctypes.windll.user32.SetForegroundWindow(int(app.Hwnd))
-                    except Exception:
-                        pass
-                    return True
-                except Exception:
-                    continue
+                ctypes.windll.user32.SetForegroundWindow(int(app.Hwnd))
+            except Exception:
+                pass
+            return True
         except Exception:
             return False
-        return False
+        finally:
+            book = None
+            app = None
     finally:
         try:
             pythoncom.CoUninitialize()
@@ -368,10 +488,22 @@ def _append_rows_com_impl(win32com_client, path: Path, rows: list[ExcelRow]) -> 
         app = None
         if _excel_window_exists():
             try:
+                app, book = _bind_open_workbook(win32com_client, path)
+            except Exception as exc:
+                if com_busy_reason(exc):
+                    raise
+                app, book = None, None
+            if book is not None:
+                try:
+                    headless = not bool(app.Visible)
+                except Exception:
+                    headless = False
+        if app is None and _excel_window_exists():
+            try:
                 app = win32com_client.GetActiveObject("Excel.Application")
             except Exception:
                 app = None
-        if app is not None:
+        if app is not None and book is None:
             try:
                 headless = not bool(app.Visible)
             except Exception:
@@ -397,13 +529,14 @@ def _append_rows_com_impl(win32com_client, path: Path, rows: list[ExcelRow]) -> 
             app = win32com_client.Dispatch("Excel.Application")
             started = True
             headless = False
-        for item in app.Workbooks:
-            try:
-                if _norm(Path(str(item.FullName))) == want:
-                    book = item
-                    break
-            except Exception:
-                continue
+        if book is None:
+            for item in app.Workbooks:
+                try:
+                    if _norm(Path(str(item.FullName))) == want:
+                        book = item
+                        break
+                except Exception:
+                    continue
         if book is None:
             if not started:
                 # Excel is open with other files. Do not load a second copy.
@@ -560,23 +693,15 @@ def add_worksheet_com(path: Path, sheet: str, headers: list[str]) -> bool:
 
 
 def _add_worksheet_com_impl(win32com_client, path: Path, sheet: str, headers: list[str]) -> bool:
-    want = _norm(path)
     app = None
     book = None
     try:
         try:
-            app = win32com_client.GetActiveObject("Excel.Application")
+            app, book = _bind_open_workbook(win32com_client, Path(path))
         except Exception as exc:
             if com_busy_reason(exc):
                 raise ExcelBusyError(f"Excel could not be asked about {path.name} right now: {com_busy_reason(exc)}.") from exc
             return False
-        for item in app.Workbooks:
-            try:
-                if _norm(Path(str(item.FullName))) == want:
-                    book = item
-                    break
-            except Exception:
-                continue
         if book is None:
             return False
         for existing in book.Worksheets:

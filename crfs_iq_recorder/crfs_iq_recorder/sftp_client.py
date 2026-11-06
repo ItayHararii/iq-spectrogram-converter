@@ -133,6 +133,27 @@ class SftpBrowser:
         """(hex digest, note) computed on the sensor; ('' , why) when the sensor offers none."""
         return "", "no checksum available from this connection"
 
+    def pending_writeback_bytes(self) -> int | None:
+        """Bytes the sensor's Linux still has to write to its disks (Dirty + Writeback), None when unknown."""
+        return None
+
+
+def parse_writeback_bytes(meminfo_text: str) -> int | None:
+    """Dirty + Writeback from /proc/meminfo text (kB lines), None when neither line is there."""
+    total = 0
+    found = False
+    for line in (meminfo_text or "").splitlines():
+        key, _, rest = line.partition(":")
+        if key.strip() not in {"Dirty", "Writeback"}:
+            continue
+        fields = rest.split()
+        if not fields or not fields[0].isdigit():
+            continue
+        found = True
+        unit = fields[1].casefold() if len(fields) > 1 else "kb"
+        total += int(fields[0]) * (1024 if unit == "kb" else 1)
+    return total if found else None
+
 
 REMOTE_CHECKSUM_TIMEOUT_S = 180.0  # a 500 MB part takes the Node a few seconds; a slow disk much longer
 
@@ -140,6 +161,12 @@ REMOTE_CHECKSUM_TIMEOUT_S = 180.0  # a 500 MB part takes the Node a few seconds;
 def _raise_if_cancelled(cancel: threading.Event | None) -> None:
     if cancel is not None and cancel.is_set():
         raise SftpError("Download cancelled.")
+
+
+def exception_text(exc: BaseException) -> str:
+    """The message, or the exception's type when it has none ("OverflowError", not "")."""
+    text = str(exc).strip()
+    return text or type(exc).__name__
 
 
 SFTP_CONNECT_TIMEOUT_S = 8.0
@@ -381,10 +408,16 @@ class ParamikoSftpBrowser(SftpBrowser):
         local_path.parent.mkdir(parents=True, exist_ok=True)
         _raise_if_cancelled(cancel)
 
+        progress_failed: list[str] = []
+
         def _cb(transferred: int, total: int) -> None:
             _raise_if_cancelled(cancel)
-            if progress:
-                progress(int(transferred), int(total or 0))
+            if progress and not progress_failed:
+                try:
+                    progress(int(transferred), int(total or 0))
+                except Exception as exc:  # noqa: BLE001 - a progress display never ends a transfer
+                    progress_failed.append(exception_text(exc))
+                    logging.getLogger(__name__).warning("download progress disabled: %s", progress_failed[0])
 
         try:
             self._sftp.get(remote_path, str(tmp), callback=_cb)
@@ -406,7 +439,7 @@ class ParamikoSftpBrowser(SftpBrowser):
             cleanup_part(tmp)
             if cancel is not None and cancel.is_set():
                 raise SftpError("Download cancelled.") from exc
-            raise SftpError(f"Download failed: {exc}") from exc
+            raise SftpError(f"Download failed: {exception_text(exc)}") from exc
         except Exception as exc:  # noqa: BLE001 - paramiko raises its own classes
             # Cancel closes the socket under paramiko, which then raises
             # `paramiko.sftp.SFTPError: Garbage packet received` (not an OSError):
@@ -415,7 +448,7 @@ class ParamikoSftpBrowser(SftpBrowser):
             cleanup_part(tmp)
             if cancel is not None and cancel.is_set():
                 raise SftpError("Download cancelled.") from exc
-            raise SftpError(f"Download failed: {exc}") from exc
+            raise SftpError(f"Download failed: {exception_text(exc)}") from exc
 
     def remove_file(self, remote_path: str) -> None:
         try:
@@ -448,6 +481,14 @@ class ParamikoSftpBrowser(SftpBrowser):
         if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
             return digest, "sha256sum computed on the sensor over SSH"
         return "", f"sha256sum over SSH gave no digest ({err or text or 'no output'})"
+
+    def pending_writeback_bytes(self) -> int | None:
+        """Read-only: `/proc/meminfo` over this SSH session (no extra handshake)."""
+        try:
+            _stdin, stdout, _stderr = self._client.exec_command("grep -E '^(Dirty|Writeback):' /proc/meminfo", timeout=10)
+            return parse_writeback_bytes(stdout.read().decode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001 - unknown, never a failed recording
+            return None
 
     def storage_usage(self, path: str):
         from .sensor_storage import snapshot_from_df_text, snapshot_from_statvfs
@@ -908,6 +949,9 @@ class DemoSftpBrowser(SftpBrowser):
                 free_bytes=min(int(self._storage_free), int(self._storage_total)),
                 ok=True,
             )
+
+    def pending_writeback_bytes(self) -> int | None:
+        return 0
 
     def remove_file(self, remote_path: str) -> None:
         with self._lock:
