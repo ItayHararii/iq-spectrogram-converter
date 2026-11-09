@@ -23,6 +23,7 @@ from crfs_iq_recorder.capture_api import (
     OUTCOME_UNKNOWN,
     CaptureRequest,
     CaptureSummary,
+    receiver_wait_s,
 )
 from crfs_iq_recorder.capture_measure import (
     PARTIAL_TOLERANCE,
@@ -123,7 +124,7 @@ class FakeHost(QObject):
         self.requests.append(request)
         return None
 
-    def finish(self, request, outcome=OUTCOME_CONFIRMED, *, parts=1, held=None, detail="", names=None, result=None, sensor_error=""):
+    def finish(self, request, outcome=OUTCOME_CONFIRMED, *, parts=1, held=None, detail="", names=None, result=None, sensor_error="", sensor_finished=None):
         names = names or [f"file_{len(self.requests):06d}_{i + 1:04d}.wav" for i in range(parts)]
         paths = [f"/mnt/1/remdata/20261103/{name}" for name in names]
         measured = held if held is not None else (request.seconds if outcome == OUTCOME_CONFIRMED else None)
@@ -146,7 +147,7 @@ class FakeHost(QObject):
             held_s=measured,
             parts=parts if outcome == OUTCOME_CONFIRMED else 0,
             total_bytes=1000 * parts,
-            sensor_finished=outcome == OUTCOME_CONFIRMED,
+            sensor_finished=outcome == OUTCOME_CONFIRMED if sensor_finished is None else sensor_finished,
             request_sent=outcome not in {OUTCOME_NOT_SENT},
             sensor_parts=list(names) if outcome == OUTCOME_CONFIRMED else [],
             finalized_paths=paths if outcome == OUTCOME_CONFIRMED else [],
@@ -311,6 +312,60 @@ def test_short_unknown_sensor_error_and_not_sent_outcomes(qapp, tmp_path):
     assert runner.retry_task(record.round_id, tasks[0].task_key) is not None
     runner._tick()
     assert runner.state == S_DONE
+
+
+def test_a_request_the_sensor_finished_without_recording_is_sent_once_more(qapp, tmp_path):
+    host = FakeHost()
+    runner = _runner(tmp_path, host)
+    runner.start_session(_plan(tmp_path), Schedule(mode=MODE_NOW), _settings())
+    first = host.requests[0]
+    host.finish(first, OUTCOME_UNKNOWN, detail="no file confirmed", sensor_finished=True)
+    _pump(qapp)
+    tasks = runner.current_tasks()
+    assert len(host.requests) == 2, "the same row goes again before the next row"
+    again = host.requests[1]
+    assert (again.plan.center_hz, again.plan.bandwidth_hz, again.seconds) == (first.plan.center_hz, first.plan.bandwidth_hz, first.seconds)
+    assert tasks[0].status == T_SUBMITTING and tasks[0].attempts == 2
+    assert [h["attempt"] for h in tasks[0].history] == [1]
+    assert any("finished without recording" in n and "sent once more, unchanged" in n for n in tasks[0].notes)
+    # Only once: a second empty finish stays uncertain and the pass moves on.
+    host.finish(again, OUTCOME_UNKNOWN, detail="no file confirmed", sensor_finished=True)
+    _pump(qapp)
+    assert tasks[0].status == T_UNKNOWN and tasks[0].attempts == 2
+    assert len(host.requests) == 3 and host.requests[2].plan.center_hz != first.plan.center_hz
+    # No finish message from the sensor (its outcome is unknown, not empty): never sent again on its own.
+    host.finish(host.requests[2], OUTCOME_UNKNOWN, detail="no file settled")
+    _pump(qapp)
+    assert tasks[1].status == T_UNKNOWN and tasks[1].attempts == 1
+
+
+def test_a_request_is_held_while_the_sensor_closes_its_previous_receiver(qapp, isolated_app_paths, monkeypatch):
+    import crfs_iq_recorder.capture_api as capture_api
+    from crfs_iq_recorder.gui import MainWindow
+
+    monkeypatch.setattr(capture_api, "RECEIVER_CLOSE_WINDOW_S", (0.0, 0.6))
+    window = MainWindow(demo=True)
+    try:
+        window._settle_s = 0
+        window._stable_needed = 2
+        window.time_edit.setText("0.05")
+        gen = window._record_gen
+        window._stream_closed_at = time.monotonic()
+        held_from = time.monotonic()
+        window._on_start()
+        qapp.processEvents()
+        assert window._record_gen == gen, "nothing is sent while the sensor closes its receiver"
+        assert "for the sensor to close its previous recording" in window.msg.text()
+        assert _pump_until(qapp, lambda: window._record_gen == gen + 1, timeout=3.0)
+        assert time.monotonic() - held_from >= 0.55
+        assert _pump_until(qapp, lambda: window._http_in_flight is False)
+        _drive_capture(window, qapp)
+        assert window._stream_closed_at > held_from
+    finally:
+        window._watch_timer.stop()
+        window._record_timer.stop()
+        window.close()
+        qapp.processEvents()
 
 
 def test_pause_after_current_resume_and_stop_let_the_capture_finish(qapp, tmp_path):
@@ -1086,6 +1141,24 @@ def test_capture_summary_dict_and_properties():
     # "Partial" is the result of measuring the files, not a comparison the summary makes itself.
     assert not CaptureSummary(outcome=OUTCOME_CONFIRMED, requested_s=20, held_s=14.1, parts=7, result=RESULT_COMPLETED).short
     assert CaptureSummary(outcome=OUTCOME_NOT_SENT).retry_is_safe
+
+
+def test_sensor_recorded_nothing_and_receiver_wait():
+    empty = dict(outcome=OUTCOME_UNKNOWN, request_sent=True, sensor_finished=True)
+    assert CaptureSummary(**empty).sensor_recorded_nothing
+    for extra in (
+        {"sensor_finished": False},
+        {"stream_lost": True},
+        {"sensor_reply": {"first_filename": "iq_1_0001.wav"}},
+        {"sensor_parts": ["iq_1_0001.wav"]},
+        {"finalized_paths": ["/mnt/1/remdata/iq_1_0001.wav"]},
+        {"sensor_warnings": ["No suitable antenna found"]},
+        {"sensor_error": "Unable to schedule the command"},
+        {"outcome": OUTCOME_CONFIRMED},
+    ):
+        assert not CaptureSummary(**{**empty, **extra}).sensor_recorded_nothing, extra
+    assert receiver_wait_s(0.0) == 0.0 and receiver_wait_s(27.4) == 0.0 and receiver_wait_s(32.5) == 0.0
+    assert receiver_wait_s(27.5) == pytest.approx(5.0) and receiver_wait_s(30.4) == pytest.approx(2.1)
 
 
 # --------------------------------------------------------------------------- 1.10: idle check, refusals, identity

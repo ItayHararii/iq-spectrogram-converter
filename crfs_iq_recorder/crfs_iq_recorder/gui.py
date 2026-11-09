@@ -57,6 +57,7 @@ from .capture_api import (
     OUTCOME_UNKNOWN,
     CaptureRequest,
     CaptureSummary,
+    receiver_wait_s,
 )
 from .class_match import suggest_class
 from .collection_catalog import preferred_event, load_workbook_catalog
@@ -318,6 +319,8 @@ class MainWindow(QMainWindow):
         self._record_phase = IDLE
         self._record_client: EmpClient | None = None
         self._record_cancel = threading.Event()
+        # time.monotonic() when the last recording's event stream closed (0: none yet this session).
+        self._stream_closed_at = 0.0
         self._sensor_finished = False
         self._sensor_finished_at = 0.0
         self._stream_lost = False
@@ -1213,6 +1216,7 @@ class MainWindow(QMainWindow):
         self._record_client = None
         if client is None:
             return
+        self._stream_closed_at = time.monotonic()
         try:
             client.abort()
         except Exception:
@@ -2797,6 +2801,19 @@ class MainWindow(QMainWindow):
         request: CaptureRequest | None,
     ) -> None:
         """Submit one recording (manual or programmatic) and arm the completion watch."""
+        since = time.monotonic() - self._stream_closed_at if self._stream_closed_at else None
+        hold_s = receiver_wait_s(since) if since is not None else 0.0
+        if hold_s > 0:
+            # The caller's submit lock stays held, so nothing else starts meanwhile.
+            diag("sensor_receiver_wait", f"request held {hold_s:.1f} s", since_stream_closed_s=round(since, 1))
+            self._set_msg(f"Waiting {max(1, round(hold_s))} s for the sensor to close its previous recording.")
+
+            def resume() -> None:
+                if self._alive:
+                    self._launch_capture(plan, seconds, target=target, mapping=mapping, request=request)
+
+            QTimer.singleShot(int(hold_s * 1000) + 50, resume)
+            return
         recording_format = self._recording_format()
         if request is not None and request.recording_format:
             recording_format = request.recording_format
@@ -3570,6 +3587,7 @@ class MainWindow(QMainWindow):
             if gen != self._record_gen:
                 return
         self._http_in_flight = False
+        self._stream_closed_at = time.monotonic()
         if not self._recording_active:
             self._record_client = None
         if not isinstance(outcome, HttpOutcome):

@@ -133,6 +133,7 @@ MAX_DOWNLOADS = 2
 DOWNLOAD_RETRIES = 2
 DOWNLOAD_RETRY_DELAY_S = 10.0
 NOT_SENT_RETRIES = 1
+NOTHING_RECORDED_RETRIES = 1
 DEFAULT_BACKLOG_LIMIT = 8
 DEFAULT_LOCAL_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 # Seconds between a confirmed capture and the fresh listing that precedes its
@@ -1625,6 +1626,13 @@ class CellularRunner(QObject):
         elif summary.outcome == OUTCOME_SENSOR_ERROR:
             state.status = T_SENSOR_ERROR
             state.notes.append(f"Rejected by the sensor: {summary.sensor_error or summary.detail}")
+        elif summary.sensor_recorded_nothing and state.attempts <= NOTHING_RECORDED_RETRIES:
+            state.history.append(state.attempt_record())
+            state.status = T_QUEUED
+            state.notes.append(
+                f"Attempt {state.attempts}: the sensor finished without recording (no reply, no file); sent once more, unchanged."
+            )
+            self._log(f"The sensor recorded nothing. {self._row_position(planned).capitalize()} is sent once more.", "error")
         else:
             state.status = T_UNKNOWN
             state.notes.append(f"Not confirmed: {summary.result_reason or summary.detail}")

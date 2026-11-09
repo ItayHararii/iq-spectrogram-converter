@@ -25,6 +25,20 @@ OUTCOME_SENSOR_ERROR = "sensor_error"  # the sensor reported an error for the ta
 OUTCOME_FAILED = "failed"  # an application error ended the capture; state uncertain
 OUTCOME_BUSY = "busy"  # never started: another recording owns the sensor
 
+# The Node closes its receiver connection about 30 s after a recording's event stream closes. A
+# request that reaches it while that connection closes gets no samples: the sensor says "finished"
+# within seconds and writes no file (Node 100-18, 2.25: 3 of 14 requests sent 30 s after the
+# previous stream closed; none of 74 sent 21-29 s or 31-45 s after it).
+RECEIVER_CLOSE_WINDOW_S = (27.5, 32.5)
+
+
+def receiver_wait_s(since_stream_closed_s: float) -> float:
+    """Seconds to hold a request so it does not reach the sensor while it closes its receiver connection."""
+    start, end = RECEIVER_CLOSE_WINDOW_S
+    if start <= since_stream_closed_s < end:
+        return end - since_stream_closed_s
+    return 0.0
+
 
 @dataclass(frozen=True)
 class CaptureRequest:
@@ -95,6 +109,23 @@ class CaptureSummary:
     def retry_is_safe(self) -> bool:
         """True only when nothing reached the sensor."""
         return self.outcome in {OUTCOME_NOT_SENT, OUTCOME_BUSY}
+
+    @property
+    def sensor_recorded_nothing(self) -> bool:
+        """The sensor took the request and said "finished" without starting: no reply naming a file, no
+        file on its storage, and no message or error that explains it (so sending it again is no repeat)."""
+        return (
+            self.outcome == OUTCOME_UNKNOWN
+            and self.request_sent
+            and self.sensor_finished
+            and not self.stream_lost
+            and not self.sensor_reply
+            and not self.sensor_parts
+            and not self.finalized_paths
+            and not self.sizes
+            and not self.sensor_warnings
+            and not self.sensor_error
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {
