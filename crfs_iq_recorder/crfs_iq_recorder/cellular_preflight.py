@@ -142,12 +142,14 @@ def gather_preflight(
             notes.append(Check("sensor_clock", LEVEL_INFO, f"Sensor clock: unknown ({type(exc).__name__}: {exc})."))
     clock_offset = None
     clock_source = ""
+    clock_uncertainty = 0.0
     sensor_time = None
     gnss = None
     if clock is not None:
         result.clock = clock.to_dict() if hasattr(clock, "to_dict") else dict(clock)
         if getattr(clock, "available", False):
             clock_offset = getattr(clock, "offset_s", None)
+            clock_uncertainty = float(getattr(clock, "uncertainty_s", 0.0) or 0.0)
             sensor_time = getattr(clock, "sensor_utc", None)
             clock_source = getattr(clock, "source", "") or ""
             if getattr(clock, "time_source", ""):
@@ -197,6 +199,8 @@ def gather_preflight(
         expected_identity=expected_identity,
         clock_offset_s=clock_offset,
         clock_source=clock_source,
+        clock_uncertainty_s=clock_uncertainty,
+        clock_note=str(getattr(clock, "note", "") or "") if clock is not None else "",
         workbook_path=workbook_path,
         workbook_sheet=workbook_sheet,
         workbook_state=state,
@@ -209,6 +213,50 @@ def gather_preflight(
     result.finished_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     result.duration_s = time.monotonic() - started
     return result
+
+
+RECOVERY_NOTE_MAX_AGE_S = 900.0
+
+
+def recovery_note(monitor: Any) -> str:
+    """What the last sensor clock check did, when it was recent (added to the pre-flight's clock line)."""
+    from .ntp_recovery import COOLDOWN, NTP_IS_OFF, PC_UNTRUSTED, RESTORE_FAILED, SAVE_FAILED, STILL_WRONG, SYNCED
+
+    result = getattr(monitor, "last_result", None)
+    finished = getattr(monitor, "last_finished", None)
+    if result is None or finished is None or time.monotonic() - finished > RECOVERY_NOTE_MAX_AGE_S:
+        return ""
+    return {
+        SYNCED: "Corrected by an NTP refresh.",
+        STILL_WRONG: "An NTP refresh did not correct it.",
+        COOLDOWN: "An NTP refresh did not correct it.",
+        SAVE_FAILED: "The NTP refresh on the sensor failed.",
+        RESTORE_FAILED: "The sensor's NTP server list was not restored.",
+        NTP_IS_OFF: "NTP is off on the sensor.",
+        PC_UNTRUSTED: "This computer's clock is not verified, so NTP was not refreshed.",
+    }.get(result.outcome, "")
+
+
+def _clock_reading(clock: Any, elapsed_s: float, note: str) -> Any:
+    """The API's reading with its uncertainty: half the request's duration plus the page's 1 s."""
+    if clock is None or not getattr(clock, "available", False):
+        return clock
+    from .sensor_clock import STATUS_RESOLUTION_S, ClockReading
+
+    return ClockReading(
+        available=True,
+        sensor_utc=getattr(clock, "sensor_utc", None),
+        pc_utc=getattr(clock, "pc_utc", None),
+        offset_s=getattr(clock, "offset_s", None),
+        uncertainty_s=max(elapsed_s, 0.0) / 2 + STATUS_RESOLUTION_S,
+        rtt_s=max(elapsed_s, 0.0),
+        source=str(getattr(clock, "source", "") or ""),
+        time_source=str(getattr(clock, "time_source", "") or ""),
+        gnss_status=str(getattr(clock, "gnss_status", "") or ""),
+        warnings=list(getattr(clock, "warnings", None) or []),
+        error=str(getattr(clock, "error", "") or ""),
+        note=note,
+    )
 
 
 class _Blank:
@@ -258,8 +306,14 @@ def default_probes(host: Any, conn: Any) -> dict[str, Callable | None]:
                 now = datetime.now(timezone.utc)
                 return SensorClock(available=True, sensor_utc=now, pc_utc=now, offset_s=0.0, source="demo", time_source="demo")
             return None
+        # A wrong clock is corrected (when every rule allows it) before the pass, not during it.
+        monitor = getattr(host, "_clock_monitor", None)
+        if monitor is not None and not demo:
+            monitor.wait_for_check("collection pre-flight")
         client = make_client()
-        return client.fetch_sensor_clock(make_target(), getattr(conn, "http_password", ""))
+        started = time.monotonic()
+        clock = client.fetch_sensor_clock(make_target(), getattr(conn, "http_password", ""))
+        return _clock_reading(clock, time.monotonic() - started, recovery_note(monitor))
 
     def fetch_storage():
         from .sensor_storage import query_iq_storage

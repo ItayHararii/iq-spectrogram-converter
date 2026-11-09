@@ -2,9 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .constants import SFTP_REMDATA_ROOT
+
+# Sensor clock minus this computer's, while the sensor's clock is known to be
+# wrong: the sensor names its date folder by its own clock (2012-01-02 on
+# 9 Nov 2026), so "today" on the sensor is that folder. None when it is right.
+_sensor_clock_offset_s: float | None = None
+
+
+def set_sensor_clock_offset(seconds: float | None) -> None:
+    global _sensor_clock_offset_s
+    _sensor_clock_offset_s = None if seconds is None else float(seconds)
+
+
+def sensor_clock_offset() -> float | None:
+    return _sensor_clock_offset_s
 
 
 def today_remdata_directory(now: datetime | None = None) -> str:
@@ -16,7 +30,9 @@ def today_remdata_directory(now: datetime | None = None) -> str:
 
 
 def candidate_today_directories(now: datetime | None = None) -> list[str]:
-    """Local date first, then UTC date (CRFS filenames are often UTC)."""
+    """Local date first, then UTC date (CRFS filenames are often UTC).
+
+    While the sensor's clock is known to be wrong its own date comes first."""
     local = now if now is not None else datetime.now()
     if local.tzinfo is not None:
         utc = local.astimezone(timezone.utc)
@@ -24,8 +40,11 @@ def candidate_today_directories(now: datetime | None = None) -> list[str]:
     else:
         local_naive = local
         utc = datetime.now(timezone.utc)
+    dates = [local_naive, utc.replace(tzinfo=None)]
+    if _sensor_clock_offset_s is not None:
+        dates.insert(0, utc.replace(tzinfo=None) + timedelta(seconds=_sensor_clock_offset_s))
     paths: list[str] = []
-    for when in (local_naive, utc.replace(tzinfo=None)):
+    for when in dates:
         path = f"/mnt/1/remdata/{when:%Y%m%d}/"
         if path not in paths:
             paths.append(path)
@@ -49,7 +68,7 @@ def resolve_today_directory(
     primary = candidates[0]
     extra = ""
     if len(candidates) > 1:
-        extra = f" Also checked {candidates[1]} (UTC)."
+        extra = f" Also checked {', '.join(candidates[1:])}."
     fallback, message = resolve_start_directory(primary, False)
     if message:
         message = message.rstrip(".") + "." + extra

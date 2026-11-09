@@ -8,6 +8,9 @@ every launch, so this spec bundles only what the app imports:
   QML/Quick, 3D, Multimedia, Designer, or software OpenGL).
 - matplotlib with the Agg backend only (used for the short waterfall preview).
 - numpy, paramiko + cryptography (SFTP), requests, openpyxl, pywin32.
+- The IQ Spectrogram Converter engine (iq_data, iq_metadata from the folder
+  above this one) with soundfile + libsndfile, for the spectrogram of every
+  verified download. Its FFT falls back to numpy, so scipy stays out.
 
 It also embeds a Windows version resource (product name, company, version) so
 Explorer, Task Manager, and SmartScreen show a real name instead of blanks.
@@ -47,6 +50,10 @@ from PyInstaller.utils.win32.versioninfo import (
 
 block_cipher = None
 root = Path(SPECPATH)
+# The converter engine lives beside this folder; an EXE without it could not make spectrograms.
+ENGINE_DIR = root.parent
+if not all((ENGINE_DIR / name).is_file() for name in ("iq_data.py", "iq_metadata.py")):
+    raise SystemExit(f"Converter engine (iq_data.py, iq_metadata.py) not found in {ENGINE_DIR}.")
 
 APP_NAME = "CRFS IQ Recorder"
 COMPANY = "Sensorz"
@@ -192,6 +199,15 @@ hiddenimports += [
     "urllib3",
     "cryptography",
     "nacl",
+    # Spectrogram engine (run in the --spectrogram-job child process).
+    "iq_data",
+    "iq_metadata",
+    "soundfile",
+    "_soundfile_data",
+    "cffi",
+    "_cffi_backend",
+    "PIL.Image",
+    "PIL.PngImagePlugin",
 ]
 
 # Qt modules PyInstaller may otherwise pull in through package scanning.
@@ -277,7 +293,7 @@ excludes = [
 
 a = Analysis(
     [str(root / "run.py")],
-    pathex=[str(root)],
+    pathex=[str(root), str(ENGINE_DIR)],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,

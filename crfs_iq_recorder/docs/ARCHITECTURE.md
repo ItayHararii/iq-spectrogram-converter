@@ -1,6 +1,6 @@
 # CRFS IQ Recorder - architecture
 
-**Version documented:** 1.18.0
+**Version documented:** 1.19.0
 **Code:** `crfs_iq_recorder/` as of this file (6 November 2026). The Excel Collection rows below (called Cellular Collection before 1.13.0) describe the 1.13.0 design; `docs/CELLULAR_COLLECTION.md` has the detail.
 **Related app:** IQ Spectrogram Converter (`iq_gui.py`, `iq_data.py`) at the repository root
 
@@ -115,7 +115,13 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | Link monitor | HTTP reachability every 10 s; SFTP errors stay in Sensor Files. Each check, sensor-info refresh and mission-list read uses a one-shot client that closes its HTTP session on the worker thread (1.16.0: a window left open held one keep-alive socket per check, about 300 after 50 minutes) | `connection_monitor.py`, `gui.py` |
 | IQ storage | SFTP `statvfs` on `/mnt/1/remdata/`; block Start if the estimate plus margin would not fit | `sensor_storage.py` |
 | Recording history | Save requested Hz/time; match remote files to that Start | `recording_history.py` |
-| File watch | Stable SFTP size for every recording's parts, including the parts the sensor named in its EMP stream (1.8.10: always on, not only with Excel or Repeat) | `file_watch.py` |
+| File watch | Stable SFTP size for every recording's parts, including the parts the sensor named in its EMP stream (1.8.10: always on, not only with Excel or Repeat); the folders the sensor named (`file_dir`, part folders) are watched first, so a recording under a wrong-date folder is still confirmed (1.19.0) | `file_watch.py` |
+| Sensor clock | Offset of the sensor's status-page time (its own UTC offset parsed) against the PC request midpoint, uncertainty RTT/2 + 1 s; PC trusted by SNTP or `w32tm`; verdict correct / drifting / incorrect (> 120 s) (1.19.0) | `sensor_clock.py` |
+| NTP recovery | While idle and NTP is on: change-and-restore pair of the Network Time page's own Save (`original + [first server]`, then the original list, read back), persisted pending restore, 90 s verification with two correct readings, at most 2 pairs per episode then 30 min cooldown (`sensor_clock_recovery.json`) (1.19.0) | `ntp_recovery.py` |
+| Clock monitor | Triggers (connect, link check every 10 min, pre-flight, misdated EMP reply), idle gating and deferral, capture hold with watchdog, link checks ignored while the sensor saves its NTP page, sensor-date folder hint and discovery refresh (1.19.0) | `clock_monitor.py`, `gui.py` |
+| Spectrograms | Persisted queue of verified downloads; one below-normal child process at a time (`--spectrogram-job`, job object kills it with the app) running the Converter engine with its saved settings and the recording history; PNG + thumbnail in `<WAV folder>\Spectrograms\`; bounded retries (1.19.0) | `spectrogram_queue.py`, `spectrogram_job.py`, `iq_data.py` |
+| Excel thumbnails | IQ Spectrogram column right of IQ Recording (reused, or inserted once by Excel), pictures move-and-size with the row, found again by file name, one per part, link to the PNG (SharePoint URL only from a synced OneDrive mount), COM when open, openpyxl only when provably safe, busy/edit mode queued; filter-safe last row (COUNTA bisection) (1.19.0) | `excel_images.py`, `openpyxl_links.py`, `excel_com.py`, `cellular_workbook.py` |
+| Remote delete | Delete folder: confined strictly inside the recording root, links removed not followed, counted snapshot only, each item re-checked, refused while recording / collecting / downloading from it / written in the last 2 min, progress and partial-failure report (1.19.0) | `remote_delete.py`, `sftp_window.py`, `sftp_client.py` |
 | Merge engine | Parse RIFF/RF64 parts and the CRFS `meta` chunk, check format/tuning/numbering/continuity, chunked byte-exact concatenation to RIFF or RF64, JSON sidecar (1.8.10) | `iq_merge.py` |
 | Merge controller | Toggle state, queue, one worker thread, dedupe via `merge_history.json` and sidecars, cancel, `.partial` sweep on start (1.8.10) | `merge_controller.py` |
 | Programmatic capture | `MainWindow.start_capture(CaptureRequest)` drives the same Start path as the button; `capture_finished(CaptureSummary)` reports confirmed / unknown / not_sent / sensor_error / failed; an external owner blocks manual Start and the series (1.9.0) | `capture_api.py`, `gui.py` |
@@ -131,7 +137,7 @@ PNG copy for Confluence: [architecture-overview.png](architecture-overview.png).
 | Excel COM states | Tri-state workbook probe (`excel_workbook_state`: open/closed/busy) and `com_busy_reason` (RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER, cell edit mode 0x800AC472); a save counts only when `Workbook.Saved` is true; the results sheet of an open log workbook is added through Excel (`add_worksheet_com`) (1.15.0); `activate_workbook` brings a workbook the running Excel holds to the front for **Open written Excel file**, whose target is the workbook the queue last wrote (`WorkbookQueue.written_workbook`, persisted, independent of the workbook currently chosen) (1.16.0) | `excel_com.py`, `cellular_workbook.py`, `cellular_excel.py` |
 | XDAT header | Reads the `.xhdr` the Node writes beside each `.xdat` (sample count/rate, centre, bandwidth, `start_capture`, layout) into a `PartInfo` so measurement, verification, quality checks and previews treat XDAT like WAVE; decodes only the layout the header states (int16 interleaved I/Q), reports anything else as not decoded (1.15.0) | `xdat_header.py`, `capture_measure.py` |
 | Cellular panel | The Excel Collection tab (1.13.0): header with state badge, lazily built form, action bar pinned under the tab, plan preview, result card, pass summary with Retry failed rows, recovery notice (interrupted session: Check with the sensor / Continue / Skip uncertain; missed pass: Run now / Skip; unfinished downloads: Continue) | `cellular_panel.py`, `cellular_pickers.py` |
-| Sensor Files window | Listing, sort, groups, download, delete, waterfall; requested (**Req.**) and recorded columns side by side, recorded values from what was read from each file (1.14.0); **Local copy** column per file and group (Saved / Queued / Downloading with speed and time left only once measured / Waiting to retry / Verified / Failed), right-click Retry download / Open folder / Copy filename, selection count and total size, downloads into the mirrored dated folder, selection, scroll and expanded groups kept across refreshes, Ctrl+C copies names only inside the table (1.16.0) | `sftp_window.py`, `file_measurements.py`, `download_paths.py` |
+| Sensor Files window | Listing, sort, groups, download, delete, waterfall; requested (**Req.**) and recorded columns side by side, recorded values from what was read from each file (1.14.0); **Local copy** column per file and group (Saved / Queued / Downloading with speed and time left only once measured / Waiting to retry / Verified / Failed), right-click Retry download / Open folder / Copy filename, selection count and total size, downloads into the mirrored dated folder, selection, scroll and expanded groups kept across refreshes, Ctrl+C copies names only inside the table (1.16.0); right-click targets the row under the pointer or the selection that contains it, Download / Open folder / Copy filename / Delete from sensor / Delete folder, unavailable actions disabled with the reason, themed menu, verified downloads handed to the spectrogram queue (1.19.0) | `sftp_window.py`, `file_measurements.py`, `download_paths.py` |
 | SFTP backend | One listing thread and one SSH session for browse/delete | `sftp_window.py` (`SftpBackend`) |
 | SFTP client | Paramiko connect (8 s), read (20 s), download via `.part` | `sftp_client.py`, `download_util.py` |
 | Listing groups | `_0001` / `_0002` as one capture; NEW badge | `listing_sort.py` |
@@ -293,7 +299,10 @@ Matching: prefer a remembered `iq_stem`; otherwise the lead part's timestamp mus
 | Downloads | Settings folder, default `%USERPROFILE%\CRFS IQ Recorder\Recordings`, one subfolder per sensor date (`20261104\`) since 1.16.0; older flat copies recognised in place | configurable; cloud paths remapped to local | Yes |
 | Preview cache | Memory in `SftpWindow` | - | No |
 | Matplotlib cache | `%LOCALAPPDATA%\CRFS IQ Recorder\cache\matplotlib` | unused unless frozen | Yes |
-| Converter settings | `.iq_gui_settings.json` next to the Converter | same | Separate app |
+| Converter settings | `.iq_gui_settings.json` next to the Converter (read by the Recorder's spectrograms when found near the app, or via `IQ_GUI_SETTINGS`) | same | Separate app |
+| Spectrogram queue | `spectrograms.json`, `spectrogram_jobs\`, `.iq_eta_calibration.json` in the config folder; pending thumbnails in `cellular\workbook_queue.json` (`images`, `roles`) | same | Yes; an interrupted conversion runs again (1.19.0) |
+| Spectrogram images | `<download folder>\<date>\Spectrograms\<name>.png` / `.thumb.png` | same | Yes |
+| Clock recovery | `sensor_clock_recovery.json` in the config folder (attempts, cooldown, pending restore per sensor) | same | Yes (1.19.0) |
 | Demo SFTP | In-memory | - | No |
 
 Settings, recording history and the Excel queue are written through `json_store.write_json`: the document goes to `<name>.<pid>.tmp` and is moved over the live file (`os.replace`), and the previous document is kept as `<name>.bak`. A kill or power loss mid-write therefore leaves the old or the new file, never an empty one; if the live file is unreadable at startup the `.bak` copy is loaded instead and the next save repairs the live file.
@@ -310,7 +319,7 @@ Crash during download leaves a `.part` file; the next successful download finali
 | Input | SFTP prefix, max 786,432 bytes, 131,072 samples | Whole WAV, chunked |
 | Plot | Waterfall only, 256-point FFT, jet | Spectrum + spectrogram, RBW-based FFT |
 | Axis | Baseband `±fs/2` | Same IF axis (not EMP MHz) |
-| Shared code | Imports `iq_data` helpers when **not** frozen; EXE uses a local STFT copy | `iq_data.py` |
+| Shared code | Preview: imports `iq_data` helpers when **not** frozen; EXE uses a local STFT copy. Spectrograms (1.19.0): the EXE bundles `iq_data` / `iq_metadata` and runs `iq_data.process_file` in a child process (numpy FFT when scipy is absent) | `iq_data.py` |
 
 Typical field path: Recorder download folder → copy or save into the Converter input folder (this repo's launchers use `IQ Collection` / `IQ Results` next to the Converter). Folders are settings, not hardcoded drive letters in shared code.
 

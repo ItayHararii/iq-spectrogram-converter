@@ -115,8 +115,10 @@ def ensure_results_sheet(store: ExcelLogStore, workbook: Path, sheet: str = RESU
             return True
         raise ExcelBusyError(f"{workbook.name} is open in Excel; the results sheet is created when Excel is free.")
     store.ensure_backup(workbook)
+    from .openpyxl_links import load_workbook_keeping_links
+
     try:
-        wb = load_workbook(workbook, keep_vba=workbook.suffix.casefold() == ".xlsm")
+        wb = load_workbook_keeping_links(workbook, keep_vba=workbook.suffix.casefold() == ".xlsm")
     except PermissionError as exc:
         raise ExcelBusyError(f"Could not open {workbook.name}. It may be open in Excel.") from exc
     try:

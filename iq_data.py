@@ -32,11 +32,31 @@ def _plt():
     return _plt_mod
 
 
+def _numpy_fft(x, n=None, axis=-1, workers=None, overwrite_x=False):
+    """scipy.fft.fft stand-in for builds without scipy (one thread, same spectrum)."""
+    return np.fft.fft(x, n=n, axis=axis)
+
+
+def _numpy_get_window(window, nx, fftbins=True):
+    """scipy.signal.windows.get_window stand-in: periodic Blackman-Harris only."""
+    if window != "blackmanharris":
+        raise ValueError(f"window {window!r} needs scipy")
+    coefs = (0.35875, 0.48829, 0.14128, 0.01168)
+    m = int(nx) + 1 if fftbins else int(nx)
+    fac = np.linspace(-np.pi, np.pi, m)
+    w = np.zeros(m)
+    for k, coef in enumerate(coefs):
+        w += coef * np.cos(k * fac)
+    return w[:-1] if fftbins else w
+
+
 def _fft():
     global _fft_fn
     if _fft_fn is None:
-        from scipy.fft import fft
-
+        try:
+            from scipy.fft import fft
+        except ImportError:
+            fft = _numpy_fft
         _fft_fn = fft
     return _fft_fn
 
@@ -44,10 +64,17 @@ def _fft():
 def _get_window():
     global _get_window_fn
     if _get_window_fn is None:
-        from scipy.signal.windows import get_window
-
+        try:
+            from scipy.signal.windows import get_window
+        except ImportError:
+            get_window = _numpy_get_window
         _get_window_fn = get_window
     return _get_window_fn
+
+
+def fft_backend():
+    """'scipy' or 'numpy': which FFT this process uses."""
+    return "numpy" if _fft() is _numpy_fft else "scipy"
 
 
 def preload_engine():
@@ -74,6 +101,10 @@ FIGSIZE = (12.0, 8.0)
 SPECTRUM_HEIGHT_RATIO = 1
 WATERFALL_HEIGHT_RATIO = 3
 SAVE_DPI = 125
+# Spectrogram-only preview for tables (no axes, text or markers): the PNG's
+# display grid, colormap and dB limits at a fixed size, 2:1 like its spectrogram panel.
+THUMBNAIL_SIZE = (320, 160)
+THUMBNAIL_COLORS = 128
 ALLOWED_CMAPS = ("jet", "turbo", "viridis", "gray")
 SPECTRUM_COLOR = "#1f77b4"
 SPECTRUM_HOLD_COLOR = "#e07a3d"
@@ -114,6 +145,10 @@ def _app_dir():
 
 
 def _calibration_path():
+    # A host that bundles the engine keeps the file in its own settings folder.
+    override = os.environ.get("IQ_ETA_CALIBRATION", "").strip()
+    if override:
+        return Path(override)
     return _app_dir() / CALIBRATION_NAME
 
 
@@ -1017,6 +1052,67 @@ def _save_spectrogram_png(fig, output_dir, out_name, cancel_event=None):
     return out_path
 
 
+def _thumbnail_rgb(power_db, cmap, vmin, vmax, size):
+    """(height, width, 3) uint8 image of the display grid: frequency left to right, time upwards.
+
+    Peak-hold pooling down to about twice the size, then an area average, so a
+    narrow carrier stays visible at thumbnail size.
+    """
+    import matplotlib
+    from matplotlib.colors import Normalize
+    from PIL import Image
+
+    width, height = (int(v) for v in size)
+    if width < 8 or height < 8:
+        raise ValueError("Thumbnail size must be at least 8 x 8 pixels.")
+    grid = np.asarray(power_db, dtype=np.float32)  # (frequency, time)
+    f_factor = grid.shape[0] // (2 * width)
+    if f_factor > 1:
+        grid = _max_pool_axis0(grid, grid.shape[0] // f_factor)
+    t_factor = grid.shape[1] // (2 * height)
+    if t_factor > 1:
+        grid = _max_pool_axis0(np.ascontiguousarray(grid.T), grid.shape[1] // t_factor).T
+    finite = grid[np.isfinite(grid)]
+    lo = float(vmin) if vmin is not None else (float(finite.min()) if finite.size else 0.0)
+    hi = float(vmax) if vmax is not None else (float(finite.max()) if finite.size else lo + 1.0)
+    image = Image.fromarray(np.ascontiguousarray(grid.T[::-1], dtype=np.float32))
+    values = np.asarray(image.resize((width, height), Image.Resampling.BOX), dtype=np.float32)
+    rgba = matplotlib.colormaps[cmap](Normalize(vmin=lo, vmax=hi, clip=True)(values), bytes=True)
+    return np.ascontiguousarray(rgba[..., :3])
+
+
+def _save_thumbnail_png(rgb, output_dir, name, cancel_event=None):
+    """Palette PNG of the thumbnail, written to a temp file and moved into place like the full PNG."""
+    from PIL import Image
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, name)
+    tmp_path = os.path.join(output_dir, f".iq_{os.getpid()}_{time.time_ns() % 1_000_000}.thumb.part.png")
+    try:
+        image = Image.fromarray(rgb).quantize(colors=THUMBNAIL_COLORS, dither=Image.Dither.NONE)
+        image.save(tmp_path, format="PNG", optimize=True)
+        if cancel_event is not None and cancel_event.is_set():
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise ConversionCancelled("Conversion cancelled.")
+        os.replace(tmp_path, out_path)
+    except OSError as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        if _write_denied(exc):
+            raise PermissionError(
+                f"Cannot write {name}. Close the PNG if it is open in another app, "
+                "check that the output folder is not read-only, then try again."
+            ) from exc
+        raise
+    return out_path
+
+
 def validate_rbw(rbw):
     """Return rbw as a positive finite float or raise ValueError with a user message."""
     try:
@@ -1043,6 +1139,9 @@ def process_file(
     stats=None,
     range_markers=True,
     recorder_history=None,
+    thumbnail_name=None,
+    thumbnail_size=None,
+    title_centre=False,
 ):
     """Convert one stereo IQ WAV to <output_dir>/<stem>.png and return the PNG path.
 
@@ -1060,6 +1159,10 @@ def process_file(
     whenever the file's centre frequency is verified, either way.
     recorder_history: CRFS IQ Recorder history file to look requests up in;
     None uses IQ_RECORDER_HISTORY or this PC's Recorder (if installed).
+    thumbnail_name: also write <output_dir>/<thumbnail_name>, the spectrogram
+    alone (no axes, text or markers) at thumbnail_size (width, height) pixels,
+    default THUMBNAIL_SIZE; its path goes to stats["thumbnail_path"].
+    title_centre: put the centre frequency (or "centre unknown") in the title.
     None of this changes the samples, the FFT or any computed value.
     """
 
@@ -1079,6 +1182,13 @@ def process_file(
     out_name = str(output_name).strip() if output_name else Path(path).stem + ".png"
     if not out_name.lower().endswith(".png"):
         out_name += ".png"
+    thumb_name = str(thumbnail_name).strip() if thumbnail_name else None
+    if thumb_name:
+        if not thumb_name.lower().endswith(".png"):
+            thumb_name += ".png"
+        if thumb_name.casefold() == out_name.casefold():
+            raise ValueError("The thumbnail needs a file name of its own.")
+    thumb_size = tuple(thumbnail_size) if thumbnail_size else THUMBNAIL_SIZE
 
     t0 = time.perf_counter()
     try:
@@ -1367,7 +1477,16 @@ def process_file(
                 else None,
             }
         )
-    title = f"{Path(path).name}  ·  RBW {rbw_label}{part_label}"
+    centre_label = ""
+    if title_centre:
+        if plan["absolute"]:
+            centre_label = f"  ·  centre {_fmt_freq(plan['centre_hz'], f_scale)} {f_unit}"
+        else:
+            centre_label = "  ·  centre unknown"
+    title = f"{Path(path).name}{centre_label}  ·  RBW {rbw_label}{part_label}"
+    if stats is not None:
+        stats["title"] = title
+    thumb_path = None
     try:
         fig, (ax_spec, ax_wf) = plt.subplots(
             2,
@@ -1451,12 +1570,16 @@ def process_file(
             stats["range_lines"] = [{k: v for k, v in line.items() if k != "artist"} for line in drawn["lines"]]
             stats["range_tag_rows"] = drawn["tag_rows"]
             stats["layout"] = _layout_boxes(fig, ax_spec, ax_wf, cbar, drawn)
+        thumb_rgb = _thumbnail_rgb(power_db, cmap, vmin, vmax, thumb_size) if thumb_name else None
         del power_db, peak_db, mean_db
         check_cancel()
         report(0.95, "Saving PNG…")
         out_path = _save_spectrogram_png(fig, output_dir, out_name, cancel_event)
         print(f"  Saved          : {out_name}")
         print("  Layout         : spectrum + spectrogram")
+        if thumb_rgb is not None:
+            thumb_path = _save_thumbnail_png(thumb_rgb, output_dir, thumb_name, cancel_event)
+            print(f"  Thumbnail      : {thumb_name} ({thumb_rgb.shape[1]} x {thumb_rgb.shape[0]} px, spectrogram only)")
         marked = [b for b in plan["boundaries"]]
         if marked:
             parts = []
@@ -1484,6 +1607,7 @@ def process_file(
     _update_eta_calibration(raw_est, time.perf_counter() - t0)
     if stats is not None:
         stats["out_path"] = out_path
+        stats["thumbnail_path"] = thumb_path
     report(1.0, "Done")
     return out_path
 
@@ -1507,6 +1631,12 @@ if __name__ == "__main__":
         "or this PC's Recorder)",
     )
     parser.add_argument("--no-range-markers", action="store_true", help="Do not mark requested / sensor-reported ranges")
+    parser.add_argument(
+        "--thumbnail",
+        action="store_true",
+        help=f"Also write <stem>.thumb.png: the spectrogram alone, {THUMBNAIL_SIZE[0]}x{THUMBNAIL_SIZE[1]} px",
+    )
+    parser.add_argument("--title-centre", action="store_true", help="Show the centre frequency in the title")
     args = parser.parse_args()
 
     db_auto = args.db_min is None and args.db_max is None
@@ -1523,6 +1653,8 @@ if __name__ == "__main__":
             db_vmax=args.db_max,
             range_markers=not args.no_range_markers,
             recorder_history=args.recorder_history,
+            thumbnail_name=f"{Path(wav_path).stem}.thumb.png" if args.thumbnail else None,
+            title_centre=args.title_centre,
         )
 
     if args.input:

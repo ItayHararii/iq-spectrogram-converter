@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from .excel_writer import ExcelBusyError, ExcelRow, format_playback_duration
@@ -48,9 +50,25 @@ OPEN = "open"
 CLOSED = "closed"
 BUSY = "busy"
 
+_workbook_locks: dict[str, threading.RLock] = {}
+_workbook_locks_guard = threading.Lock()
+
 
 def _norm(path: Path) -> str:
     return str(path.resolve()).casefold()
+
+
+@contextmanager
+def workbook_lock(path: Path):
+    """One writer per workbook in this process: rows and spectrogram pictures flush on different workers."""
+    try:
+        key = _norm(Path(path))
+    except (OSError, ValueError):
+        key = str(path).casefold()
+    with _workbook_locks_guard:
+        lock = _workbook_locks.setdefault(key, threading.RLock())
+    with lock:
+        yield
 
 
 def _same_file(display_name: str, want: str) -> bool:
@@ -354,13 +372,61 @@ def _header_map(sheet) -> dict[str, int]:
     return found
 
 
+def sheet_filtered(sheet) -> bool:
+    """True when a sheet or table filter hides rows (or Excel cannot say)."""
+    try:
+        if bool(sheet.FilterMode):
+            return True
+    except Exception:  # noqa: BLE001
+        return True
+    try:
+        tables = sheet.ListObjects
+        for index in range(1, int(tables.Count) + 1):
+            auto = tables(index).AutoFilter
+            if auto is not None and bool(auto.FilterMode):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def last_row_counting(sheet, columns: int) -> int:
+    """Last row with a value in columns 1..columns, rows a filter hides included.
+
+    COUNTA counts hidden cells, so a bisection over UsedRange needs about 20
+    calls even when stray formatting stretches it to row 1,048,576.
+    """
+    width = max(1, int(columns))
+    used = sheet.UsedRange
+    bottom = max(1, int(used.Row) + int(used.Rows.Count) - 1)
+    count = sheet.Application.WorksheetFunction.CountA
+
+    def any_value(first: int) -> bool:
+        return int(count(sheet.Range(sheet.Cells(first, 1), sheet.Cells(bottom, width)))) > 0
+
+    if bottom <= 1 or not any_value(2):
+        return 1
+    low, high = 2, bottom
+    while low < high:
+        mid = (low + high + 1) // 2
+        if any_value(mid):
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
 def _last_used_row(sheet, columns: int) -> int:
     """Last row with a value. UsedRange can reach row 1,048,576 after stray formatting.
 
     Walking UsedRange cell by cell over COM takes minutes on such a sheet and
     blocks the UI. Excel's own Find (searching backwards from A1) returns the
-    last non-empty cell in one call.
+    last non-empty cell in one call - but only while no filter hides rows: on
+    a filtered sheet it answered row 1 (Excel 365, 9 Nov 2026), and appending
+    after that would overwrite row 2.
     """
+    if sheet_filtered(sheet):
+        return last_row_counting(sheet, columns)
     try:
         found = sheet.Cells.Find(
             What="*",

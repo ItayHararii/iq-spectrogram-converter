@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
@@ -293,8 +294,11 @@ def workbook_has_iq_filename(path: Path, sheet: str, filename: str) -> bool:
 def append_rows_openpyxl(path: Path, rows: list[ExcelRow]) -> list[int]:
     if not rows:
         return []
+    from .openpyxl_links import load_workbook_keeping_links
+
     try:
-        workbook = _load_workbook(path, keep_vba=True)
+        # Spectrogram thumbnails (and any other linked picture) keep their click links.
+        workbook = load_workbook_keeping_links(path, keep_vba=True)
     except PermissionError as exc:
         raise ExcelBusyError(f"Could not open {path.name}. It may be open in Excel.") from exc
     try:
@@ -303,10 +307,18 @@ def append_rows_openpyxl(path: Path, rows: list[ExcelRow]) -> list[int]:
             if row.worksheet not in workbook.sheetnames:
                 raise ValueError(f"Workbook has no worksheet named {row.worksheet!r}.")
             written.append(append_iq_row(workbook[row.worksheet], row))
+        temp = path.with_name(f"{path.stem}.crfs-tmp-{os.getpid()}{path.suffix}")
         try:
-            workbook.save(path)
+            workbook.save(temp)
+            os.replace(temp, path)
         except PermissionError as exc:
             raise ExcelBusyError(f"Could not save {path.name}. Excel may have it open.") from exc
+        finally:
+            try:
+                if temp.exists():
+                    temp.unlink()
+            except OSError:
+                pass
         return written
     finally:
         vba = getattr(workbook, "vba_archive", None)

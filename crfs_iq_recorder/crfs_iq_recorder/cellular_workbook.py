@@ -2,8 +2,11 @@
 
 The worksheet keeps its nine columns (Band, Direction, Duplex, Freq Start,
 Freq Stop, Sensor, IQ Recording, IQ Duration (s), Recording Date & Time; the
-last four are filled when present). Nothing is appended to the right and no
-other sheet is written.
+last four are filled when present). The one exception is the "IQ Spectrogram"
+column directly right of IQ Recording, which holds spectrogram thumbnails
+(excel_images); it is reused, taken when that column is free, or inserted
+once. Results find their columns by header text afterwards (settle_layout),
+so the insert does not shift them. No other sheet is written.
 
 Blocks. The protocol rows read at import time are *block 0*: the plan. The
 first pass fills their result cells in place when they are still empty.
@@ -36,7 +39,7 @@ import os
 import re
 import threading
 from copy import copy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -53,6 +56,7 @@ from .excel_com import (
     _norm,
     com_busy_reason,
     excel_workbook_state,
+    workbook_lock,
 )
 from .excel_writer import ExcelBusyError, backup_workbook
 from .json_store import read_json, write_json
@@ -61,6 +65,9 @@ from .xdat_header import is_xdat_sidecar
 
 QUEUE_SCHEMA = 1
 QUEUE_FILENAME = "workbook_queue.json"
+# Spectrogram pictures waiting for their rows (bounded), and the ones already placed (dedupe).
+MAX_PENDING_IMAGES = 2000
+MAX_DONE_IMAGES = 20000
 DATETIME_FORMAT = "dd/mm/yyyy hh:mm:ss"
 DURATION_FORMAT = "0.000"
 # Written into the time cell when the sensor gave no timestamp for the files
@@ -73,6 +80,22 @@ _SENSOR_HEADERS = {
 }
 _STEM_UTC = re.compile(r"(?:^|_)(\d{8})_(\d{6})(?:_|$)")
 _EXCEL_EPOCH = datetime(1899, 12, 30)
+
+
+def _norm_text(path: str) -> str:
+    try:
+        return _norm(Path(path))
+    except (OSError, ValueError):
+        return str(path).casefold()
+
+
+def _sheet_key(workbook: Path | str, worksheet: str) -> str:
+    return f"{_norm_text(str(workbook))}|{str(worksheet).casefold()}"
+
+
+def image_key(workbook: Path | str, worksheet: str, filename: str) -> str:
+    """Identity of one spectrogram picture: (workbook full path, sheet, IQ part file)."""
+    return f"{_sheet_key(workbook, worksheet)}|{str(filename).casefold()}"
 
 
 class WorkbookError(RuntimeError):
@@ -532,16 +555,31 @@ class _ComSheet:
     def copy_cells(self, src_row: int, dst_row: int, first_col: int, last_col: int, *, values: bool) -> None:
         source = self.sheet.Range(self.sheet.Cells(src_row, first_col), self.sheet.Cells(src_row, last_col))
         target = self.sheet.Range(self.sheet.Cells(dst_row, first_col), self.sheet.Cells(dst_row, last_col))
-        if values:
-            # Copy(Destination) carries values and formats without the clipboard.
-            source.Copy(target)
-        else:
-            source.Copy()
-            target.PasteSpecial(Paste=-4122)  # xlPasteFormats
-            try:
-                self.sheet.Application.CutCopyMode = False
-            except Exception:  # noqa: BLE001
-                pass
+        # A plan row of an earlier round carries its spectrogram pictures; the new block must not get copies.
+        app = objects = None
+        try:
+            app = self.sheet.Application
+            objects = app.CopyObjectsWithCells
+            app.CopyObjectsWithCells = False
+        except Exception:  # noqa: BLE001
+            objects = None
+        try:
+            if values:
+                # Copy(Destination) carries values and formats without the clipboard.
+                source.Copy(target)
+            else:
+                source.Copy()
+                target.PasteSpecial(Paste=-4122)  # xlPasteFormats
+                try:
+                    self.sheet.Application.CutCopyMode = False
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
+            if app is not None and objects is not None:
+                try:
+                    app.CopyObjectsWithCells = objects
+                except Exception:  # noqa: BLE001
+                    pass
 
     def clear(self, row: int, col: int) -> None:
         self.sheet.Cells(row, col).ClearContents()
@@ -554,6 +592,10 @@ class _ComSheet:
         self.sheet.Rows(row).RowHeight = _row_height(lines, current)
 
     def last_used_row(self, columns: Iterable[int]) -> int:
+        from .excel_com import last_row_counting, sheet_filtered  # noqa: PLC0415
+
+        if sheet_filtered(self.sheet):  # Find skips rows a filter hides: appended blocks would land on row 2
+            return last_row_counting(self.sheet, max([c for c in columns if c] or [1]))
         try:
             found = self.sheet.Cells.Find(
                 What="*", After=self.sheet.Cells(1, 1), LookIn=XL_FORMULAS, LookAt=XL_PART,
@@ -696,6 +738,57 @@ class WriteReport:
     conflicts: list[tuple[str, int]] = field(default_factory=list)  # ... because the row holds other entries
     blocks: dict[str, BlockRef] = field(default_factory=dict)
     last_row: int = 0
+    # Header text of each role column as written now (see settle_layout).
+    roles: dict[str, str] = field(default_factory=dict)
+
+
+_ROLE_FIELDS = ("band", "direction", "duplex", "start", "stop", "sensor", "result", "duration", "time")
+_HEADER_SCAN_EXTRA = 16
+
+
+def _same_header(a: Any, b: Any) -> bool:
+    return re.sub(r"\s+", " ", _text(a)).casefold() == re.sub(r"\s+", " ", _text(b)).casefold()
+
+
+def settle_layout(sheet, layout: SheetLayout, roles: dict[str, str] | None) -> tuple[SheetLayout, dict[str, str]]:
+    """The layout with every role column found again by its header text, and those texts.
+
+    ``roles`` is the header text each role had when results were last written.
+    A column inserted since then (the "IQ Spectrogram" column, or one the
+    operator added) moves the columns right of it; they are followed by name
+    so a duration never lands in a neighbour's column. Without ``roles`` (the
+    first write) the imported layout is taken as it is.
+    """
+    header = layout.header_row
+    columns = {name: getattr(layout, name) for name in _ROLE_FIELDS if getattr(layout, name)}
+    if not roles:
+        return layout, {name: _text(sheet.value(header, col)) for name, col in columns.items()}
+    limit = max(layout.last_column, *(columns.values() or [1])) + _HEADER_SCAN_EXTRA
+    cache: dict[int, Any] = {}
+
+    def at(col: int) -> Any:
+        if col not in cache:
+            cache[col] = sheet.value(header, col)
+        return cache[col]
+
+    moved: dict[str, int] = {}
+    for name, col in columns.items():
+        want = roles.get(name)
+        if not want or _same_header(at(col), want):
+            continue
+        hits = [c for c in range(1, limit + 1) if _same_header(at(c), want)]
+        if len(hits) == 1:
+            moved[name] = hits[0]
+    if moved:
+        shift = max(0, *(moved[name] - columns[name] for name in moved))
+        last = layout.last_column + shift
+        for col in range(limit, last, -1):
+            if _text(at(col)):
+                last = col
+                break
+        layout = replace(layout, last_column=max(last, *moved.values()), **moved)
+        columns.update(moved)
+    return layout, {name: _text(at(col)) for name, col in columns.items()}
 
 
 def _write_row(sheet, layout: SheetLayout, row: int, result: RowResult) -> tuple[bool, str | None]:
@@ -753,9 +846,11 @@ def apply_results(
     plan: list[PlanRow],
     results: list[RowResult],
     blocks: dict[str, BlockRef],
+    roles: dict[str, str] | None = None,
 ) -> WriteReport:
     """Reconcile and write every result into the sheet (no save here)."""
     report = WriteReport(blocks=dict(blocks))
+    layout, report.roles = settle_layout(sheet, layout, roles)
     if not plan:
         report.skipped.extend(f"{r.round_id}: the plan has no rows" for r in results)
         return report
@@ -805,20 +900,29 @@ def apply_results(
     return report
 
 
-def write_results_openpyxl(path: Path, *, layout: SheetLayout, plan: list[PlanRow], results: list[RowResult], blocks: dict[str, BlockRef]) -> WriteReport:
+def write_results_openpyxl(
+    path: Path,
+    *,
+    layout: SheetLayout,
+    plan: list[PlanRow],
+    results: list[RowResult],
+    blocks: dict[str, BlockRef],
+    roles: dict[str, str] | None = None,
+) -> WriteReport:
     """Write through openpyxl with an atomic save; raises ExcelBusyError when the file is locked."""
-    from openpyxl import load_workbook
+    from .openpyxl_links import load_workbook_keeping_links
 
     file = Path(path)
     keep_vba = file.suffix.casefold() == ".xlsm"
     try:
-        workbook = load_workbook(file, keep_vba=keep_vba)
+        # Spectrogram thumbnails keep their click links through the save.
+        workbook = load_workbook_keeping_links(file, keep_vba=keep_vba)
     except PermissionError as exc:
         raise ExcelBusyError(f"Could not open {file.name}: {_busy_reason(exc)}") from exc
     try:
         if layout.worksheet not in workbook.sheetnames:
             raise WorkbookError(f"Worksheet {layout.worksheet!r} is not in {file.name}.")
-        report = apply_results(_OpenpyxlSheet(workbook[layout.worksheet]), layout=layout, plan=plan, results=results, blocks=blocks)
+        report = apply_results(_OpenpyxlSheet(workbook[layout.worksheet]), layout=layout, plan=plan, results=results, blocks=blocks, roles=roles)
         if report.written or report.blocks != blocks:
             temp = file.with_name(f"{file.stem}.crfs-tmp-{os.getpid()}{file.suffix}")
             try:
@@ -843,7 +947,15 @@ def write_results_openpyxl(path: Path, *, layout: SheetLayout, plan: list[PlanRo
         workbook.close()
 
 
-def write_results_com(path: Path, *, layout: SheetLayout, plan: list[PlanRow], results: list[RowResult], blocks: dict[str, BlockRef]) -> WriteReport:
+def write_results_com(
+    path: Path,
+    *,
+    layout: SheetLayout,
+    plan: list[PlanRow],
+    results: list[RowResult],
+    blocks: dict[str, BlockRef],
+    roles: dict[str, str] | None = None,
+) -> WriteReport:
     """Write into the workbook as it is open in the running Excel instance, then save it there."""
     try:
         import win32com.client  # type: ignore
@@ -885,7 +997,7 @@ def write_results_com(path: Path, *, layout: SheetLayout, plan: list[PlanRow], r
             raise ExcelBusyError(f"{com_busy_reason(exc) or 'Excel refused the call'}; {Path(path).name} is written when Excel is free.") from exc
         try:
             try:
-                report = apply_results(_ComSheet(sheet), layout=layout, plan=plan, results=results, blocks=blocks)
+                report = apply_results(_ComSheet(sheet), layout=layout, plan=plan, results=results, blocks=blocks, roles=roles)
             except Exception as exc:  # noqa: BLE001
                 reason = com_busy_reason(exc)
                 if reason:
@@ -998,6 +1110,10 @@ class WorkbookQueue:
         data.setdefault("backups", {})
         data.setdefault("written", [])
         data.setdefault("conflicts", [])
+        data.setdefault("roles", {})
+        data.setdefault("images", [])
+        data.setdefault("images_done", {})
+        data.setdefault("images_failed", [])
         return data
 
     def _save(self) -> None:
@@ -1109,7 +1225,11 @@ class WorkbookQueue:
                 # A result already in the sheet unchanged counts as written too (row 0: not changed now).
                 key = (item.result.round_id, item.result.plan_index)
                 self._data["written"].append(
-                    {"round_id": key[0], "plan_index": key[1], "row": rows.get(key, 0), "at": now, "workbook": str(item.workbook)}
+                    {
+                        "round_id": key[0], "plan_index": key[1], "row": rows.get(key, 0), "at": now, "workbook": str(item.workbook),
+                        # Where each IQ file went, so its spectrogram finds the row later.
+                        "sheet": item.layout.worksheet, "header_row": item.layout.header_row, "files": list(item.result.files),
+                    }
                 )
             self._data["conflicts"] = [
                 c for c in self._data.get("conflicts") or []
@@ -1149,6 +1269,156 @@ class WorkbookQueue:
             self._data["pending"] = [p for p in self._data["pending"] if (p.get("result") or {}).get("round_id") != round_id]
             self._save()
             return before - len(self._data["pending"])
+
+    # ---- protocol columns
+    def roles_for(self, workbook: Path, worksheet: str) -> dict[str, str]:
+        with self._lock:
+            return dict(self._data["roles"].get(_sheet_key(workbook, worksheet)) or {})
+
+    def record_roles(self, workbook: Path, worksheet: str, roles: dict[str, str]) -> None:
+        if not roles:
+            return
+        key = _sheet_key(workbook, worksheet)
+        with self._lock:
+            if self._data["roles"].get(key) != roles:
+                self._data["roles"][key] = dict(roles)
+                self._save()
+
+    def rows_listing(self, filename: str) -> list[dict[str, Any]]:
+        """Protocol rows that list this IQ file: {workbook, sheet, header_row, iq_header, iq_col, row, queued}."""
+        want = str(filename or "").casefold()
+        return self.rows_listing_many({want}).get(want, []) if want else []
+
+    def rows_listing_many(self, names: set[str]) -> dict[str, list[dict[str, Any]]]:
+        """rows_listing for several (case-folded) file names in one pass."""
+        found: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
+        if not names:
+            return {}
+        with self._lock:
+            for item in self._data["pending"]:
+                files = [str(f).casefold() for f in (item.get("result") or {}).get("files") or []]
+                hits = [f for f in files if f in names]
+                if not hits:
+                    continue
+                layout = item.get("layout") or {}
+                sheet = str(layout.get("worksheet") or "")
+                book = str(item.get("workbook") or "")
+                for name in hits:
+                    found.setdefault(name, {})[(_norm_text(book), sheet.casefold())] = {
+                        "workbook": book, "sheet": sheet, "header_row": int(layout.get("header_row") or 1),
+                        "iq_col": int(layout.get("result") or 0), "row": 0, "queued": True,
+                    }
+            for entry in reversed(self._data["written"]):
+                hits = [f for f in (str(x).casefold() for x in entry.get("files") or []) if f in names]
+                book, sheet = str(entry.get("workbook") or ""), str(entry.get("sheet") or "")
+                if not hits or not book or not sheet:
+                    continue
+                for name in hits:
+                    found.setdefault(name, {}).setdefault((_norm_text(book), sheet.casefold()), {
+                        "workbook": book, "sheet": sheet, "header_row": int(entry.get("header_row") or 1),
+                        "iq_col": 0, "row": int(entry.get("row") or 0), "queued": False,
+                    })
+            out: dict[str, list[dict[str, Any]]] = {}
+            for name, rows in found.items():
+                for target in rows.values():
+                    roles = self._data["roles"].get(_sheet_key(Path(target["workbook"]), target["sheet"])) or {}
+                    target["iq_header"] = str(roles.get("result") or "")
+                out[name] = list(rows.values())
+        return out
+
+    # ---- spectrogram pictures
+    def enqueue_image(self, item: dict[str, Any]) -> bool:
+        """Queue one thumbnail for one row; the same (workbook, sheet, file) replaces its older entry.
+
+        False when that exact thumbnail is already in the sheet (dedupe across retries and restarts).
+        """
+        key = image_key(item["workbook"], item["sheet"], item["file"])
+        stamp = str(item.get("thumb_stamp") or "")
+        entry = dict(item, key=key)
+        entry.setdefault("queued_at", datetime.now().isoformat(timespec="seconds"))
+        entry.setdefault("attempts", 0)
+        with self._lock:
+            if stamp and self._data["images_done"].get(key) == stamp:
+                return False
+            images = self._data["images"]
+            for index, existing in enumerate(images):
+                if existing.get("key") == key:
+                    entry["queued_at"] = existing.get("queued_at") or entry["queued_at"]
+                    images[index] = entry
+                    break
+            else:
+                images.append(entry)
+                if len(images) > MAX_PENDING_IMAGES:
+                    del images[: len(images) - MAX_PENDING_IMAGES]
+            self._save()
+            return True
+
+    def pending_images(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in self._data["images"]]
+
+    def image_count(self) -> int:
+        with self._lock:
+            return len(self._data["images"])
+
+    def image_done(self, key: str) -> bool:
+        with self._lock:
+            return key in self._data["images_done"]
+
+    def failed_images(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in self._data["images_failed"]]
+
+    def mark_images(self, outcomes: Iterable[Any], *, max_attempts: int = 5) -> list[dict[str, Any]]:
+        """Apply write outcomes (excel_images.ImageOutcome); returns the items given up on now."""
+        given_up: list[dict[str, Any]] = []
+        now = datetime.now().isoformat(timespec="seconds")
+        by_key = {o.key: o for o in outcomes}
+        if not by_key:
+            return given_up
+        with self._lock:
+            keep: list[dict[str, Any]] = []
+            for item in self._data["images"]:
+                outcome = by_key.get(item.get("key"))
+                if outcome is None:
+                    keep.append(item)
+                    continue
+                if outcome.status == "written":
+                    self._data["images_done"][item["key"]] = str(item.get("thumb_stamp") or now)
+                    continue
+                if outcome.status == "skipped":
+                    given_up.append(dict(item, last_error=outcome.note, at=now))
+                    continue
+                item["last_error"] = outcome.note[:300]
+                item["last_try"] = now
+                if outcome.status == "failed":
+                    item["attempts"] = int(item.get("attempts") or 0) + 1
+                    if item["attempts"] >= max_attempts:
+                        given_up.append(dict(item, at=now))
+                        continue
+                keep.append(item)
+            self._data["images"] = keep
+            if given_up:
+                self._data["images_failed"] = (self._data["images_failed"] + given_up)[-500:]
+            done = self._data["images_done"]
+            if len(done) > MAX_DONE_IMAGES:
+                for stale in list(done)[: len(done) - MAX_DONE_IMAGES]:
+                    done.pop(stale, None)
+            self._save()
+        return given_up
+
+    def drop_images(self, keys: Iterable[str], reason: str) -> list[dict[str, Any]]:
+        """Give up on pictures (waited too long); returns them."""
+        wanted = set(keys)
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock:
+            dropped = [dict(item, last_error=reason[:300], at=now) for item in self._data["images"] if item.get("key") in wanted]
+            if not dropped:
+                return []
+            self._data["images"] = [item for item in self._data["images"] if item.get("key") not in wanted]
+            self._data["images_failed"] = (self._data["images_failed"] + dropped)[-500:]
+            self._save()
+            return dropped
 
 
 _LOCK_WINERRORS = {32, 33}  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
@@ -1227,44 +1497,8 @@ def flush_queue(queue: WorkbookQueue, *, excel_open: Callable[[Path], Any] | Non
             queue.mark_failed(group, report.error)
             continue
         try:
-            state = _open_state(excel_open, file)
-            if state == BUSY:
-                raise ExcelBusyError(f"Excel is busy (a cell is being edited or a dialog is open); {file.name} is written when it is free.")
-            backup = ensure_backup(queue, file)
-            if backup is not None:
-                report.backups.append(str(backup))
-            layout = group[0].layout
-            plan = group[0].plan
-            results = [item.result for item in group if item.layout.worksheet == layout.worksheet]
-            blocks = queue.blocks_for(file)
-            before = {rid: b.to_dict() for rid, b in blocks.items()}
-            if state == OPEN:
-                written = write_results_com(file, layout=layout, plan=plan, results=results, blocks=blocks)
-                report.notes.append(f"written through the open Excel window into {file.name}")
-            else:
-                written = write_results_openpyxl(file, layout=layout, plan=plan, results=results, blocks=blocks)
-            for rid, block in written.blocks.items():
-                if rid not in before:
-                    report.blocks_created.append((rid, block.ordinal, block.first_row))
-            queue.record_blocks(file, written.blocks)
-            skipped = set(written.skipped_keys)
-            conflicts = set(written.conflicts)
-            done = [
-                item for item in group
-                if item.result.round_id in written.blocks and (item.result.round_id, item.result.plan_index) not in skipped
-            ]
-            queue.mark_done(done, written_rows=written.written)
-            report.written += len(written.written)
-            report.unchanged += written.unchanged
-            if (written.written or done) and str(file) not in report.workbooks:
-                report.workbooks.append(str(file))
-            report.notes.extend(written.skipped)
-            clashing = [item for item in group if (item.result.round_id, item.result.plan_index) in conflicts]
-            if clashing:
-                queue.mark_conflict(clashing, "; ".join(written.skipped)[:300])
-            left = [item for item in group if item not in done and item not in clashing]
-            if left:
-                queue.mark_failed(left, "; ".join(written.skipped)[:300] or "not written")
+            with workbook_lock(file):
+                _flush_book(queue, file, group, excel_open, report)
         except ExcelBusyError as exc:
             report.busy = str(exc)
         except BackupError as exc:
@@ -1278,6 +1512,50 @@ def flush_queue(queue: WorkbookQueue, *, excel_open: Callable[[Path], Any] | Non
             queue.mark_failed(group, report.error)
     report.pending = queue.pending_count()
     return report
+
+
+def _flush_book(queue: WorkbookQueue, file: Path, group: list[PendingItem], excel_open: Callable[[Path], Any], report: FlushReport) -> None:
+    """One workbook's pending results (the caller holds its workbook lock)."""
+    state = _open_state(excel_open, file)
+    if state == BUSY:
+        raise ExcelBusyError(f"Excel is busy (a cell is being edited or a dialog is open); {file.name} is written when it is free.")
+    backup = ensure_backup(queue, file)
+    if backup is not None:
+        report.backups.append(str(backup))
+    layout = group[0].layout
+    plan = group[0].plan
+    results = [item.result for item in group if item.layout.worksheet == layout.worksheet]
+    blocks = queue.blocks_for(file)
+    before = {rid: b.to_dict() for rid, b in blocks.items()}
+    roles = queue.roles_for(file, layout.worksheet)
+    if state == OPEN:
+        written = write_results_com(file, layout=layout, plan=plan, results=results, blocks=blocks, roles=roles)
+        report.notes.append(f"written through the open Excel window into {file.name}")
+    else:
+        written = write_results_openpyxl(file, layout=layout, plan=plan, results=results, blocks=blocks, roles=roles)
+    queue.record_roles(file, layout.worksheet, written.roles)
+    for rid, block in written.blocks.items():
+        if rid not in before:
+            report.blocks_created.append((rid, block.ordinal, block.first_row))
+    queue.record_blocks(file, written.blocks)
+    skipped = set(written.skipped_keys)
+    conflicts = set(written.conflicts)
+    done = [
+        item for item in group
+        if item.result.round_id in written.blocks and (item.result.round_id, item.result.plan_index) not in skipped
+    ]
+    queue.mark_done(done, written_rows=written.written)
+    report.written += len(written.written)
+    report.unchanged += written.unchanged
+    if (written.written or done) and str(file) not in report.workbooks:
+        report.workbooks.append(str(file))
+    report.notes.extend(written.skipped)
+    clashing = [item for item in group if (item.result.round_id, item.result.plan_index) in conflicts]
+    if clashing:
+        queue.mark_conflict(clashing, "; ".join(written.skipped)[:300])
+    left = [item for item in group if item not in done and item not in clashing]
+    if left:
+        queue.mark_failed(left, "; ".join(written.skipped)[:300] or "not written")
 
 
 def queue_path(config_dir: Path) -> Path:

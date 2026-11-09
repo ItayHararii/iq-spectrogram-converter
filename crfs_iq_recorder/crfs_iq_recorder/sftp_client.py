@@ -28,6 +28,23 @@ class RemoteEntry:
     modified: datetime | None
 
 
+@dataclass(frozen=True)
+class RemoteStat:
+    """What lstat says about one path: the entry itself, a link is never followed."""
+
+    mode: int
+    size: int
+    mtime: float | None
+
+    @property
+    def is_link(self) -> bool:
+        return stat.S_ISLNK(self.mode)
+
+    @property
+    def is_dir(self) -> bool:
+        return stat.S_ISDIR(self.mode) and not self.is_link
+
+
 class SftpError(Exception):
     """SFTP operation failed."""
 
@@ -122,6 +139,26 @@ class SftpBrowser:
 
     def remove_file(self, remote_path: str) -> None:
         raise NotImplementedError
+
+    def lstat(self, remote_path: str) -> RemoteStat:
+        """The entry itself (a link is reported as a link)."""
+        raise NotImplementedError
+
+    def scan(self, remote_path: str) -> list[tuple[str, RemoteStat]]:
+        """(name, lstat) of every entry of a folder, '.' and '..' left out."""
+        raise NotImplementedError
+
+    def realpath(self, remote_path: str) -> str:
+        """The sensor's canonical path (links resolved)."""
+        raise NotImplementedError
+
+    def remove_dir(self, remote_path: str) -> None:
+        """Remove an empty folder."""
+        raise NotImplementedError
+
+    def remote_time(self) -> float | None:
+        """The sensor's clock (Unix seconds), None when it cannot be read."""
+        return None
 
     def storage_usage(self, path: str):
         """Free/total bytes for the filesystem that contains `path`."""
@@ -454,11 +491,58 @@ class ParamikoSftpBrowser(SftpBrowser):
         try:
             self._sftp.remove(remote_path)
         except FileNotFoundError as exc:
-            raise SftpError(f"File not found: {remote_path}") from exc
+            raise SftpNotFoundError(f"File not found: {remote_path}") from exc
         except OSError as exc:
             raise SftpError(f"Could not delete {remote_path}: {exc}") from exc
         except Exception as exc:
             raise SftpError(f"Could not delete {remote_path}: {exc}") from exc
+
+    @staticmethod
+    def _stat_of(attr) -> RemoteStat:
+        mtime = attr.st_mtime
+        return RemoteStat(int(attr.st_mode or 0), int(attr.st_size or 0), float(mtime) if mtime is not None else None)
+
+    def lstat(self, remote_path: str) -> RemoteStat:
+        try:
+            return self._stat_of(self._sftp.lstat(remote_path))
+        except FileNotFoundError as exc:
+            raise SftpNotFoundError(f"Not found: {remote_path}") from exc
+        except Exception as exc:
+            raise SftpError(f"Could not read {remote_path}: {exception_text(exc)}") from exc
+
+    def scan(self, remote_path: str) -> list[tuple[str, RemoteStat]]:
+        # OpenSSH's sftp-server takes READDIR attributes from lstat(), so links stay links.
+        try:
+            attrs = self._sftp.listdir_attr(remote_path)
+        except FileNotFoundError as exc:
+            raise SftpNotFoundError(f"Folder not found: {remote_path}") from exc
+        except Exception as exc:
+            raise SftpError(f"Could not list {remote_path}: {exception_text(exc)}") from exc
+        return [(item.filename, self._stat_of(item)) for item in attrs if item.filename not in {".", ".."}]
+
+    def realpath(self, remote_path: str) -> str:
+        try:
+            return str(self._sftp.normalize(remote_path))
+        except FileNotFoundError as exc:
+            raise SftpNotFoundError(f"Not found: {remote_path}") from exc
+        except Exception as exc:
+            raise SftpError(f"Could not resolve {remote_path}: {exception_text(exc)}") from exc
+
+    def remove_dir(self, remote_path: str) -> None:
+        try:
+            self._sftp.rmdir(remote_path)
+        except FileNotFoundError as exc:
+            raise SftpNotFoundError(f"Folder not found: {remote_path}") from exc
+        except Exception as exc:
+            raise SftpError(f"Could not delete {remote_path}: {exception_text(exc)}") from exc
+
+    def remote_time(self) -> float | None:
+        """`date +%s` over this SSH session (no extra handshake)."""
+        try:
+            _stdin, stdout, _stderr = self._client.exec_command("date +%s", timeout=10)
+            return float(stdout.read().decode("ascii", errors="replace").strip())
+        except Exception:  # noqa: BLE001 - the computer's clock is used instead
+            return None
 
     def remote_sha256(self, remote_path: str, *, timeout_s: float = REMOTE_CHECKSUM_TIMEOUT_S) -> tuple[str, str]:
         """(hex digest, note) of the sensor's file, computed on the sensor over SSH.
@@ -663,6 +747,9 @@ class DemoSftpBrowser(SftpBrowser):
         self._storage_total = DEMO_TOTAL_BYTES
         self._storage_free = DEMO_FREE_BYTES
         self._storage_fail = False
+        self._links: dict[str, str] = {}  # link path -> what it points to
+        self._remove_failures: dict[str, str] = {}  # path -> error a removal raises
+        self._before_remove: Callable[[str], None] | None = None
         self._dirs: dict[str, list[RemoteEntry]] = {
             "/": [RemoteEntry("mnt", "/mnt", True, 0, now)],
             "/mnt/": [RemoteEntry("1", "/mnt/1", True, 0, now)],
@@ -868,15 +955,149 @@ class DemoSftpBrowser(SftpBrowser):
 
     def directory_exists(self, path: str) -> bool:
         with self._lock:
-            key = _demo_dir_key(path)
+            key = _demo_dir_key(self._resolve_locked(path) if self._links else path)
             return key in self._dirs
 
     def listdir(self, path: str) -> list[RemoteEntry]:
         with self._lock:
-            key = _demo_dir_key(path)
+            key = _demo_dir_key(self._resolve_locked(path) if self._links else path)
             if key not in self._dirs:
                 raise SftpNotFoundError(f"Folder not found: {path}")
             return sort_remote_entries(list(self._dirs[key]))
+
+    # ------------------------------------------------------------------ folders and links (deletion tests)
+    def add_folder(self, path: str, *, modified: datetime | None = None) -> str:
+        """Create a folder and any missing parents; returns it as '/a/b'."""
+        with self._lock:
+            current = ""
+            for part in [p for p in str(path).replace("\\", "/").split("/") if p]:
+                parent_key = _demo_dir_key(current or "/")
+                current = f"{current}/{part}"
+                if _demo_dir_key(current) in self._dirs:
+                    continue
+                self._dirs[_demo_dir_key(current)] = []
+                self._dirs.setdefault(parent_key, []).append(RemoteEntry(part, current, True, 0, modified or datetime.now()))
+            return current or "/"
+
+    def add_link(self, path: str, target: str, *, modified: datetime | None = None) -> None:
+        """A symbolic link at `path` pointing to `target` (absolute or relative to the link's folder)."""
+        with self._lock:
+            path = "/" + "/".join(p for p in str(path).split("/") if p)
+            parent, _, name = path.rpartition("/")
+            key = _demo_dir_key(parent or "/")
+            if key not in self._dirs:
+                raise SftpNotFoundError(f"Folder not found: {parent}")
+            self._links[path] = str(target)
+            entries = [item for item in self._dirs[key] if item.path != path]
+            entries.append(RemoteEntry(name, path, False, len(str(target)), modified or datetime.now()))
+            self._dirs[key] = entries
+
+    def set_remove_failure(self, path: str, message: str | None) -> None:
+        """Make removing `path` fail with `message` (None: succeed again)."""
+        with self._lock:
+            if message:
+                self._remove_failures[path] = message
+            else:
+                self._remove_failures.pop(path, None)
+
+    def set_before_remove(self, hook: Callable[[str], None] | None) -> None:
+        """Called with each path right before it is removed (tests change the folder under the deletion)."""
+        with self._lock:
+            self._before_remove = hook
+
+    def set_clock_offset(self, seconds: float) -> None:
+        with self._lock:
+            self._clock_offset_s = float(seconds)
+
+    def remote_time(self) -> float | None:
+        with self._lock:
+            return time.time() + float(getattr(self, "_clock_offset_s", 0.0))
+
+    def _resolve_locked(self, path: str, *, follow_last: bool = True) -> str:
+        """The path with links resolved as the sensor's kernel would (the last part only when `follow_last`)."""
+        pending = [part for part in str(path or "/").replace("\\", "/").split("/") if part]
+        resolved: list[str] = []
+        hops = 0
+        while pending:
+            part = pending.pop(0)
+            if part == ".":
+                continue
+            if part == "..":
+                if resolved:
+                    resolved.pop()
+                continue
+            candidate = "/" + "/".join([*resolved, part])
+            target = self._links.get(candidate)
+            if target is not None and (pending or follow_last):
+                hops += 1
+                if hops > 40:
+                    raise SftpError(f"Too many levels of links: {path}")
+                if target.startswith("/"):
+                    resolved = []
+                pending = [p for p in target.split("/") if p] + pending
+                continue
+            resolved.append(part)
+        return "/" + "/".join(resolved)
+
+    def _entry_locked(self, path: str) -> RemoteEntry | None:
+        parent = path.rsplit("/", 1)[0] or "/"
+        for item in self._dirs.get(_demo_dir_key(parent), []):
+            if item.path.rstrip("/") == path:
+                return item
+        return None
+
+    def _stat_locked(self, path: str) -> RemoteStat:
+        entry = self._entry_locked(path)
+        mtime = entry.modified.timestamp() if entry is not None and entry.modified else None
+        if path in self._links:
+            return RemoteStat(stat.S_IFLNK | 0o777, len(self._links[path]), mtime)
+        if _demo_dir_key(path) in self._dirs:
+            return RemoteStat(stat.S_IFDIR | 0o755, 0, mtime)
+        if path in self._files:
+            return RemoteStat(stat.S_IFREG | 0o644, len(self._files[path]), mtime)
+        raise SftpNotFoundError(f"Not found: {path}")
+
+    def _drop_entry_locked(self, path: str) -> None:
+        parent = path.rsplit("/", 1)[0] or "/"
+        key = _demo_dir_key(parent)
+        if key in self._dirs:
+            self._dirs[key] = [item for item in self._dirs[key] if item.path.rstrip("/") != path]
+
+    def lstat(self, remote_path: str) -> RemoteStat:
+        with self._lock:
+            return self._stat_locked(self._resolve_locked(remote_path, follow_last=False))
+
+    def scan(self, remote_path: str) -> list[tuple[str, RemoteStat]]:
+        with self._lock:
+            key = _demo_dir_key(self._resolve_locked(remote_path))
+            if key not in self._dirs:
+                raise SftpNotFoundError(f"Folder not found: {remote_path}")
+            return [(item.name, self._stat_locked(item.path.rstrip("/"))) for item in self._dirs[key]]
+
+    def realpath(self, remote_path: str) -> str:
+        with self._lock:
+            path = self._resolve_locked(remote_path)
+            if path != "/" and path not in self._files and _demo_dir_key(path) not in self._dirs:
+                raise SftpNotFoundError(f"Not found: {remote_path}")
+            return path
+
+    def remove_dir(self, remote_path: str) -> None:
+        with self._lock:
+            if self._before_remove is not None:
+                self._before_remove(remote_path)
+            path = self._resolve_locked(remote_path, follow_last=False)
+            failure = self._remove_failures.get(remote_path) or self._remove_failures.get(path)
+            if failure:
+                raise SftpError(f"Could not delete {remote_path}: {failure}")
+            if path in self._links or path in self._files:
+                raise SftpError(f"Could not delete {remote_path}: Not a directory")
+            key = _demo_dir_key(path)
+            if key not in self._dirs:
+                raise SftpNotFoundError(f"Folder not found: {remote_path}")
+            if self._dirs[key]:
+                raise SftpError(f"Could not delete {remote_path}: Directory not empty")
+            del self._dirs[key]
+            self._drop_entry_locked(path)
 
     def read_prefix(self, remote_path: str, local_path: Path, max_bytes: int) -> int:
         with self._lock:
@@ -955,12 +1176,25 @@ class DemoSftpBrowser(SftpBrowser):
 
     def remove_file(self, remote_path: str) -> None:
         with self._lock:
+            if self._before_remove is not None:
+                self._before_remove(remote_path)
             self._remove_file_locked(remote_path)
 
     def _remove_file_locked(self, remote_path: str) -> None:
-        path = (remote_path or "").replace("\\", "/")
+        raw = (remote_path or "").replace("\\", "/")
+        # Like unlink(2): links in the parent folders are followed, the last part never is.
+        path = self._resolve_locked(raw, follow_last=False) if self._links else raw
+        failure = self._remove_failures.get(raw) or self._remove_failures.get(path)
+        if failure:
+            raise SftpError(f"Could not delete {raw}: {failure}")
+        if path in self._links:
+            del self._links[path]
+            self._drop_entry_locked(path)
+            return
+        if _demo_dir_key(path) in self._dirs:
+            raise SftpError(f"Could not delete {raw}: Is a directory")
         if path not in self._files:
-            raise SftpError(f"File not found: {path}")
+            raise SftpNotFoundError(f"File not found: {path}")
         size = len(self._files[path])
         del self._files[path]
         self._storage_free = min(self._storage_total, self._storage_free + size)

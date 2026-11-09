@@ -20,7 +20,7 @@ from crfs_iq_recorder.cellular_panel import (
 )
 from crfs_iq_recorder.cellular_protocol import import_protocol
 from crfs_iq_recorder.cellular_reference import REFERENCE_ALLOCATIONS, VERIFY_NOTE, write_template_workbook
-from crfs_iq_recorder.cellular_runner import OWNER, S_DONE, S_IDLE, T_CONFIRMED
+from crfs_iq_recorder.cellular_runner import OWNER, S_DONE, S_IDLE, T_CONFIRMED, T_QUEUED
 from crfs_iq_recorder.cellular_scheduler import MODE_NOW, MODE_TIMES, TZ_LOCAL
 
 MHZ = 1_000_000
@@ -66,6 +66,16 @@ def _drive_capture(window, qapp):
     for _ in range(4):
         window._poll_collection_files()
     qapp.processEvents()
+
+
+def _drive_rows(window, qapp, rows: int) -> None:
+    """Record each row on the demo sensor once its request is out; a row is sent only after the previous row's download."""
+    runner = window._cellular
+    for index in range(rows):
+        assert _pump_until(qapp, lambda: runner.current_tasks()[index].status != T_QUEUED, timeout=15.0), runner.status()
+        assert _pump_until(qapp, lambda: window._http_in_flight is False)
+        _drive_capture(window, qapp)
+        runner._tick()
 
 
 def _plan_book(path: Path) -> Path:
@@ -210,10 +220,7 @@ def test_panel_in_demo_window_imports_previews_starts_and_finishes(qapp, tmp_pat
         assert panel.chip.text() == "Recording"
         assert not panel.start_btn.isEnabled() and panel.stop_btn.isEnabled() and panel.pause_btn.isEnabled()
         assert _pump_until(qapp, lambda: "recording" in panel.status_label.text().casefold() or "idle" in panel.status_label.text().casefold(), timeout=5.0)
-        for _ in range(2):
-            assert _pump_until(qapp, lambda: window._http_in_flight is False)
-            _drive_capture(window, qapp)
-            window._cellular._tick()
+        _drive_rows(window, qapp, 2)
         assert _pump_until(qapp, lambda: window._cellular.state == S_DONE, timeout=8.0), window._cellular.status()
         assert _pump_until(qapp, lambda: window._cellular.background_jobs() == 0, timeout=20.0)
         tasks = window._cellular.current_tasks() or list(window._cellular.session.tasks.values())[0]
@@ -356,10 +363,7 @@ def test_panel_fills_the_protocol_rows_through_the_demo_window(qapp, tmp_path, m
         started = datetime.now().replace(microsecond=0)
         panel._start(schedule)
         assert window._external_owner == OWNER
-        for _ in range(2):
-            assert _pump_until(qapp, lambda: window._http_in_flight is False)
-            _drive_capture(window, qapp)
-            window._cellular._tick()
+        _drive_rows(window, qapp, 2)
         assert _pump_until(qapp, lambda: window._cellular.state == S_DONE, timeout=8.0), window._cellular.status()
         assert _pump_until(qapp, lambda: window._cellular.background_jobs() == 0 and window._cellular.workbook_pending() == 0, timeout=30.0), window._cellular.status()
         status = window._cellular.status()
@@ -459,10 +463,7 @@ def test_a_workbook_that_cannot_be_read_keeps_the_stored_import_and_queues_resul
         assert error is None
         panel._start(schedule)
         assert window._cellular.protocol_results_enabled()
-        for _ in range(2):
-            assert _pump_until(qapp, lambda: window._http_in_flight is False)
-            _drive_capture(window, qapp)
-            window._cellular._tick()
+        _drive_rows(window, qapp, 2)
         assert _pump_until(qapp, lambda: window._cellular.state == S_DONE, timeout=8.0), window._cellular.status()
         assert _pump_until(qapp, lambda: window._cellular.status()["workbook_status"] == "busy", timeout=8.0), window._cellular.status()
         status = window._cellular.status()

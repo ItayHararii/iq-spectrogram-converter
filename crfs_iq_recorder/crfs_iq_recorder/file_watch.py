@@ -17,10 +17,23 @@ MAX_WATCH_AFTER_ELAPSED_S = 60.0
 NO_FILE_GRACE_S = 10.0
 
 
-def folders_for_recording(started_at: datetime, now: datetime | None = None) -> list[str]:
-    """Local and UTC date folders for the start time and now (midnight crossings)."""
+def folders_for_recording(started_at: datetime, now: datetime | None = None, *, sensor_dirs=()) -> list[str]:
+    """Local and UTC date folders for the start time and now (midnight crossings).
+
+    ``sensor_dirs`` are the folders the sensor itself named for this recording
+    (its reply's ``file_dir``, a part's folder). They come first: the sensor names
+    its date folder by its own clock, which may be wrong (/mnt/1/remdata/20120102/
+    on 9 Nov 2026), and then no computer date matches.
+    """
     current = now or datetime.now()
     paths: list[str] = []
+    for folder in sensor_dirs or ():
+        text = str(folder or "").replace("\\", "/").strip()
+        if not text.startswith("/") or text == "/" or ".." in text.split("/"):
+            continue
+        text = text if text.endswith("/") else text + "/"
+        if text not in paths:
+            paths.append(text)
     for when in (started_at, current):
         for folder in candidate_today_directories(when):
             if folder not in paths:

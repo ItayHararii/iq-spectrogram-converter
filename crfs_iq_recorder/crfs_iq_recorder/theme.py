@@ -404,9 +404,34 @@ QMainWindow, QDialog, QWidget#central, QWidget#sftpRoot {{
     color: {p.text};
     font-size: 13px;
 }}
-QLabel, QCheckBox, QRadioButton, QStatusBar, QMenuBar, QMenu {{
+QLabel, QCheckBox, QRadioButton, QStatusBar, QMenuBar {{
     color: {p.text};
     background: transparent;
+}}
+QMenu {{
+    color: {p.text};
+    background: {p.surface};
+    border: 1px solid {mix(p.border, p.muted, 0.35)};
+    padding: 4px 0;
+}}
+QMenu::item {{
+    padding: 6px 28px 6px 14px;
+    background: transparent;
+}}
+QMenu::item:selected {{
+    background: {p.button_hover};
+    color: {p.text};
+}}
+QMenu::item:disabled {{
+    color: {mix(p.muted, p.surface, 0.2)};
+}}
+QMenu::item:disabled:selected {{
+    background: transparent;
+}}
+QMenu::separator {{
+    height: 1px;
+    background: {p.border};
+    margin: 4px 8px;
 }}
 QLabel#muted, QLabel#emptyState {{
     color: {p.muted};

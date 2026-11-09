@@ -19,6 +19,8 @@ HEADER_SENSOR = "Sensor"
 HEADER_SNAPSHOT = "Snapshot ID"
 HEADER_IQ = "IQ Recording"
 HEADER_IMAGE = "IQ Image"
+# Thumbnails of each IQ file's spectrogram, right of HEADER_IQ (an existing HEADER_IMAGE column there is reused).
+HEADER_SPECTROGRAM = "IQ Spectrogram"
 HEADER_PLAY_START = "Playback Start"
 HEADER_PLAY_END = "Playback End"
 HEADER_PLAY_TIME = "Playback Time (UTC-3)"

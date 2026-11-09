@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 from .cellular_plan import CellularPlan, format_bytes
 from .iq_merge import MergeError, PartInfo, part_number
+from .sensor_clock import CLOCK_INCORRECT_S, CLOCK_SYNCED_S, offset_text
 from .sensor_storage import StorageSnapshot, format_storage_bytes, needed_bytes_with_margin
 from .xdat_header import XdatHeaderMissing, inspect_recording, is_xdat_file, is_xdat_sidecar
 
@@ -766,8 +767,8 @@ def plausible_time(stamp: datetime | None, *, now: datetime | None = None) -> st
     return None
 
 
-CLOCK_DRIFT_WARN_S = 5.0
-CLOCK_DRIFT_ERROR_S = 120.0
+CLOCK_DRIFT_WARN_S = CLOCK_SYNCED_S
+CLOCK_DRIFT_ERROR_S = CLOCK_INCORRECT_S
 # "Blocking" checks stop the pass; the others are reported and the pass goes on.
 BLOCKING_CHECKS = {"connection", "identity_match", "sensor_storage", "local_storage", "destination", "plan"}
 
@@ -804,6 +805,8 @@ def pre_run_checks(
     expected_identity: dict[str, str] | None = None,
     clock_offset_s: float | None = None,
     clock_source: str = "",
+    clock_uncertainty_s: float = 0.0,
+    clock_note: str = "",
     workbook_path: str | Path | None = None,
     workbook_sheet: str = "",
     workbook_state: str | None = None,
@@ -859,27 +862,33 @@ def pre_run_checks(
         checks.append(Check("computer_clock", LEVEL_ERROR, f"Computer clock {computer_problem}."))
     else:
         checks.append(Check("computer_clock", LEVEL_OK, f"Computer clock {now.astimezone().isoformat(timespec='seconds')}."))
-    if clock_offset_s is None and sensor_time is not None and sensor_time.tzinfo:
+    if sensor_time is not None and sensor_time.tzinfo is None:
+        sensor_time = sensor_time.replace(tzinfo=timezone.utc)
+    if clock_offset_s is None and sensor_time is not None:
         clock_offset_s = (sensor_time.astimezone(timezone.utc) - now).total_seconds()
     if sensor_time is None and clock_offset_s is None:
         checks.append(Check("sensor_clock", LEVEL_INFO, "Sensor clock: unknown (the sensor's status page could not be read). Recording times come from the files' own timestamps; the difference to the computer is not known."))
     else:
-        problem = plausible_time(sensor_time, now=now) if sensor_time is not None else None
+        # Instants against the computer's clock (time zones do not matter), with the
+        # reading's own uncertainty (half the round trip plus the page's 1 s).
         source = f" ({clock_source})" if clock_source else ""
-        direction = ""
-        if clock_offset_s is not None:
-            direction = "ahead of" if clock_offset_s > 0 else "behind"
-        if problem:
-            checks.append(Check("sensor_clock", LEVEL_ERROR, f"Sensor clock {problem}{source}."))
-        elif clock_offset_s is not None and abs(clock_offset_s) > CLOCK_DRIFT_ERROR_S:
-            # Reported, not blocking: recording times follow the sensor's own timestamps either way.
-            checks.append(Check("sensor_clock", LEVEL_ERROR, f"Sensor clock is {abs(clock_offset_s):.1f} s {direction} the computer{source}. Recording times in Excel follow the sensor's clock; check its time source."))
-        elif clock_offset_s is not None and abs(clock_offset_s) > CLOCK_DRIFT_WARN_S:
-            checks.append(Check("sensor_clock", LEVEL_WARNING, f"Sensor clock is {abs(clock_offset_s):.1f} s {direction} the computer{source}."))
-        elif clock_offset_s is not None:
-            checks.append(Check("sensor_clock", LEVEL_OK, f"Sensor clock agrees with the computer ({clock_offset_s:+.1f} s{source})."))
+        note = f" {clock_note}" if clock_note else ""
+        margin = max(float(clock_uncertainty_s or 0.0), 0.0)
+        if clock_offset_s is None:
+            checks.append(Check("sensor_clock", LEVEL_OK, f"Sensor clock read{source}; offset not measured.{note}"))
         else:
-            checks.append(Check("sensor_clock", LEVEL_OK, f"Sensor clock read{source}; offset not measured."))
+            size = abs(float(clock_offset_s))
+            direction = "ahead of" if clock_offset_s > 0 else "behind"
+            if size - margin > CLOCK_DRIFT_ERROR_S:
+                # Reported, not blocking: recording times follow the sensor's own timestamps either way.
+                stamp = sensor_time.astimezone(timezone.utc) if sensor_time is not None else None
+                reads = f" (reads {stamp:%Y-%m-%d %H:%M} UTC)" if stamp is not None and stamp.date() != now.astimezone(timezone.utc).date() else ""
+                checks.append(Check("sensor_clock", LEVEL_ERROR, f"Sensor clock is {offset_text(clock_offset_s)} {direction} the computer{reads}{source}. Recording times and date folders follow the sensor's clock; check its time source.{note}"))
+            elif size > CLOCK_DRIFT_WARN_S + margin:
+                checks.append(Check("sensor_clock", LEVEL_WARNING, f"Sensor clock is {size:.1f} s {direction} the computer{source}.{note}"))
+            else:
+                within = f", within {margin:.1f} s" if margin else ""
+                checks.append(Check("sensor_clock", LEVEL_OK, f"Sensor clock agrees with the computer ({clock_offset_s:+.1f} s{within}{source}).{note}"))
     checks.append(Check("gnss", LEVEL_INFO, f"GNSS status: {gnss_status or 'unknown (not reported by the sensor API used here)'}."))
 
     # Storage.

@@ -1,6 +1,6 @@
 # Excel Collection - how it works (developer report)
 
-**Version:** CRFS IQ Recorder 1.13.0 (November 2026)
+**Version:** CRFS IQ Recorder 1.19.0 (November 2026; one request per row since 1.13.0)
 **Operator guide:** the "Excel Collection" section of the [Quick Start](confluence/CRFS_IQ_Recorder_Quick_Start.md).
 **QA:** `QA_REPORT.md` at the repository root, Parts D to G.
 
@@ -54,6 +54,12 @@ sequenceDiagram
 - **No automatic re-send**, with one exception: a request that provably never reached the sensor (no connection) is sent once more, unchanged. Anything that may have reached the sensor is never resent automatically; an uncertain row is checked against the mission list and the sensor's files first (**Check with the sensor**).
 - The wait between recordings starts only after the capture is confirmed. Downloads start from a fresh listing `FINALIZE_SETTLE_S` after confirmation. When more than `DEFAULT_BACKLOG_LIMIT` (8) downloads are waiting the collection pauses itself ("Downloads: 9 waiting (limit 8). Recording resumes when they catch up.") and continues by itself; this happened on the hardware run over a slow VPN link. When it continues because files were given up rather than downloaded, the line says so (`Not downloaded: 11 files, still on the sensor. The collection continues.`).
 - **Persistence:** `cellular/session.json` under the config folder holds the plan, rounds, task states (with every attempt in `history`), file states and settings; it is rewritten atomically after every change.
+
+## Spectrograms, sensor clock and filtered sheets (1.19.0)
+
+- **Spectrograms.** `_after_file_verified` (and the "already present, no checksum" branch of `_start_download`) hands every `DL_VERIFIED` file with a local path to `SpectrogramService.request`. The conversion runs in a child process; the runner never waits for it, and a failure never changes a task, a file state or the pass counts. The thumbnail goes to every protocol result row that lists the part (`excel_log.rows_listing`), through the existing `WorkbookQueue` (`enqueue_image`, `pending_images`): an **IQ Spectrogram** column right of IQ Recording, inserted once by Excel (`ListColumns.Add` inside a table), after which the result columns are found again by header text (`settle_layout` with the stored roles), so later results still land in the right cells. Block copies run with `CopyObjectsWithCells = False`, so a new pass never duplicates thumbnails. Busy Excel or cell-edit mode does not count as an attempt; pictures retry every 15 s, and a row that is not in the sheet yet is re-checked every 60 s. The handover is a JSON manifest, so it gets no thumbnails.
+- **Filter-safe last row.** With an AutoFilter or table filter hiding rows, Excel's `Cells.Find("*")` answers row 1, so an appended block (and a collection-log row) could overwrite row 2 (present in 1.18.0, measured in Excel 365). When a filter hides rows the last row is now found by a COUNTA bisection (about 20 calls at 1,048,576 rows); unfiltered sheets keep using Find.
+- **Sensor clock.** The pre-flight clock probe waits (bounded) for the clock monitor's check and reports the offset with its uncertainty: error above 120 s, warning above 5 s, plus a note of a recent NTP refresh (`recovery_note`). A wrong clock is refreshed only while the sensor is idle; `start_capture` answers "Sensor clock check in progress." during a check, which the runner retries as busy (keep "in progress" in that text). `_reconcile_files` watches the summary's `sensor_reply.file_dir` first, so a capture written under a wrong-date folder (`/mnt/1/remdata/20120102/`, seen on 9 Nov after the Node lost its time) is confirmed instead of left uncertain.
 
 ## Sensor storage, large files and open workbooks (1.18.0)
 
@@ -144,7 +150,7 @@ The panel reads the sensor's identity right before Start (`MainWindow.fetch_sens
 
 - The imported worksheet is the plan: its valid rows, in worksheet order, are stored in the session as `plan_rows`. Appended result blocks are recognised by key and never become instructions; the workbook's duration column is a result, never an instruction.
 - **Block 0** is the plan rows themselves, used by the first pass while their result cells are empty. Every further pass gets a **new block** of the same rows appended below the last used row (key cells copied with their styles, result cells empty except Sensor). Blocks are re-located by key before every write.
-- Values: **Sensor** = readable name from the verified identity (`CRFS 100-18`); **IQ Recording** = the recording's files one per line (size-split parts grouped); **IQ Duration (s)** = measured seconds, three decimals, or empty when unknown (never the requested value); **Recording Date & Time** = capture start in local time as a real datetime. Only these cells of the app's own rows are written.
+- Values: **Sensor** = readable name from the verified identity (`CRFS 100-18`); **IQ Recording** = the recording's files one per line (size-split parts grouped); **IQ Duration (s)** = measured seconds, three decimals, or empty when unknown (never the requested value); **Recording Date & Time** = capture start in local time as a real datetime; **IQ Spectrogram** = one thumbnail picture per part (1.19.0). Only these cells of the app's own rows are written.
 - **Queue:** results go to `cellular/workbook_queue.json` and are flushed on a worker; the queue survives restarts. **Backup first:** one `.crfs-backup-<stamp>` copy before the first change of every session. **Excel open:** cells are written through COM into the open workbook and saved; a locked file without COM access is *busy* and retried.
 
 ## Schedule, passes, sleep

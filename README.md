@@ -64,7 +64,7 @@ venv\Scripts\python.exe iq_data.py --input path\to\file.wav --output "IQ Results
 venv\Scripts\python.exe iq_data.py --folder path\to\wavs --output "IQ Results" --rbw 15000
 ```
 
-Use either `--input` or `--folder`, not both. Default RBW is 15000 Hz. Optional flags: `--cmap jet|turbo|viridis|gray`, `--freq-smooth`, `--db-min`, `--db-max`, `--recorder-history path\to\history.json`, `--no-range-markers`.
+Use either `--input` or `--folder`, not both. Default RBW is 15000 Hz. Optional flags: `--cmap jet|turbo|viridis|gray`, `--freq-smooth`, `--db-min`, `--db-max`, `--recorder-history path\to\history.json`, `--no-range-markers`, `--thumbnail` (also writes `<stem>.thumb.png`: the spectrogram alone at 320x160 px, for previews), `--title-centre` (adds the centre frequency to the PNG title, or "centre unknown").
 
 The EXE converts without opening a window when `--input` is given (same `--recorder-history` and `--no-range-markers` flags):
 

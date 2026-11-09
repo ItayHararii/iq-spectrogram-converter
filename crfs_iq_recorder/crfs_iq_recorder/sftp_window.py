@@ -22,7 +22,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPixmap, QScreen, QShortcut
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPixmap, QScreen, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -49,13 +49,28 @@ from PySide6.QtWidgets import (
 from .capture_measure import measure_part
 from .cellular_pickers import format_datetime
 from .connection_state import ConnectionState
-from .constants import DEFAULT_SFTP_PORT
+from .constants import DEFAULT_SFTP_PORT, SFTP_REMDATA_ROOT
 from .diagnostic_log import diag
-from .download_paths import LocalCopies, candidate_paths, existing_copy, plan_destinations
+from .download_paths import LocalCopies, candidate_paths, existing_copy, plan_destinations, remote_subfolder
 from .download_util import DownloadError, already_saved
 from .file_measurements import load_measurements, reading_from_local_copy, record_parts, recorded_columns
 from .file_measurements import lookup as lookup_measurement
-from .operator_text import size_detail
+from .operator_text import size_detail, size_text
+from .remote_delete import (
+    DeletePlan,
+    DeleteProgress,
+    DeleteRefused,
+    DeleteResult,
+    SensorActivity,
+    confined_folder,
+    delete_planned,
+    files_busy_reason,
+    folder_busy_reason,
+    folder_refusal,
+    host_activity,
+    plan_busy_reason,
+    plan_folder_delete,
+)
 from .listing_sort import (
     COL_MODIFIED,
     COL_NAME,
@@ -294,11 +309,15 @@ def _disconnect_signal(signal, slot) -> None:
 
 
 class SftpBackend(QObject):
-    """Listing stays on this object's thread."""
+    """Listing (and folder deletion, on the same session) stays on this object's thread."""
 
     listed = Signal(str, object, object)
     failed = Signal(str)
     removed = Signal(object, object)
+    folder_counted = Signal(object)  # DeletePlan
+    folder_refused = Signal(str, str, str)  # folder, short reason, detail for the diagnostic log
+    folder_progress = Signal(object)  # DeleteProgress
+    folder_deleted = Signal(object)  # DeleteResult
 
     def __init__(self, state: ConnectionState) -> None:
         super().__init__()
@@ -417,6 +436,76 @@ class SftpBackend(QObject):
             return
         self.removed.emit(ok, errors)
 
+    def _session(self) -> SftpBrowser:
+        """The listing session, opened again if the sensor dropped it."""
+        browser = self._browser
+        if browser is not None and browser.is_alive():
+            return browser
+        if browser is not None:
+            browser.close()
+        with self._lock:
+            self._browser = None
+
+        def on_client(client) -> None:
+            with self._lock:
+                self._connecting = client
+
+        browser = _open_browser(self._state, cancel=self._cancel, on_client=on_client)
+        with self._lock:
+            self._connecting = None
+        if self._closing:
+            browser.close()
+            raise SftpError("SFTP cancelled.")
+        with self._lock:
+            self._browser = browser
+        return browser
+
+    def _progress_emitter(self):
+        last = [0.0]
+
+        def emit(progress: DeleteProgress) -> None:
+            now = time.monotonic()
+            final = bool(progress.total) and progress.done >= progress.total
+            if not final and now - last[0] < PROGRESS_INTERVAL_S:
+                return
+            last[0] = now
+            self.folder_progress.emit(progress)
+
+        return emit
+
+    @Slot(object)
+    def count_folder(self, request: object) -> None:
+        folder, cancel = request  # type: ignore[misc]
+        try:
+            plan = plan_folder_delete(self._session(), str(folder), root=SFTP_REMDATA_ROOT, cancel=cancel, progress=self._progress_emitter())
+        except DeleteRefused as exc:
+            self.folder_refused.emit(str(folder), str(exc), "")
+            return
+        except SftpError as exc:
+            self.folder_refused.emit(str(folder), "Could not read the folder", str(exc))
+            return
+        except Exception:
+            self.folder_refused.emit(str(folder), "Could not read the folder", traceback.format_exc(limit=4))
+            return
+        if not self._closing:
+            self.folder_counted.emit(plan)
+
+    @Slot(object)
+    def delete_folder(self, request: object) -> None:
+        plan, cancel = request  # type: ignore[misc]
+        try:
+            browser = self._session()
+        except Exception as exc:  # noqa: BLE001 - nothing was deleted
+            self.folder_refused.emit(plan.folder, "Not connected", str(exc))
+            return
+        try:
+            result = delete_planned(browser, plan, cancel=cancel, progress=self._progress_emitter())
+        except Exception:  # noqa: BLE001 - some items may be gone: the window lists the folder again
+            self.folder_refused.emit(plan.folder, "Deletion stopped by an error", traceback.format_exc(limit=4))
+            return
+        if not self._closing:
+            self.folder_deleted.emit(result)
+
     @Slot()
     def shutdown(self) -> None:
         self.abort()
@@ -471,6 +560,10 @@ class FileDownloadWorker(QObject):
     def stop_waiting(self) -> None:
         """Give up if no connection has been made yet; a transfer already running continues."""
         self._stop_waiting.set()
+
+    def remote_paths(self) -> list[str]:
+        """The sensor file this worker reads (Sensor Files refuses to delete it meanwhile)."""
+        return [self._remote]
 
     def abort(self) -> None:
         if self._cancel is not None:
@@ -595,6 +688,9 @@ class PreviewWorker(QObject):
         self._cancel = threading.Event()
         self._browser: SftpBrowser | None = None
 
+    def remote_paths(self) -> list[str]:
+        return [self._entry.path]
+
     def abort(self) -> None:
         self._cancel.set()
         browser = self._browser
@@ -680,6 +776,8 @@ class SftpWindow(QWidget):
     _cmd_try_today = Signal()
     _cmd_list = Signal(str)
     _cmd_remove = Signal(object)
+    _cmd_count_folder = Signal(object)
+    _cmd_delete_folder = Signal(object)
     _cmd_close = Signal()
 
     def __init__(self, state: ConnectionState, parent=None, *, screen: QScreen | None = None) -> None:
@@ -701,10 +799,14 @@ class SftpWindow(QWidget):
             | Qt.WindowType.WindowCloseButtonHint
         )
         self._state = state
+        self._host = None  # the main window: sensor identity and what is recording
         self._path = today_remdata_directory()
         self._entries: list[RemoteEntry] = []
         self._closing = False
         self._busy = False
+        self._folder_delete = ""  # folder being counted, confirmed or deleted
+        self._delete_cancel = threading.Event()
+        self._listing_note = ""  # shown by the next listing instead of its item count (a deletion's outcome)
         self._dl_pending: list[tuple[RemoteEntry, str]] = []
         self._dl_active: list[tuple[QThread, FileDownloadWorker]] = []
         self._dl_ok = 0
@@ -953,10 +1055,16 @@ class SftpWindow(QWidget):
         self._cmd_try_today.connect(self._worker.try_today, queued)
         self._cmd_list.connect(self._worker.listdir, queued)
         self._cmd_remove.connect(self._worker.remove_files, queued)
+        self._cmd_count_folder.connect(self._worker.count_folder, queued)
+        self._cmd_delete_folder.connect(self._worker.delete_folder, queued)
         self._cmd_close.connect(self._worker.shutdown, queued)
         self._worker.listed.connect(self._on_listed, queued)
         self._worker.failed.connect(self._on_failed, queued)
         self._worker.removed.connect(self._on_removed, queued)
+        self._worker.folder_counted.connect(self._on_folder_counted, queued)
+        self._worker.folder_refused.connect(self._on_folder_refused, queued)
+        self._worker.folder_progress.connect(self._on_folder_progress, queued)
+        self._worker.folder_deleted.connect(self._on_folder_deleted, queued)
         track_worker_thread(self._thread, self._worker)
         self._thread.start()
         self._set_busy(True)
@@ -988,8 +1096,16 @@ class SftpWindow(QWidget):
         """Files this window is downloading now (they read the sensor's storage)."""
         return len(self._dl_active)
 
+    def set_host(self, host) -> None:
+        """The main window: its sensor identity, and what is recording or downloading (asked before any deletion)."""
+        self._host = host
+
+    def deleting_folder(self) -> str:
+        """The sensor folder being counted, confirmed or deleted ('' when none)."""
+        return self._folder_delete
+
     def retry_today(self) -> None:
-        if self._closing or self._dl_active or self._dl_pending:
+        if self._closing or self._dl_active or self._dl_pending or self._folder_delete:
             return
         self._set_busy(True)
         self._show_list_state("loading", "Looking for today's folder…")
@@ -1000,13 +1116,20 @@ class SftpWindow(QWidget):
         if self._closing:
             event.accept()
             return
+        if self._folder_delete:
+            self.activity.emit("Sensor Files closed: the folder deletion stopped. Open it again to see what is left.")
         self._closing = True
+        self._delete_cancel.set()
         self._dl_pending.clear()
         self._preview_token += 1
         self._preview_pending = None
         _disconnect_signal(self._worker.listed, self._on_listed)
         _disconnect_signal(self._worker.failed, self._on_failed)
         _disconnect_signal(self._worker.removed, self._on_removed)
+        _disconnect_signal(self._worker.folder_counted, self._on_folder_counted)
+        _disconnect_signal(self._worker.folder_refused, self._on_folder_refused)
+        _disconnect_signal(self._worker.folder_progress, self._on_folder_progress)
+        _disconnect_signal(self._worker.folder_deleted, self._on_folder_deleted)
         try:
             self._worker.abort()
         except Exception:
@@ -1062,10 +1185,11 @@ class SftpWindow(QWidget):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         downloading = bool(self._dl_pending or self._dl_active)
-        locked = busy or downloading
+        deleting = bool(self._folder_delete)
+        locked = busy or downloading or deleting
         self.refresh_btn.setEnabled(not locked)
         self.download_btn.setEnabled(not locked)
-        self.cancel_btn.setEnabled(downloading)
+        self.cancel_btn.setEnabled(downloading or deleting)
         self.open_folder_btn.setEnabled(True)
         self._sync_up_button()
         self._update_download_button()
@@ -1278,8 +1402,11 @@ class SftpWindow(QWidget):
             self._show_list_state("empty", "This folder is empty.")
         else:
             self._show_list_state("ready")
+        note, self._listing_note = self._listing_note, ""
         if warning:
             self.status.setText(str(warning))
+        elif note:
+            self.status.setText(note)
         elif self._state.demo:
             self.status.setText("Demo listing.")
         else:
@@ -1310,7 +1437,7 @@ class SftpWindow(QWidget):
         self._request_list(self._path)
 
     def _request_list(self, path: str) -> None:
-        if self._busy or self._closing or self._dl_active or self._dl_pending:
+        if self._busy or self._closing or self._dl_active or self._dl_pending or self._folder_delete:
             return
         if not _same_remote_path(path, self._path):
             self._reset_default_sort()
@@ -1412,6 +1539,17 @@ class SftpWindow(QWidget):
         by_path = {entry.path: entry for entry in self._entries if not entry.is_dir}
         return [by_path[path] for path in paths if path in by_path]
 
+    def _selected_folders(self) -> list[RemoteEntry]:
+        by_path = {entry.path: entry for entry in self._entries if entry.is_dir}
+        out: list[RemoteEntry] = []
+        for item in self._selected_items():
+            if str(item.data(0, ROLE_KIND) or "") != "dir":
+                continue
+            entry = by_path.get(str(item.data(0, ROLE_PATH) or ""))
+            if entry is not None and entry not in out:
+                out.append(entry)
+        return out
+
     def _selected_file_paths(self) -> list[str]:
         """Resolve selected parents to listed parts and selected children to those files only."""
         seen: list[str] = []
@@ -1429,14 +1567,30 @@ class SftpWindow(QWidget):
         return seen
 
     def _delete_selected_remote(self) -> None:
-        if self._busy or self._closing or self._dl_active or self._dl_pending:
+        """Delete key: the selected files, or the one selected folder."""
+        if self._busy or self._closing or self._dl_active or self._dl_pending or self._folder_delete:
             return
         if not self.table.hasFocus():
             return
         paths = self._selected_file_paths()
-        if not paths:
+        if paths:
+            self._delete_files(paths)
+            return
+        folders = self._selected_folders()
+        if len(folders) == 1:
+            self._delete_folder(folders[0].path)
+
+    def _delete_files(self, paths: list[str]) -> None:
+        reason = self._file_delete_block_reason(paths)
+        if reason:
+            self.status.setText(f"Not deleted: {reason}.")
             return
         if not self._confirm_delete(paths):
+            return
+        # The confirmation may have stayed open while a recording or a download started.
+        reason = self._file_delete_block_reason(paths)
+        if reason:
+            self.status.setText(f"Not deleted: {reason}.")
             return
         self._deleting_paths = list(paths)
         self._set_busy(True)
@@ -1452,11 +1606,243 @@ class SftpWindow(QWidget):
         answer = QMessageBox.question(
             self,
             "Delete from sensor",
-            f"Delete {len(paths)} file(s) from the sensor? This cannot be undone.\n\n{shown}",
+            f"Delete {len(paths)} file(s) from the sensor {self._sensor_identity_text()}? "
+            f"This cannot be undone. Local copies on this PC are kept.\n\n{shown}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         return answer == QMessageBox.StandardButton.Yes
+
+    # ------------------------------------------------------------------ deleting a folder
+    def _activity(self) -> SensorActivity:
+        """What records, downloads or reads the sensor now. This window's own previews do not count: the
+        preview keeps its open handle, and clearing the preview drops its late result."""
+        skip = [worker for _thread, worker in self._preview_jobs]
+        return host_activity(self._host, also_reading=[entry.path for entry, _dest in self._dl_pending], skip=skip)
+
+    def _sensor_identity_text(self) -> str:
+        """'R100-18, serial rfeye100400, at 192.0.2.10' (only what was read from this very sensor)."""
+        host = (self._state.host or "").strip() or "no address"
+        if self._state.demo:
+            return f"demo sensor ({host})"
+        info = getattr(self._host, "_sensor_info", None)
+
+        def known(value: object) -> str:
+            text = str(value or "").strip()
+            return "" if text in {"", "-", "—"} else text
+
+        model, serial = known(getattr(info, "model", "")), known(getattr(info, "serial", ""))
+        if info is not None and known(getattr(info, "host", "")) in {"", host} and (model or serial):
+            bits = [bit for bit in (model, f"serial {serial}" if serial else "") if bit]
+            return f"{', '.join(bits)}, at {host}"
+        return f"at {host} (model and serial not read yet)"
+
+    def _local_folder_for(self, remote_folder: str) -> Path | None:
+        """The download folder that mirrors a sensor folder, when it exists on this PC."""
+        root = self._local_root()
+        sub = remote_subfolder(remote_folder.rstrip("/") + "/x")
+        if root is None or not sub:
+            return None
+        folder = root / Path(*sub.split("/"))
+        try:
+            return folder if folder.is_dir() else None
+        except OSError:
+            return None
+
+    def _folder_block_reason(self, path: str) -> str:
+        """'' when the folder may be deleted now, else a short reason (shown in the menu)."""
+        refusal = folder_refusal(path, SFTP_REMDATA_ROOT)
+        if refusal:
+            return refusal
+        if self._closing:
+            return "Window closing"
+        if self._folder_delete:
+            return "Deleting a folder"
+        if self._dl_active or self._dl_pending:
+            return "Downloads in progress"
+        if self._busy:
+            return "Wait for the listing"
+        return folder_busy_reason(confined_folder(path, SFTP_REMDATA_ROOT), self._activity())
+
+    def _file_delete_block_reason(self, paths: list[str]) -> str:
+        if self._closing:
+            return "Window closing"
+        if self._folder_delete:
+            return "Deleting a folder"
+        if self._dl_active or self._dl_pending:
+            return "Downloads in progress"
+        if self._busy:
+            return "Wait for the listing"
+        return files_busy_reason(paths, self._activity())
+
+    def _delete_folder(self, path: str) -> None:
+        """Count the folder in the background, then confirm, then delete (see remote_delete)."""
+        reason = self._folder_block_reason(path)
+        if reason:
+            self.status.setText(f"Folder not deleted: {reason[:1].lower()}{reason[1:]}.")
+            return
+        folder = confined_folder(path, SFTP_REMDATA_ROOT)
+        self._folder_delete = folder
+        self._delete_cancel = threading.Event()
+        self._set_busy(True)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        self.status.setText(f"Counting what is in {folder}/…")
+        diag("sftp_folder_count", folder, host=self._state.host)
+        self._cmd_count_folder.emit((folder, self._delete_cancel))
+
+    def _end_folder_delete(self, text: str) -> None:
+        self._folder_delete = ""
+        self.progress.setVisible(False)
+        self._set_busy(False)
+        self.status.setText(text)
+
+    @Slot(object)
+    def _on_folder_progress(self, progress: object) -> None:
+        if self._closing or not self._folder_delete or not isinstance(progress, DeleteProgress):
+            return
+        folder = self._folder_delete
+        if progress.phase == "counting":
+            self.status.setText(f"Counting what is in {folder}/… {progress.done:,} items so far")
+            return
+        self.progress.setRange(0, max(progress.total, 1))
+        self.progress.setValue(min(progress.done, progress.total))
+        self.status.setText(
+            f"Deleting {folder}/: {progress.done:,} of {progress.total:,} items, "
+            f"{size_text(progress.bytes_done)} of {size_text(progress.bytes_total)}…"
+        )
+
+    @Slot(str, str, str)
+    def _on_folder_refused(self, folder: str, reason: str, detail: str) -> None:
+        if self._closing or folder != self._folder_delete:
+            return
+        diag("sftp_folder_refused", folder, reason=reason, detail=detail)
+        started = self.progress.maximum() > 0  # the deletion itself had begun: some items may be gone
+        text = f"Folder not deleted: {reason[:1].lower()}{reason[1:]}."
+        self._end_folder_delete(text)
+        if started:
+            self.remote_changed.emit()
+            self._refresh_keeping(text)
+
+    @Slot(object)
+    def _on_folder_counted(self, plan: object) -> None:
+        if self._closing or not isinstance(plan, DeletePlan) or plan.folder != self._folder_delete:
+            return
+        self.progress.setVisible(False)
+        diag(
+            "sftp_folder_counted",
+            plan.folder,
+            files=plan.files,
+            links=plan.links,
+            subfolders=plan.subfolders,
+            bytes=plan.total_bytes,
+            sensor_now=plan.sensor_now,
+            real_root=plan.real_root,
+        )
+        reason = plan_busy_reason(plan, self._activity())
+        if reason:
+            self._end_folder_delete(f"Folder not deleted: {reason[:1].lower()}{reason[1:]}.")
+            return
+        self.status.setText(f"{plan.folder}/: {plan.contents_text()}.")
+        if not self._confirm_folder_delete(plan):
+            self._end_folder_delete("Folder not deleted.")
+            return
+        # The confirmation may have stayed open while a recording or a download started.
+        reason = plan_busy_reason(plan, self._activity())
+        if reason or self._closing:
+            self._end_folder_delete(f"Folder not deleted: {(reason or 'window closing').lower()}.")
+            return
+        diag("sftp_folder_delete", plan.folder, host=self._state.host, items=len(plan.entries) + 1)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, len(plan.entries) + 1)
+        self.progress.setValue(0)
+        self.status.setText(f"Deleting {plan.folder}/…")
+        self._cmd_delete_folder.emit((plan, self._delete_cancel))
+
+    def _folder_delete_box(self, plan: DeletePlan) -> tuple[QMessageBox, QPushButton]:
+        """The one confirmation: sensor, full path, what is inside, and that it is permanent. Cancel is the default."""
+        local = self._local_folder_for(plan.folder)
+        lines = [
+            f"Sensor: {self._sensor_identity_text()}",
+            f"Folder: {plan.folder}/",
+            f"Contents: {plan.contents_text()}",
+            "",
+            "Its contents will be permanently deleted from the sensor. This cannot be undone.",
+        ]
+        if plan.links:
+            lines.append("Links are removed as links; what they point to is not touched.")
+        lines.append(f"Local copies on this PC are kept ({local})." if local else "Local copies on this PC are kept.")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Delete folder from sensor")
+        box.setText(f"Delete the folder {plan.folder}/ and everything in it?")
+        box.setInformativeText("\n".join(lines))
+        delete_btn = box.addButton("Delete folder", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        return box, delete_btn
+
+    def _confirm_folder_delete(self, plan: DeletePlan) -> bool:
+        box, delete_btn = self._folder_delete_box(plan)
+        try:
+            box.exec()
+            return box.clickedButton() is delete_btn
+        finally:
+            box.deleteLater()
+
+    @Slot(object)
+    def _on_folder_deleted(self, result: object) -> None:
+        if self._closing or not isinstance(result, DeleteResult) or result.folder != self._folder_delete:
+            return
+        diag(
+            "sftp_folder_deleted",
+            result.folder,
+            host=self._state.host,
+            items_deleted=result.items_deleted,
+            items_total=result.items_total,
+            bytes_deleted=result.bytes_deleted,
+            folders_deleted=result.folders_deleted,
+            folders_total=result.folders_total,
+            already_gone=result.already_gone,
+            folder_removed=result.folder_removed,
+            cancelled=result.cancelled,
+            connection_lost=result.connection_lost,
+            failed=[f"{path}: {why}" for path, why in result.failed],
+        )
+        name = result.folder.rsplit("/", 1)[-1]
+        local = self._local_folder_for(result.folder)
+        summary = result.summary()
+        if local is not None:
+            summary += f" Local copies stay in {local}."
+        if result.complete:
+            self.activity.emit(f"Deleted folder {name} from the sensor." + (" Local copies are kept." if local else ""))
+        elif result.cancelled:
+            self.activity.emit(f"Folder {name}: deletion stopped, {result.items_deleted} of {result.items_total} deleted.")
+        else:
+            self.activity.emit(f"Folder {name} was only partly deleted. See details.")
+        preview_path = str(self.preview_file.property("remote_path") or "")
+        if preview_path.startswith(result.folder + "/"):
+            self._clear_preview()
+        for key in list(self._seen_by_dir):
+            if _normalise_dir(key) == result.folder or _normalise_dir(key).startswith(result.folder + "/"):
+                self._seen_by_dir.pop(key, None)
+        self._end_folder_delete(summary)
+        if result.items_deleted or result.folders_deleted:
+            self.remote_changed.emit()
+        if not result.complete and not result.cancelled:
+            details = "\n".join(f"  {path}: {why}" for path, why in result.failed[:10])
+            if len(result.failed) > 10:
+                details += f"\n  … and {len(result.failed) - 10} more"
+            QMessageBox.warning(self, "Delete folder", summary + (f"\n\nNot deleted:\n{details}" if details else ""))
+        self._refresh_keeping(summary)
+
+    def _refresh_keeping(self, note: str) -> None:
+        """List the folder again; the status line keeps `note` instead of the item count."""
+        self._listing_note = note
+        self.refresh()
+        if not self._busy:  # no listing started
+            self._listing_note = ""
 
     @Slot(object, object)
     def _on_removed(self, ok: object, errors: object) -> None:
@@ -1485,7 +1871,7 @@ class SftpWindow(QWidget):
         if deleted:
             self.remote_changed.emit()
         self._set_busy(False)
-        self.refresh()
+        self._refresh_keeping(self.status.text())
 
     def _clear_preview(self) -> None:
         self._preview_token += 1
@@ -1676,6 +2062,10 @@ class SftpWindow(QWidget):
         self._pump_downloads()
 
     def _cancel_downloads(self) -> None:
+        if self._folder_delete:
+            self._delete_cancel.set()
+            self.status.setText("Stopping after the current item…")
+            return
         if not (self._dl_pending or self._dl_active):
             return
         self._dl_cancel.set()
@@ -1730,6 +2120,9 @@ class SftpWindow(QWidget):
         done = self._dl_ok + self._dl_fail + self._dl_cancel_count
         self.status.setText(f"Saved {name} ({done}/{self._dl_total})")
         self._set_local_state(self._remote_path_of(name), LOCAL_VERIFIED, local_path=path)
+        service = getattr(self._host, "spectrograms", None)
+        if service is not None:
+            service.request(path, remote_path=self._remote_path_of(name), origin="sensor files")
 
     @Slot(str, str)
     def _on_file_download_failed(self, name: str, text: str) -> None:
@@ -1968,6 +2361,13 @@ class SftpWindow(QWidget):
             return None
 
     def _sensor_key(self) -> str:
+        """Serial of the connected sensor, else its address: names the sub-folder when two sensors clash.
+
+        The same key as the collection and the main window's downloads, so a copy they saved is found here."""
+        info = getattr(self._host, "_sensor_info", None)
+        serial = str(getattr(info, "serial", "") or "").replace("—", "").strip()
+        if serial and str(getattr(info, "host", "") or "").strip() in {"", self._state.host.strip()}:
+            return serial
         return str(getattr(self._state, "sensor_serial", "") or getattr(self._state, "host", "") or "")
 
     def _set_local_state(self, path: str, state: str, *, detail: str = "", local_path: str = "") -> None:
@@ -2016,28 +2416,142 @@ class SftpWindow(QWidget):
             return (LOCAL_SAVED, "", str(local))
         return (LOCAL_NONE, "", "")
 
+    # ------------------------------------------------------------------ right-click menu
     def _show_context_menu(self, pos) -> None:
         item = self.table.itemAt(pos)
         if item is None:
             return
+        menu = self._context_menu(item)
+        try:
+            self._exec_menu(menu, self.table.viewport().mapToGlobal(pos))
+        finally:
+            menu.deleteLater()
+
+    def _exec_menu(self, menu: QMenu, global_pos) -> None:
+        menu.exec(global_pos)
+
+    def _context_targets(self, item: QTreeWidgetItem) -> tuple[list[RemoteEntry], list[RemoteEntry]]:
+        """(files, folders) a right-click on `item` acts on.
+
+        A row inside the selection acts on the whole selection; any other row
+        becomes the only selected row and the only target."""
         if not item.isSelected():
-            self.table.setCurrentItem(item)
-        files = self._selected_files()
+            self.table.clearSelection()
+            item.setSelected(True)
+            self.table.setCurrentItem(item, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
+        return self._selected_files(), self._selected_folders()
+
+    def _context_menu(self, item: QTreeWidgetItem) -> QMenu:
+        """The menu for a right-click on `item`. Targets are captured as entries, so a refresh meanwhile is harmless."""
+        files, folders = self._context_targets(item)
         menu = QMenu(self.table)
-        saved_paths = [self._local_states.get(f.path, ("", "", ""))[2] for f in files]
-        saved_paths = [p for p in saved_paths if p]
-        can_download = bool(files) and not self._busy and not self._dl_active and not self._closing
+        menu.setObjectName("contextMenu")
+        menu.setToolTipsVisible(True)
+        if files:
+            self._add_file_actions(menu, files, folders)
+        else:
+            self._add_folder_actions(menu, folders)
+        return menu
+
+    def _menu_action(self, menu: QMenu, key: str, label: str, handler, reason: str = "", tip: str = "") -> QAction:
+        """An enabled action, or a disabled one whose short reason sits beside its label."""
+        action = menu.addAction(f"{label}\t{reason}" if reason else label)
+        action.setObjectName(key)
+        action.setEnabled(not reason)
+        if reason or tip:
+            action.setToolTip(reason or tip)
+        if not reason:
+            action.triggered.connect(handler)
+        return action
+
+    def _download_block_reason(self) -> str:
+        if self._closing:
+            return "Window closing"
+        if self._folder_delete:
+            return "Deleting a folder"
+        if self._dl_active or self._dl_pending:
+            return "Downloads in progress"
+        if self._busy:
+            return "Wait for the listing"
+        return ""
+
+    def _add_file_actions(self, menu: QMenu, files: list[RemoteEntry], folders: list[RemoteEntry]) -> None:
         failed = any(self._local_states.get(f.path, ("", "", ""))[0] == LOCAL_FAILED for f in files)
-        retry = menu.addAction("Retry download" if failed else "Download")
-        retry.setEnabled(can_download)
-        retry.triggered.connect(lambda: self._begin_downloads(files))
-        open_folder = menu.addAction("Open folder")
-        open_folder.setEnabled(bool(saved_paths))
-        open_folder.triggered.connect(lambda: self._reveal_local(saved_paths[0]) if saved_paths else None)
-        copy_name = menu.addAction("Copy filename" if len(files) == 1 else "Copy filenames")
-        copy_name.setEnabled(bool(files))
-        copy_name.triggered.connect(lambda: QApplication.clipboard().setText("\n".join(f.name for f in files)))
-        menu.exec(self.table.viewport().mapToGlobal(pos))
+        label = "Retry download" if failed else ("Download" if len(files) == 1 else f"Download {len(files)} files")
+        self._menu_action(menu, "download", label, lambda: self._menu_download(files), self._download_block_reason())
+        local = self._first_local_copy(files)
+        self._menu_action(
+            menu,
+            "open_folder",
+            "Open folder",
+            lambda: self._reveal_local(str(local)),
+            "" if local is not None else "Not downloaded yet",
+            tip=str(local.parent) if local is not None else "",
+        )
+        names = [entry.name for entry in files] + [entry.name for entry in folders]
+        label = "Copy names" if folders else ("Copy filename" if len(names) == 1 else "Copy filenames")
+        self._menu_action(menu, "copy_name", label, lambda: self._copy_names(names))
+        menu.addSeparator()
+        paths = [entry.path for entry in files]
+        label = "Delete from sensor…" if len(files) == 1 else f"Delete {len(files)} files from sensor…"
+        self._menu_action(menu, "delete_files", label, lambda: self._delete_files(paths), self._file_delete_block_reason(paths))
+        if folders:
+            self._menu_action(menu, "delete_folder", "Delete folder…", None, "Select one folder only")
+
+    def _add_folder_actions(self, menu: QMenu, folders: list[RemoteEntry]) -> None:
+        one = folders[0] if len(folders) == 1 else None
+        browse = "Select one folder" if one is None else self._download_block_reason()
+        self._menu_action(menu, "open_remote", "Open", lambda: self._open_remote_folder(one.path), browse)
+        local = self._local_folder_for(one.path) if one is not None else None
+        self._menu_action(
+            menu,
+            "open_local",
+            "Open local folder",
+            lambda: self._open_recordings_folder(local),
+            "" if local is not None else ("No local copies" if one is not None else "Select one folder"),
+            tip=str(local) if local is not None else "",
+        )
+        names = [entry.name for entry in folders]
+        self._menu_action(menu, "copy_name", "Copy folder name" if len(names) == 1 else "Copy folder names", lambda: self._copy_names(names))
+        menu.addSeparator()
+        reason = self._folder_block_reason(one.path) if one is not None else "Select one folder only"
+        self._menu_action(menu, "delete_folder", "Delete folder…", lambda: self._delete_folder(one.path), reason)
+
+    def _menu_download(self, files: list[RemoteEntry]) -> None:
+        reason = self._download_block_reason()
+        if reason:
+            self.status.setText(f"Download not started: {reason[:1].lower()}{reason[1:]}.")
+            return
+        self._begin_downloads(files)
+
+    def _open_remote_folder(self, path: str) -> None:
+        if self._busy or self._dl_active or self._dl_pending or self._folder_delete or self._closing:
+            self.status.setText("Wait until the current task has finished.")
+            return
+        self._request_list(path if path.endswith("/") else path + "/")
+
+    def _copy_names(self, names: list[str]) -> None:
+        QApplication.clipboard().setText("\n".join(names))
+        self.status.setText(f"Copied {len(names)} name{'s' if len(names) != 1 else ''}.")
+
+    def _first_local_copy(self, files: list[RemoteEntry]) -> Path | None:
+        """Where the first of `files` that is on this PC was saved (a copy of the sensor's size)."""
+        root = self._local_root()
+        for entry in files[:50]:
+            known = self._local_states.get(entry.path, ("", "", ""))
+            if known[0] in {LOCAL_SAVED, LOCAL_VERIFIED} and known[2]:
+                try:
+                    if Path(known[2]).is_file():
+                        return Path(known[2])
+                except OSError:
+                    pass
+            local = self._local_copy_of(entry)
+            if local is None and root is not None and self._state.host and self._sensor_key() != self._state.host:
+                # Saved by an earlier version that named the sensor sub-folder after its address.
+                local = existing_copy(root, entry.path, int(entry.size or 0), sensor=self._state.host)
+            if local is not None:
+                return local
+        return None
 
     def _reveal_local(self, path: str) -> None:
         from . import desktop_open

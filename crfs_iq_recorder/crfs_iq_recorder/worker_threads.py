@@ -42,6 +42,11 @@ def tracked_count() -> int:
     return len(_TRACKED)
 
 
+def tracked_workers() -> list[QObject]:
+    """The workers whose threads are still running."""
+    return [worker for _thread, worker in list(_TRACKED) if worker is not None]
+
+
 def stop_worker_threads(timeout_s: float = 8.0) -> int:
     """Stop every tracked thread. Returns how many had to be leaked."""
     entries = list(_TRACKED)

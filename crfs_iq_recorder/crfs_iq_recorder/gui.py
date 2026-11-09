@@ -47,6 +47,7 @@ from . import APP_NAME, __version__
 from .api_client import EmpClient, HttpOutcome
 from .cellular_panel import CellularPanel
 from .cellular_runner import OWNER, S_INTERRUPTED, CellularRunner
+from .clock_monitor import SensorClockMonitor
 from .capture_api import (
     OUTCOME_BUSY,
     OUTCOME_CONFIRMED,
@@ -321,6 +322,7 @@ class MainWindow(QMainWindow):
         self._sensor_finished_at = 0.0
         self._stream_lost = False
         self._sensor_parts: list[str] = []
+        self._sensor_dirs: list[str] = []
         self._sensor_warnings: list[str] = []
         self._sensor_message_counts: dict[str, int] = {}
         # Sensor notices shown once per session in the Activity panel (counted in the diagnostic log).
@@ -421,6 +423,19 @@ class MainWindow(QMainWindow):
             download_dir=lambda: resolved_download_dir(self._conn.download_dir),
             parent=self,
         )
+        self._clock_monitor = SensorClockMonitor(self)
+        # Spectrogram (and Excel thumbnail) for every verified IQ download, in a background process.
+        self.spectrograms = None
+        if not demo:
+            from .spectrogram_queue import SpectrogramService
+
+            self.spectrograms = SpectrogramService(
+                self,
+                config_dir=user_config_dir(),
+                workbook_queue=self._cellular.workbook_queue,
+                excel_store=lambda: self._excel_store,
+                parent=self,
+            )
 
         central = QWidget()
         central.setObjectName("central")
@@ -1150,6 +1165,10 @@ class MainWindow(QMainWindow):
                 pass
         if hasattr(self, "_cellular"):
             self._cellular.shutdown()
+        if hasattr(self, "_clock_monitor"):
+            self._clock_monitor.shutdown()
+        if getattr(self, "spectrograms", None) is not None:
+            self.spectrograms.shutdown()
         self._record_timer.stop()
         self._watch_timer.stop()
         self._wait_timer.stop()
@@ -1698,9 +1717,14 @@ class MainWindow(QMainWindow):
         if token is not None and token != self._link_token:
             return
         self._link_in_flight = False
+        if not ok and self._clock_monitor.saving_ntp_page():
+            diag("link_check_ignored", detail, reason="the sensor was saving its NTP page")
+            return
         previous = self._link.state
         changed = self._link.note_success() if ok else self._link.note_failure()
         self._sync_link_indicators()
+        if ok:
+            self._clock_monitor.request_check("connection check")
         if not changed:
             return
         self._log_link_change()
@@ -1889,6 +1913,7 @@ class MainWindow(QMainWindow):
 
             diag("sensor_identity", serial=info.serial, model=info.model, firmware=info.display_firmware())
             self.log(f"Connected to {readable_sensor_name(info.model, info.display_model())}.")
+            self._clock_monitor.request_check("sensor connected", force=True)
         elif info.status not in {"Checking…", "No sensor IP", "Demo"}:
             diag("sensor_identity_failed", str(info.status))
             self.log("Could not read the sensor's details. See details.")
@@ -1912,6 +1937,7 @@ class MainWindow(QMainWindow):
             if self._sftp_win is not None:
                 self._sftp_win.set_connection_state(self._conn)
             self._sync_connection_label()
+            self._clock_monitor.reset()
             self._restart_link_monitor()
             self._refresh_sensor_info()
             self._refresh_storage()
@@ -2132,6 +2158,9 @@ class MainWindow(QMainWindow):
         self._refresh_manual_card()
         names = [Path(p).name for p in paths]
         self.log("Saved locally: " + (names[0] if len(names) == 1 else f"{len(names)} files") + ".")
+        if self.spectrograms is not None:
+            for path in paths:
+                self.spectrograms.request(path, origin="manual recording")
         summary = self._last_manual_summary
         if len(paths) > 1 and summary is not None and self.merge_check.isChecked():
             first = summary.finalized_paths[0]
@@ -2442,6 +2471,9 @@ class MainWindow(QMainWindow):
             return "The previous recording is still being confirmed from the sensor's files."
         if self._series_active or self._waiting:
             return "A repeat series is running."
+        hold = self._clock_monitor.claim_for_capture()
+        if hold:
+            return hold
         try:
             seconds = float(request.seconds)
         except (TypeError, ValueError):
@@ -2650,6 +2682,13 @@ class MainWindow(QMainWindow):
         self._start_trigger = f"Start button ({self.start_btn.take_trigger()})"
         self._on_start()
 
+    def _start_after_clock_check(self, trigger: str, series: bool) -> None:
+        if series and not self._series_active:
+            return
+        self._set_msg("")
+        self._start_trigger = trigger
+        self._on_start()
+
     def _on_start(self) -> None:
         trigger, self._start_trigger = self._start_trigger or "direct call", ""
         if self._recording_active or self._submit_lock:
@@ -2664,6 +2703,11 @@ class MainWindow(QMainWindow):
         if self._watching or self._measuring or self._record_phase == FINALIZING:
             # The manual button is disabled in this state; a programmatic or
             # keyboard trigger must not abandon the confirmation half-way.
+            return
+        series = self._series_active
+        hold = self._clock_monitor.claim_for_capture(lambda: self._start_after_clock_check(trigger, series))
+        if hold:
+            self._set_msg(hold)
             return
         self._submit_lock = True
         payload, error = self._try_payload()
@@ -2773,6 +2817,7 @@ class MainWindow(QMainWindow):
         self._sensor_finished_at = 0.0
         self._stream_lost = False
         self._sensor_parts = []
+        self._sensor_dirs = []
         self._sensor_warnings = []
         self._sensor_message_counts = {}
         self._sensor_error = ""
@@ -2967,7 +3012,7 @@ class MainWindow(QMainWindow):
                 else:
                     self._set_recording_ui(False)
             return
-        folders = folders_for_recording(record.started_at)
+        folders = folders_for_recording(record.started_at, sensor_dirs=self._sensor_dirs)
         if self._conn.demo:
             try:
                 if self._watch_browser is None:
@@ -3709,6 +3754,9 @@ class MainWindow(QMainWindow):
         first = not self._sensor_reply
         self._sensor_reply.update(reply)
         diag("sensor_reply", **reply)
+        if reply.get("file_dir") and str(reply["file_dir"]) not in self._sensor_dirs:
+            self._sensor_dirs.append(str(reply["file_dir"]))
+        self._clock_monitor.note_sensor_reply(reply)
         if not first:
             return
         try:
@@ -3764,6 +3812,8 @@ class MainWindow(QMainWindow):
         if filename in self._sensor_parts:
             return
         self._sensor_parts.append(filename)
+        if directory and directory not in self._sensor_dirs:
+            self._sensor_dirs.append(directory)
         diag("sensor_file", filename, directory=directory)
         self._refresh_finalizing_ui()
         record_id = self._open_record_id
@@ -3823,6 +3873,7 @@ class MainWindow(QMainWindow):
             if self._sftp_win is not None:
                 self._sftp_win.close()
             self._sftp_win = SftpWindow(self._conn, None, screen=self.screen())
+            self._sftp_win.set_host(self)
             self._sftp_win.activity.connect(self.log)
             self._sftp_win.remote_changed.connect(self._refresh_storage)
             self._sftp_win.set_merge_controller(self._merge)

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .excel_com import append_rows_com, excel_has_workbook
+from .excel_com import append_rows_com, excel_has_workbook, workbook_lock
 from .excel_writer import (
     ExcelBusyError,
     ExcelRow,
@@ -295,6 +295,32 @@ class ExcelLogStore:
             self.queue = [item for item in self.queue if item.id not in item_ids]
             self.save()
 
+    def rows_listing(self, filename: str) -> list[tuple[str, str, bool]]:
+        """(workbook, worksheet, still queued) of every row that lists this IQ file, written or waiting."""
+        want = str(filename or "").casefold()
+        return self.rows_listing_many({want}).get(want, []) if want else []
+
+    def rows_listing_many(self, names: set[str]) -> dict[str, list[tuple[str, str, bool]]]:
+        """rows_listing for several (case-folded) file names in one pass."""
+        found: dict[str, dict[tuple[str, str], bool]] = {}
+        if not names:
+            return {}
+        with self.lock:
+            for item in self.queue:
+                for name in item.filenames():
+                    key = name.casefold()
+                    if key in names:
+                        found.setdefault(key, {})[(item.workbook, item.worksheet)] = True
+            for group in self.groups.values():
+                where = (str(group.get("workbook") or ""), str(group.get("worksheet") or ""))
+                if not where[0]:
+                    continue
+                for name in group.get("filenames") or []:
+                    key = str(name).casefold()
+                    if key in names:
+                        found.setdefault(key, {}).setdefault(where, False)
+        return {name: [(book, sheet, queued) for (book, sheet), queued in rows.items()] for name, rows in found.items()}
+
 
 def pending_from_row(
     *,
@@ -423,7 +449,8 @@ def flush_excel_queue(store: ExcelLogStore) -> tuple[int, int]:
             grouped.setdefault(item.group(), []).append(item)
         rows = [_merged_group_row(store, batch) for batch in grouped.values()]
         try:
-            write_excel_rows(book, rows)
+            with workbook_lock(book):
+                write_excel_rows(book, rows)
         except ExcelBusyError:
             remaining += len(items)
             continue

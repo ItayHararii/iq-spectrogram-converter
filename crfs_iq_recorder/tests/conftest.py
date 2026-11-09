@@ -24,7 +24,7 @@ def block_real_network(monkeypatch):
 
 
 @pytest.fixture(autouse=True, scope="session")
-def stop_worker_threads_at_exit():
+def stop_worker_threads_at_exit(session_config_dir):
     """GUI tests leave sensor checks and previews running; finish them before
     the interpreter deletes their QThreads (Qt would abort with 0xC0000409)."""
     yield
@@ -83,6 +83,17 @@ def reset_demo_sftp():
     reset_shared_demo_browser()
     yield
     reset_shared_demo_browser()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def session_config_dir(tmp_path_factory):
+    """Where work that outlives its test (a workbook flush finishing on a worker
+    thread) writes, instead of the developer's own config folder."""
+    patcher = pytest.MonkeyPatch()
+    config = tmp_path_factory.mktemp("session_config")
+    patcher.setattr("crfs_iq_recorder.paths.user_config_dir", lambda: config)
+    yield config
+    patcher.undo()
 
 
 @pytest.fixture(autouse=True)

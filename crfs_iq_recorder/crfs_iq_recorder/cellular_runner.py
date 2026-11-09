@@ -2016,6 +2016,7 @@ class CellularRunner(QObject):
                     item["download_status"] = DL_VERIFIED
                     stages[V_CHECKSUM] = V_SKIPPED
                     item["verified_text"] = verification_text(stages)
+                    self._request_spectrograms(state)
                 self._save()
                 return
             # A same-size copy that does not check out is downloaded again (it is replaced, never doubled).
@@ -2518,8 +2519,18 @@ class CellularRunner(QObject):
         self._checksums = remaining
         self._emit_status()
 
+    def _request_spectrograms(self, state: TaskState) -> None:
+        """Each verified IQ file gets its spectrogram (and Excel thumbnail) in the background; never blocks."""
+        service = getattr(self.host, "spectrograms", None)
+        if service is None:
+            return
+        for item in state.files:
+            if item.get("download_status") == DL_VERIFIED and item.get("local_path"):
+                service.request(str(item["local_path"]), remote_path=str(item.get("remote_path") or ""), origin="collection")
+
     def _after_file_verified(self, state: TaskState) -> None:
         self._rewrite_manifest(state)
+        self._request_spectrograms(state)
         if all(item.get("download_status") == DL_VERIFIED for item in state.files) and state.files:
             planned = self.session.planned(state.task_key) if self.session is not None else None
             where = self._row_position(planned) if planned is not None else "recording"
@@ -3112,7 +3123,8 @@ class CellularRunner(QObject):
 
         conn = getattr(self.host, "_conn", None)
         records = load_recordings()
-        wanted = [(state.task_key, state.round_id, state.record_id, list((state.summary or {}).get("sensor_parts") or [])) for state, _planned in pending]
+        wanted = [(state.task_key, state.round_id, state.record_id, list((state.summary or {}).get("sensor_parts") or []),
+                   [((state.summary or {}).get("sensor_reply") or {}).get("file_dir") or ""]) for state, _planned in pending]
 
         def work():
             results = {}
@@ -3121,12 +3133,12 @@ class CellularRunner(QObject):
             except Exception as exc:  # noqa: BLE001 - reported through apply(), never lost in a worker
                 return {"error": f"{type(exc).__name__}: {exc}"}
             try:
-                for task_key, round_id, record_id, parts in wanted:
+                for task_key, round_id, record_id, parts, sensor_dirs in wanted:
                     record = next((item for item in records if item.id == record_id), None)
                     if record is None:
                         results[(round_id, task_key)] = ([], None, "no history entry")
                         continue
-                    entries = list_watch_entries(browser, folders_for_recording(record.started_at))
+                    entries = list_watch_entries(browser, folders_for_recording(record.started_at, sensor_dirs=sensor_dirs))
                     mine = [(e.path, int(e.size or 0)) for e in live_capture_files(
                         entries, record, known=records, sensor_parts=parts, host=getattr(conn, "host", "")
                     ) if not e.is_dir]

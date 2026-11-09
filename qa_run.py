@@ -666,6 +666,85 @@ def t_range_markers(ctx):
     return "lines at exactly 1805.0 / 1880.0 MHz on both panels; offsets -37.5 / +37.5 MHz from 1842.5 MHz"
 
 
+@case("thumbnail: spectrogram-only PNG at a fixed size from the same grid; centre in title; off by default")
+def t_thumbnail(ctx):
+    from PIL import Image
+
+    folder = ctx.tmp / "thumb"
+    wav = folder / "iq_qa_thumb_0001.wav"
+    fs = 1_000_000
+    write_iq(wav, fs=fs, seconds=0.2, tones=((150_000.0, 0.5),), noise=0.001)
+    append_crfs_meta(wav, 1_842_500_000.0, 0.8e6, fs)
+    plain, thumbed = {}, {}
+    convert(str(wav), str(folder / "plain"), 2_000, stats=plain, recorder_history=str(ctx.tmp / "none.json"))
+    assert plain["thumbnail_path"] is None and not list((folder / "plain").glob("*.thumb*")), "thumbnail written by default"
+    assert "centre" not in plain["title"], plain["title"]
+    # Gray with a fixed dB range: brightness is monotonic in power, so the tone column is the brightest.
+    convert(str(wav), str(folder / "plain"), 2_000, stats=plain, cmap="gray", db_auto=False, db_vmin=-110, db_vmax=0,
+            recorder_history=str(ctx.tmp / "none.json"))
+    convert(
+        str(wav), str(folder / "thumbed"), 2_000, stats=thumbed, recorder_history=str(ctx.tmp / "none.json"),
+        cmap="gray", db_auto=False, db_vmin=-110, db_vmax=0,
+        thumbnail_name="iq_qa_thumb_0001.thumb.png", thumbnail_size=(160, 80), title_centre=True,
+    )
+    for key in ("freqs_hz", "spectrum_mean_db", "spectrum_peak_db", "waterfall_db"):
+        assert np.array_equal(plain[key], thumbed[key], equal_nan=True), f"{key} changed with a thumbnail"
+    assert "centre 1842.5 MHz" in thumbed["title"], thumbed["title"]
+    thumb = Path(thumbed["thumbnail_path"])
+    assert thumb.is_file() and Path(thumbed["out_path"]).is_file()
+    assert not list(thumb.parent.glob("*.part.png")), "temp file left behind"
+    with Image.open(thumb) as im:
+        assert im.size == (160, 80), im.size
+        assert im.mode == "P", im.mode
+        lum = np.asarray(im.convert("L"), dtype=np.float64)
+    expected_x = (150_000.0 + fs / 2) / fs * 160
+    brightest = float(np.argmax(lum.mean(axis=0)))
+    assert abs(brightest - expected_x) <= 2.0, (brightest, expected_x)
+    bare = folder / "iq_qa_bare_0001.wav"
+    write_iq(bare, fs=fs, seconds=0.1)
+    unknown = {}
+    convert(str(bare), str(folder / "bare"), 2_000, stats=unknown, title_centre=True, thumbnail_name="b.thumb",
+            recorder_history=str(ctx.tmp / "none.json"))
+    assert "centre unknown" in unknown["title"] and unknown["thumbnail_path"].endswith("b.thumb.png"), unknown["title"]
+    try:
+        convert(str(bare), str(folder / "bare"), 2_000, thumbnail_name="iq_qa_bare_0001.png")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a thumbnail named like the PNG was accepted")
+    return f"160x80 palette PNG, {thumb.stat().st_size} bytes, tone column {brightest:.0f} (expected {expected_x:.0f}); arrays unchanged"
+
+
+@case("without scipy: numpy FFT and window give the same spectrum and spectrogram (bundled engine)")
+def t_numpy_fallback(ctx):
+    for n in (8, 1024, 65536):
+        scipy_w = np.asarray(iq_data._get_window()("blackmanharris", n, fftbins=True), dtype=np.float64)
+        assert np.array_equal(scipy_w, iq_data._numpy_get_window("blackmanharris", n)), f"window differs at {n}"
+    wav = ctx.tmp / "fallback" / "iq_qa_fallback_0001.wav"
+    write_iq(wav, fs=1_000_000, seconds=0.2, tones=((150_000.0, 0.5), (-225_000.0, 0.01)), noise=0.01)
+    append_crfs_meta(wav, 100e6, 0.8e6, 1_000_000)
+    ref, alt = {}, {}
+    convert(str(wav), str(ctx.tmp / "fallback" / "scipy"), 2_000, stats=ref, recorder_history=str(ctx.tmp / "none.json"))
+    saved = (iq_data._fft_fn, iq_data._get_window_fn)
+    iq_data._fft_fn, iq_data._get_window_fn = iq_data._numpy_fft, iq_data._numpy_get_window
+    try:
+        assert iq_data.fft_backend() == "numpy"
+        convert(str(wav), str(ctx.tmp / "fallback" / "numpy"), 2_000, stats=alt, recorder_history=str(ctx.tmp / "none.json"))
+    finally:
+        iq_data._fft_fn, iq_data._get_window_fn = saved
+    assert np.array_equal(ref["freqs_hz"], alt["freqs_hz"])
+    worst = 0.0
+    for key in ("spectrum_mean_db", "spectrum_peak_db", "waterfall_db"):
+        a, b = np.asarray(ref[key], dtype=np.float64), np.asarray(alt[key], dtype=np.float64)
+        assert np.array_equal(np.isfinite(a), np.isfinite(b)), f"{key}: finite cells differ"
+        diff = float(np.nanmax(np.abs(a - b))) if a.size else 0.0
+        assert diff < 0.05, f"{key} differs by {diff:.4f} dB"
+        worst = max(worst, diff)
+    for key in ("n_fft", "hop", "n_frames", "rbw_true_hz"):
+        assert ref[key] == alt[key], f"{key} {ref[key]!r} != {alt[key]!r}"
+    return f"window bit-identical; spectra and spectrogram within {worst:.4f} dB of scipy"
+
+
 @case("original IQ file is unchanged after conversion (sha256)")
 def t_preserve(ctx):
     wav = ctx.tmp / "preserve.wav"
@@ -1066,7 +1145,7 @@ ENGINE_CASES = [
     t_non_wav, t_unsupported_encoding, t_no_metadata, t_too_short, t_silence, t_clipped, t_bad_rbw,
     t_db_range, t_bad_cmap, t_unicode_paths, t_long_names, t_missing_input, t_readonly_output,
     t_duplicate_names, t_existing_output, t_cancel, t_sign_convention, t_full_scale, t_two_tones,
-    t_rbw_true, t_reference, t_range_markers, t_preserve, t_real_file,
+    t_rbw_true, t_reference, t_range_markers, t_thumbnail, t_numpy_fallback, t_preserve, t_real_file,
 ]
 GUI_CASES = [
     t_gui_open, t_gui_convert, t_gui_cancel, t_gui_recovery, t_gui_batch, t_gui_drop, t_gui_theme,
